@@ -4,13 +4,17 @@
 //! `ContentServerDirectory.GetManifestRequestCode#1` RPCs, all without
 //! any `unsafe` code.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use tracing::{debug, info, warn};
-use vapor_forge_config::{AppId, ManifestProvider, ManifestSection, RuntimeConfig};
+use vapor_forge_config::{
+    AppId, ManifestResponseFormat, ManifestSection, ManifestSource, RuntimeConfig,
+};
 use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
     ERESULT_NO_CONNECTION, K_MSG_HDR_PROTO_FLAG,
@@ -138,6 +142,7 @@ impl PendingQueue {
         let providers = manifest.providers.clone();
         let timeout_connect_ms = manifest.timeout_connect_ms;
         let timeout_ms = manifest.timeout_ms;
+        let min_interval_ms = manifest.min_interval_ms;
         let spawn_result = std::thread::Builder::new()
             .name("manifest-code-fetch".to_owned())
             .spawn(move || {
@@ -155,7 +160,17 @@ impl PendingQueue {
                     }
                 });
                 let code = script_code.or_else(|| {
-                    fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms)
+                    fetch_manifest_code(
+                        FetchContext {
+                            app_id,
+                            depot_id,
+                            gid,
+                        },
+                        &providers,
+                        timeout_connect_ms,
+                        timeout_ms,
+                        min_interval_ms,
+                    )
                 });
                 {
                     let mut lock = result_clone.lock().unwrap();
@@ -238,89 +253,450 @@ pub fn should_intercept_with_ownership(
 // Built-in providers
 // ---------------------------------------------------------------------------
 
-const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
 const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4096;
 
-fn fetch_manifest_code(
+/// Cooldown applied when a provider answers 429 without a usable `Retry-After`.
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+/// Ceiling on any cooldown, so one absurd `Retry-After` cannot park a provider
+/// for the rest of the Steam session.
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(300);
+/// Applied when a provider itself is unhealthy (transport error, 5xx, a
+/// Cloudflare block), once another provider has served the same gid. Steam
+/// asks for one code per depot, so without this a dead source costs a wasted
+/// round trip on every single gid.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How long a served code keeps its provider at the back of the chain for the
+/// same gid.
+///
+/// Steam asks for a gid's code again only when it needs that manifest again.
+/// Within minutes that means the CDN refused the code: Steam logs the 401 as
+/// "No Connection" and retries the whole update. Every provider hands out a
+/// refused code now and then, and asking the same one again tends to repeat
+/// it, so a quick re-request goes to the others first.
+const REREQUEST_WINDOW: Duration = Duration::from_secs(600);
+
+/// Provider bookkeeping shared by every fetch thread.
+#[derive(Default)]
+struct ProviderState {
+    /// Instants before which a provider must not be contacted again.
+    ///
+    /// Steam resolves several depot manifests back to back. Without this, one
+    /// 429 would be re-earned on every following gid: a wasted round trip each
+    /// time, and more load on a provider that just asked us to back off.
+    cooldowns: Mutex<HashMap<String, Instant>>,
+    /// Providers that served a code within [`REREQUEST_WINDOW`], per gid,
+    /// least recent first.
+    served: Mutex<HashMap<u64, Vec<(String, Instant)>>>,
+}
+
+static PROVIDER_STATE: OnceLock<ProviderState> = OnceLock::new();
+
+fn provider_state() -> &'static ProviderState {
+    PROVIDER_STATE.get_or_init(ProviderState::default)
+}
+
+/// When each provider was last contacted, for the self-imposed pacing.
+static PROVIDER_LAST_REQUEST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn provider_last_request() -> &'static Mutex<HashMap<String, Instant>> {
+    PROVIDER_LAST_REQUEST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What one manifest code request is for. `{depotId}` / `{appId}` providers
+/// need more than the gid.
+#[derive(Clone, Copy, Debug)]
+struct FetchContext {
+    app_id: u32,
+    depot_id: u32,
     gid: u64,
-    providers: &[ManifestProvider],
+}
+
+/// How long to wait before the next request to `name` may go out, reserving
+/// the slot when the wait is zero.
+///
+/// Returning the wait instead of sleeping keeps the lock out of the sleep and
+/// keeps this testable.
+fn reserve_slot_in(
+    last: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+    min_interval: Duration,
+) -> Option<Duration> {
+    match last.get(name) {
+        Some(&previous) => {
+            let elapsed = now.saturating_duration_since(previous);
+            if elapsed < min_interval {
+                return Some(min_interval - elapsed);
+            }
+            last.insert(name.to_owned(), now);
+            None
+        }
+        None => {
+            last.insert(name.to_owned(), now);
+            None
+        }
+    }
+}
+
+/// Block until this provider may be contacted again.
+fn wait_for_slot(name: &str, min_interval: Duration) {
+    if min_interval.is_zero() {
+        return;
+    }
+    loop {
+        let wait = {
+            let mut last = provider_last_request()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            reserve_slot_in(&mut last, name, Instant::now(), min_interval)
+        };
+        match wait {
+            Some(wait) => std::thread::sleep(wait),
+            None => return,
+        }
+    }
+}
+
+/// Outcome of one provider attempt. 429 is kept distinct from ordinary failure
+/// so the caller can park the provider instead of just moving to the next one.
+#[derive(Debug)]
+enum ProviderOutcome {
+    Code(u64),
+    RateLimited(Duration),
+    /// The provider is answering, but not for this target — a pool that holds
+    /// no licence for the app says so per request (20770407 replies 401
+    /// `Unauthorized`). Nothing is wrong with the source, so it must NOT be
+    /// put on cooldown: the next gid may well be one it can serve.
+    Denied(u16),
+    /// The provider itself is unhealthy; put it on cooldown.
+    Failed(String),
+}
+
+/// Remaining cooldown for `provider`, clearing the entry once it has expired.
+fn cooldown_remaining_in(
+    cooldowns: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+) -> Option<Duration> {
+    let until = *cooldowns.get(name)?;
+    if until > now {
+        Some(until - now)
+    } else {
+        cooldowns.remove(name);
+        None
+    }
+}
+
+fn start_cooldown_in(
+    cooldowns: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+    retry_after: Duration,
+) -> Duration {
+    let capped = retry_after.min(MAX_RATE_LIMIT_COOLDOWN);
+    cooldowns.insert(name.to_owned(), now + capped);
+    capped
+}
+
+/// Providers that served `gid` within [`REREQUEST_WINDOW`], least recent first.
+/// Entries past the window are dropped for every gid, so the table only holds
+/// the codes of the current update.
+fn served_by_in(
+    served: &mut HashMap<u64, Vec<(String, Instant)>>,
+    gid: u64,
+    now: Instant,
+) -> Vec<String> {
+    served.retain(|_, entries| {
+        entries.retain(|(_, at)| now.saturating_duration_since(*at) < REREQUEST_WINDOW);
+        !entries.is_empty()
+    });
+    served
+        .get(&gid)
+        .map(|entries| entries.iter().map(|(name, _)| name.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn record_served_in(
+    served: &mut HashMap<u64, Vec<(String, Instant)>>,
+    gid: u64,
+    name: &str,
+    now: Instant,
+) {
+    let entries = served.entry(gid).or_default();
+    entries.retain(|(served_name, _)| served_name != name);
+    entries.push((name.to_owned(), now));
+}
+
+/// Chain order for one gid: providers that have not served it recently keep
+/// their configured order, the ones that have go last, least recent first.
+fn order_providers<'a>(
+    providers: &'a [ManifestSource],
+    served: &[String],
+) -> Vec<&'a ManifestSource> {
+    let mut ordered: Vec<_> = providers
+        .iter()
+        .filter(|provider| !served.iter().any(|name| name == provider.name()))
+        .collect();
+    for name in served {
+        ordered.extend(providers.iter().filter(|provider| provider.name() == name));
+    }
+    ordered
+}
+
+impl ProviderState {
+    fn cooldown_remaining(&self, name: &str) -> Option<Duration> {
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cooldown_remaining_in(&mut cooldowns, name, Instant::now())
+    }
+
+    fn start_cooldown(&self, name: &str, retry_after: Duration) -> Duration {
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        start_cooldown_in(&mut cooldowns, name, Instant::now(), retry_after)
+    }
+
+    fn served_by(&self, gid: u64) -> Vec<String> {
+        let mut served = self
+            .served
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        served_by_in(&mut served, gid, Instant::now())
+    }
+
+    fn record_served(&self, gid: u64, name: &str) {
+        let mut served = self
+            .served
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        record_served_in(&mut served, gid, name, Instant::now());
+    }
+}
+
+/// `Retry-After` in its delta-seconds form. The HTTP-date form is not accepted:
+/// ManifestDeX documents seconds, and anything unparsable falls back to
+/// [`DEFAULT_RATE_LIMIT_COOLDOWN`] rather than being treated as "retry now".
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let seconds = value?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn fetch_manifest_code(
+    context: FetchContext,
+    providers: &[ManifestSource],
     timeout_connect_ms: u64,
     timeout_ms: u64,
+    min_interval_ms: u64,
 ) -> Option<u64> {
-    for &provider in providers {
-        let (name, url_template) = provider_endpoint(provider);
-        let url = url_template.replace("{gid}", &gid.to_string());
+    let FetchContext {
+        app_id,
+        depot_id,
+        gid,
+    } = context;
+
+    run_provider_chain(provider_state(), context, providers, |provider| {
+        let url = provider.resolve_url(app_id, depot_id, gid);
+        // Pace before the request, not after a 429: these are small shared
+        // services and the cooldown only reacts once the damage is done.
+        wait_for_slot(provider.name(), provider.min_interval(min_interval_ms));
+        fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms)
+    })
+}
+
+fn run_provider_chain(
+    state: &ProviderState,
+    context: FetchContext,
+    providers: &[ManifestSource],
+    mut attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
+) -> Option<u64> {
+    let FetchContext { depot_id, gid, .. } = context;
+
+    let served = state.served_by(gid);
+    if !served.is_empty() {
+        info!(
+            gid,
+            depot_id,
+            served = ?served,
+            "request_code: gid requested again, trying other providers first"
+        );
+    }
+
+    // A failure only says something about the provider once another one has
+    // answered the same gid. When the whole chain fails, the gid is the likelier
+    // cause, and cooling every provider down would turn the following gids of
+    // the same update into instant failures.
+    let mut failed = Vec::new();
+
+    for provider in order_providers(providers, &served) {
+        let name = provider.name();
+
+        // A user-defined entry can be malformed; skip it and keep the rest of
+        // the chain working rather than failing the whole fetch.
+        if let Some(rejection) = provider.rejection() {
+            warn!(gid, %rejection, "request_code: skipping unusable provider");
+            continue;
+        }
+
+        if let Some(remaining) = state.cooldown_remaining(name) {
+            debug!(
+                provider = name,
+                gid,
+                remaining_ms = remaining.as_millis() as u64,
+                "request_code: provider cooling down, skipping"
+            );
+            continue;
+        }
+
         debug!(
             provider = name,
-            gid, "request_code: trying built-in provider"
+            gid, depot_id, "request_code: trying provider"
         );
 
-        match fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms) {
-            Ok(code) if code > 0 => {
+        match attempt(provider) {
+            ProviderOutcome::Code(code) if code > 0 => {
                 info!(
                     provider = name,
                     gid, code, "request_code: manifest code obtained"
                 );
+                state.record_served(gid, name);
+                for failed_name in failed {
+                    let cooldown = state.start_cooldown(failed_name, FAILURE_COOLDOWN);
+                    warn!(
+                        provider = failed_name,
+                        gid,
+                        cooldown_ms = cooldown.as_millis() as u64,
+                        "request_code: backing off failed provider"
+                    );
+                }
                 return Some(code);
             }
-            Ok(_) => warn!(provider = name, gid, "request_code: provider returned zero"),
-            Err(error) => {
+            ProviderOutcome::Code(_) => {
+                warn!(provider = name, gid, "request_code: provider returned zero")
+            }
+            ProviderOutcome::RateLimited(retry_after) => {
+                let cooldown = state.start_cooldown(name, retry_after);
+                warn!(
+                    provider = name,
+                    gid,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "request_code: provider rate limited, backing off"
+                );
+            }
+            ProviderOutcome::Denied(status) => {
+                // Per-target answer, not a provider fault: no cooldown.
+                debug!(
+                    provider = name,
+                    gid, depot_id, status, "request_code: provider does not have this manifest"
+                );
+            }
+            ProviderOutcome::Failed(error) => {
                 warn!(provider = name, gid, %error, "request_code: provider failed");
+                failed.push(name);
             }
         }
     }
 
+    if !failed.is_empty() {
+        warn!(
+            gid,
+            depot_id,
+            failed = ?failed,
+            "request_code: no provider served this gid, failures not backed off"
+        );
+    }
     None
 }
 
-fn provider_endpoint(provider: ManifestProvider) -> (&'static str, &'static str) {
-    match provider {
-        ManifestProvider::OpenSteamTool => {
-            ("opensteamtool", "https://manifest.opensteamtool.com/{gid}")
-        }
-        ManifestProvider::Wudrm => ("wudrm", "http://gmrc.wudrm.com/manifest/{gid}"),
-        ManifestProvider::SteamRun => ("steamrun", "https://manifest.steam.run/api/manifest/{gid}"),
-    }
-}
-
 fn fetch_from_provider(
-    provider: ManifestProvider,
+    provider: &ManifestSource,
     url: &str,
     timeout_connect_ms: u64,
     timeout_ms: u64,
-) -> Result<u64, String> {
+) -> ProviderOutcome {
     let agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_millis(timeout_connect_ms)))
-        .timeout_global(Some(std::time::Duration::from_millis(timeout_ms)))
+        .timeout_connect(Some(Duration::from_millis(timeout_connect_ms)))
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
+        // Keep non-2xx as a response so 429 can be told apart from a transport
+        // failure and its Retry-After header read.
+        .http_status_as_error(false)
         .build()
         .new_agent();
 
     let mut request = agent.get(url);
-    if provider == ManifestProvider::OpenSteamTool {
-        request = request.header("User-Agent", OPENSTEAMTOOL_USER_AGENT);
+    if let Some(user_agent) = provider.user_agent() {
+        request = request.header("User-Agent", user_agent);
     }
 
-    let mut response = request.call().map_err(|error| error.to_string())?;
-    let body = response
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(error) => return ProviderOutcome::Failed(error.to_string()),
+    };
+
+    let status = response.status();
+    if status.as_u16() == 429 {
+        let retry_after = parse_retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+        )
+        .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
+        return ProviderOutcome::RateLimited(retry_after);
+    }
+    // 401/404 mean "not this manifest", not "this source is broken". Everything
+    // else non-2xx — including 403, which here is a Cloudflare block rather than
+    // a per-target refusal — is treated as the provider being unhealthy.
+    if matches!(status.as_u16(), 401 | 404) {
+        return ProviderOutcome::Denied(status.as_u16());
+    }
+    if !status.is_success() {
+        return ProviderOutcome::Failed(format!("http status {}", status.as_u16()));
+    }
+
+    let body = match response
         .body_mut()
         .with_config()
         .limit(MAX_PROVIDER_RESPONSE_BYTES)
         .read_to_string()
-        .map_err(|error| error.to_string())?;
-    parse_provider_response(provider, body.trim())
+    {
+        Ok(body) => body,
+        Err(error) => return ProviderOutcome::Failed(error.to_string()),
+    };
+
+    match parse_provider_response(provider, body.trim()) {
+        Ok(code) => ProviderOutcome::Code(code),
+        Err(error) => ProviderOutcome::Failed(error),
+    }
 }
 
-fn parse_provider_response(provider: ManifestProvider, body: &str) -> Result<u64, String> {
+fn parse_provider_response(provider: &ManifestSource, body: &str) -> Result<u64, String> {
     let body = body.trim();
-    if provider == ManifestProvider::SteamRun {
+    if provider.response_format() == ManifestResponseFormat::Json {
+        let field = provider
+            .json_field()
+            .ok_or_else(|| "json provider has no json_field".to_owned())?;
         let value: serde_json::Value =
             serde_json::from_str(body).map_err(|error| error.to_string())?;
-        return value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "missing string content field".to_owned())?
-            .parse::<u64>()
-            .map_err(|error| error.to_string());
+        let found = value
+            .get(field)
+            .ok_or_else(|| format!("missing {field} field"))?;
+        // Accept both `{"content":"123"}` and `{"content":123}`: a custom
+        // endpoint's shape is not ours to dictate.
+        return match found {
+            serde_json::Value::String(text) => text
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| error.to_string()),
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| format!("{field} is not an unsigned integer")),
+            _ => Err(format!("{field} is neither a string nor a number")),
+        };
     }
 
     body.parse::<u64>().map_err(|error| error.to_string())
@@ -370,6 +746,7 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
 mod tests {
     use super::*;
     use prost::Message;
+    use vapor_forge_config::{CustomManifestProvider, ManifestProvider};
 
     fn make_req_header(job_id: u64, method: &str) -> Vec<u8> {
         CMsgProtoBufHeader {
@@ -631,21 +1008,406 @@ mod tests {
         assert_eq!(completed[0].code, 0);
     }
 
+    fn built_in(provider: ManifestProvider) -> ManifestSource {
+        ManifestSource::BuiltIn(provider)
+    }
+
+    fn custom(
+        name: &str,
+        format: ManifestResponseFormat,
+        json_field: Option<&str>,
+    ) -> ManifestSource {
+        ManifestSource::Custom(CustomManifestProvider {
+            name: name.to_owned(),
+            url: format!("https://{name}.example/{{gid}}"),
+            user_agent: None,
+            format,
+            json_field: json_field.map(str::to_owned),
+            min_interval_ms: None,
+        })
+    }
+
     #[test]
     fn parses_built_in_provider_responses() {
         assert_eq!(
-            parse_provider_response(ManifestProvider::OpenSteamTool, "123456").unwrap(),
+            parse_provider_response(&built_in(ManifestProvider::ManifestDex), "123456").unwrap(),
             123456
         );
         assert_eq!(
-            parse_provider_response(ManifestProvider::Wudrm, " 654321 ").unwrap(),
+            parse_provider_response(&built_in(ManifestProvider::OpenSteamTool), "123456").unwrap(),
+            123456
+        );
+        assert_eq!(
+            parse_provider_response(&built_in(ManifestProvider::Wudrm), " 654321 ").unwrap(),
             654321
         );
         assert_eq!(
-            parse_provider_response(ManifestProvider::SteamRun, r#"{"content":"9999999999"}"#,)
-                .unwrap(),
+            parse_provider_response(
+                &built_in(ManifestProvider::SteamRun),
+                r#"{"content":"9999999999"}"#,
+            )
+            .unwrap(),
             9_999_999_999
         );
-        assert!(parse_provider_response(ManifestProvider::SteamRun, r#"{"other":"1"}"#).is_err());
+        assert!(
+            parse_provider_response(&built_in(ManifestProvider::SteamRun), r#"{"other":"1"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_custom_provider_responses() {
+        let plain = custom("plain", ManifestResponseFormat::Plain, None);
+        assert_eq!(parse_provider_response(&plain, " 42 ").unwrap(), 42);
+        assert!(parse_provider_response(&plain, "42abc").is_err());
+
+        // A custom JSON endpoint may quote the code or leave it a number.
+        let json = custom("json", ManifestResponseFormat::Json, Some("code"));
+        assert_eq!(
+            parse_provider_response(&json, r#"{"code":"777"}"#).unwrap(),
+            777
+        );
+        assert_eq!(
+            parse_provider_response(&json, r#"{"code":777}"#).unwrap(),
+            777
+        );
+        assert!(parse_provider_response(&json, r#"{"code":true}"#).is_err());
+        assert!(parse_provider_response(&json, r#"{"other":1}"#).is_err());
+    }
+
+    #[test]
+    fn malformed_custom_entries_are_rejected_before_any_request() {
+        let no_placeholder = ManifestSource::Custom(CustomManifestProvider {
+            name: "mirror".to_owned(),
+            url: "https://my.mirror/latest".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+
+        // fetch_manifest_code skips these, so an empty chain yields no code and
+        // — the point of the check — issues no HTTP request.
+        assert!(no_placeholder.rejection().is_some());
+        let context = FetchContext {
+            app_id: 730,
+            depot_id: 731,
+            gid: 1,
+        };
+        assert_eq!(
+            fetch_manifest_code(context, &[no_placeholder], 10, 10, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_every_placeholder_in_a_custom_url() {
+        let pool = ManifestSource::Custom(CustomManifestProvider {
+            name: "pool".to_owned(),
+            // Valve's own GetManifestRequestCode shape: depot, then manifest.
+            url: "https://example.test/manifest/{depotId}/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+        assert_eq!(
+            pool.resolve_url(730, 731, 555),
+            "https://example.test/manifest/731/555"
+        );
+        assert!(pool.rejection().is_none());
+
+        let with_app = ManifestSource::Custom(CustomManifestProvider {
+            name: "withapp".to_owned(),
+            url: "https://example.test/{appId}/{depotId}/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+        assert_eq!(
+            with_app.resolve_url(730, 731, 555),
+            "https://example.test/730/731/555"
+        );
+
+        // Built-ins that take only the gid leave the other placeholders inert.
+        assert_eq!(
+            built_in(ManifestProvider::Wudrm).resolve_url(730, 731, 555),
+            "http://gmrc.wudrm.com/manifest/555"
+        );
+        // The built-in pool provider is itself depot-shaped.
+        assert_eq!(
+            built_in(ManifestProvider::Pool20770407).resolve_url(730, 731, 555),
+            "https://20770407.xyz/manifest/731/555"
+        );
+        assert!(built_in(ManifestProvider::Pool20770407)
+            .user_agent()
+            .is_some_and(|ua| ua.starts_with("vapor-forge/")));
+    }
+
+    #[test]
+    fn denial_is_not_a_provider_fault() {
+        // A pool that holds no licence for the app answers 401 per request.
+        // Cooling it down would hide it from every later gid, including the
+        // ones it can serve — so Denied must stay distinct from Failed.
+        let denied = ProviderOutcome::Denied(401);
+        let failed = ProviderOutcome::Failed("http status 503".to_owned());
+
+        assert!(matches!(denied, ProviderOutcome::Denied(401)));
+        assert!(matches!(failed, ProviderOutcome::Failed(_)));
+
+        // The cooldown table is only ever written for the failure classes.
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+        start_cooldown_in(&mut cooldowns, "unhealthy", now, FAILURE_COOLDOWN);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "unhealthy", now),
+            Some(FAILURE_COOLDOWN)
+        );
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "denied-but-healthy", now),
+            None
+        );
+    }
+
+    #[test]
+    fn pacing_defers_a_second_request_then_lets_it_through() {
+        let mut last = HashMap::new();
+        let now = Instant::now();
+        let interval = Duration::from_millis(1000);
+
+        // First request reserves the slot immediately.
+        assert_eq!(reserve_slot_in(&mut last, "pool", now, interval), None);
+
+        // A second one inside the window is told how long to wait, and does
+        // not reserve — otherwise concurrent callers would all think they won.
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(400),
+                interval
+            ),
+            Some(Duration::from_millis(600))
+        );
+
+        // Another provider is unaffected.
+        assert_eq!(reserve_slot_in(&mut last, "other", now, interval), None);
+
+        // Past the window it goes through and re-reserves.
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(1200),
+                interval
+            ),
+            None
+        );
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(1300),
+                interval
+            ),
+            Some(Duration::from_millis(900))
+        );
+    }
+
+    #[test]
+    fn parses_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after(Some("30")), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after(Some(" 5 ")), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after(Some("0")), Some(Duration::ZERO));
+        // HTTP-date form is deliberately unsupported; caller substitutes the default.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn cooldown_hides_a_provider_until_it_expires() {
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
+            None
+        );
+
+        start_cooldown_in(&mut cooldowns, "manifestdex", now, Duration::from_secs(30));
+
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
+            Some(Duration::from_secs(30))
+        );
+        // Other providers stay usable.
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "opensteamtool", now),
+            None
+        );
+
+        let later = now + Duration::from_secs(31);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", later),
+            None
+        );
+        // The expired entry is dropped rather than left to accumulate.
+        assert!(cooldowns.is_empty());
+    }
+
+    #[test]
+    fn cooldown_is_capped() {
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+
+        let applied = start_cooldown_in(
+            &mut cooldowns,
+            "manifestdex",
+            now,
+            Duration::from_secs(86_400),
+        );
+
+        assert_eq!(applied, MAX_RATE_LIMIT_COOLDOWN);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
+            Some(MAX_RATE_LIMIT_COOLDOWN)
+        );
+    }
+
+    fn chain(names: &[&str]) -> Vec<ManifestSource> {
+        names
+            .iter()
+            .map(|name| custom(name, ManifestResponseFormat::Plain, None))
+            .collect()
+    }
+
+    fn context(gid: u64) -> FetchContext {
+        FetchContext {
+            app_id: 10,
+            depot_id: 11,
+            gid,
+        }
+    }
+
+    /// Run the chain with scripted outcomes and return the code plus the order
+    /// in which providers were asked.
+    fn run_scripted(
+        state: &ProviderState,
+        gid: u64,
+        providers: &[ManifestSource],
+        outcome: impl Fn(&str) -> ProviderOutcome,
+    ) -> (Option<u64>, Vec<String>) {
+        let mut asked = Vec::new();
+        let code = run_provider_chain(state, context(gid), providers, |provider| {
+            asked.push(provider.name().to_owned());
+            outcome(provider.name())
+        });
+        (code, asked)
+    }
+
+    #[test]
+    fn a_rerequested_gid_goes_to_other_providers_first() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b", "c"]);
+        let serve = |_: &str| ProviderOutcome::Code(7);
+
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["b"]);
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["c"]);
+        // Every provider has served it: the least recent one comes back first.
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
+        // Another gid keeps the configured order.
+        assert_eq!(run_scripted(&state, 2, &providers, serve).1, ["a"]);
+    }
+
+    #[test]
+    fn a_rerequested_gid_still_reaches_the_previous_provider() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        run_scripted(&state, 1, &providers, |_| ProviderOutcome::Code(7));
+        let (code, asked) = run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::Code(8),
+            _ => ProviderOutcome::Denied(401),
+        });
+
+        assert_eq!(code, Some(8));
+        assert_eq!(asked, ["b", "a"]);
+    }
+
+    #[test]
+    fn served_entries_expire_after_the_rerequest_window() {
+        let mut served = HashMap::new();
+        let now = Instant::now();
+        record_served_in(&mut served, 1, "a", now);
+        record_served_in(&mut served, 1, "b", now + Duration::from_secs(1));
+        record_served_in(&mut served, 1, "a", now + Duration::from_secs(2));
+
+        assert_eq!(served_by_in(&mut served, 1, now), ["b", "a"]);
+        assert!(served_by_in(
+            &mut served,
+            1,
+            now + REREQUEST_WINDOW + Duration::from_secs(2)
+        )
+        .is_empty());
+        assert!(served.is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_backed_off_once_another_provider_serves_the_gid() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (code, _) = run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::Failed("http status 503".to_owned()),
+            _ => ProviderOutcome::Code(7),
+        });
+
+        assert_eq!(code, Some(7));
+        assert!(state.cooldown_remaining("a").is_some());
+        assert!(state.cooldown_remaining("b").is_none());
+        assert_eq!(
+            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)).1,
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn a_gid_no_provider_serves_backs_nobody_off() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (code, asked) = run_scripted(&state, 1, &providers, |_| {
+            ProviderOutcome::Failed("http status 502".to_owned())
+        });
+
+        assert_eq!(code, None);
+        assert_eq!(asked, ["a", "b"]);
+        assert!(state.cooldown_remaining("a").is_none());
+        assert!(state.cooldown_remaining("b").is_none());
+        // The next gid of the same update is still asked everywhere.
+        assert_eq!(
+            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)),
+            (Some(9), vec!["a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_backed_off_even_when_the_chain_fails() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::RateLimited(Duration::from_secs(30)),
+            _ => ProviderOutcome::Failed("timeout".to_owned()),
+        });
+
+        assert!(state.cooldown_remaining("a").is_some());
+        assert!(state.cooldown_remaining("b").is_none());
     }
 }

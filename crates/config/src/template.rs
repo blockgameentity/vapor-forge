@@ -10,7 +10,6 @@ use crate::RuntimeConfig;
 pub const CONFIG_TEMPLATE: &str = include_str!("../../../res/config.default.toml");
 
 pub(crate) const TEMPLATE_EXAMPLES: &[&str] = &[
-    "runtime.patterns_url",
     "apps.shared.include",
     "apps.shared.exclude",
     "[debug]",
@@ -28,6 +27,8 @@ pub(crate) const TEMPLATE_EXAMPLES: &[&str] = &[
     "app_avatar.rules[].avatar",
     "app_avatar.rules[].apps",
     "app_avatar.rules[].exclude",
+    "[steam_id]",
+    "steam_id.480",
     "[[library_inject.libs]]",
     "library_inject.libs[].path",
     "library_inject.libs[].flag",
@@ -393,15 +394,15 @@ fn join_path(prefix: &str, key: &str) -> String {
     }
 }
 
-fn assign_table_positions(table: &mut Table, position: &mut usize) {
+fn assign_table_positions(table: &mut Table, position: &mut isize) {
     for (_, item) in table.iter_mut() {
         if let Some(child) = item.as_table_mut() {
-            child.set_position(*position);
+            child.set_position(Some(*position));
             *position += 1;
             assign_table_positions(child, position);
         } else if let Some(array) = item.as_array_of_tables_mut() {
             for child in array.iter_mut() {
-                child.set_position(*position);
+                child.set_position(Some(*position));
                 *position += 1;
                 assign_table_positions(child, position);
             }

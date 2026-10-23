@@ -81,6 +81,7 @@ const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
     crate::capability::Capability::CloudHttp,
     crate::capability::Capability::LaunchEnvironment,
     crate::capability::Capability::LegacyCdKeyControl,
+    crate::capability::Capability::SteamIdOverride,
 ];
 
 const STEAMUI_CAPABILITIES: &[crate::capability::Capability] = &[
@@ -548,15 +549,23 @@ fn resolve_cuser_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
         .copied()
         .filter(|candidate| candidate.slot == public_slot)
         .filter(|candidate| vtable_slot_count(&candidates, candidate.vtable_va) == iface_slot_count)
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let implementation = super::ticket::resolve_adapter_implementation(
                 code,
                 name,
                 candidate.func_va,
                 check_ownership,
-            )
-            .unwrap_or(candidate.func_va);
-            (candidate, implementation)
+                candidate.offset_to_top.unsigned_abs(),
+            );
+            // The IsUserSubscribedAppInTicket wrapper takes fewer arguments
+            // than the implementation the hook is typed for, so the wrapper
+            // itself is never a fallback target.
+            let implementation = match implementation {
+                Some(implementation) => implementation,
+                None if name == super::ticket::IS_SUBSCRIBED_IN_TICKET_NAME => return None,
+                None => candidate.func_va,
+            };
+            Some((candidate, implementation))
         })
         .collect::<Vec<_>>();
     by_slot.sort_by_key(|(_, implementation)| *implementation);
@@ -805,6 +814,24 @@ fn do_install() {
         check_ownership,
         super::legacy_cdkey::hk_requires_legacy_cdkey as super::legacy_cdkey::RequiresLegacyCdKeyFn,
     );
+    let d_cuser_get_steam_id = resolve_cuser_adapter(
+        &code,
+        super::user::CUSER_GET_STEAM_ID_NAME,
+        "GetSteamID",
+        check_ownership,
+        super::user::hk_cuser_get_steam_id as super::user::CUserGetSteamIdFn,
+    )
+    .filter(|pending| {
+        let valid = super::user::validate_cuser_get_steam_id(&code, pending.callee_addr);
+        if !valid {
+            error!(
+                hook = super::user::CUSER_GET_STEAM_ID_NAME,
+                target = format_args!("0x{:x}", pending.callee_addr),
+                "CUser adapter is not the expected member read"
+            );
+        }
+        valid
+    });
     let mut d_build_depot = resolve_from_registry(
         &registry,
         &code,
@@ -884,17 +911,39 @@ fn do_install() {
 
     // Resolve SetEnvString as a raw fn pointer for library injection, and as a
     // detour so LD_PRELOAD writes made by Steam can be merged with ours.
-    let d_set_env_string = if env_hooks_supported() {
+    // The writer's convention decides which replacement can be installed: a
+    // three-argument detour in front of a five-parameter callee would forward a
+    // short argument list.
+    if env_hooks_supported() {
         super::env::resolve_set_env_string(&registry, &code);
+    }
+    let env_writer_abi = super::env::set_env_string_abi();
+    let d_set_env_string = matches!(
+        env_writer_abi,
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValue)
+    )
+    .then(|| {
         resolve_from_registry(
             &registry,
             &code,
             "SetEnvString",
             super::env::hk_set_env_string as super::env::SetEnvStringFn,
         )
-    } else {
-        None
-    };
+    })
+    .flatten();
+    let d_set_env_string_sep = matches!(
+        env_writer_abi,
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValueSeparator)
+    )
+    .then(|| {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "SetEnvString",
+            super::env::hk_set_env_string_sep as super::env::SetEnvStringSepFn,
+        )
+    })
+    .flatten();
 
     let callback_group_resolved = d_set_api_call_result.is_some()
         && d_register_internal_callback.is_some()
@@ -1021,7 +1070,21 @@ fn do_install() {
             super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME,
             d_is_cloud_enabled_for_account
         ),
-        hr!("SetEnvString", d_set_env_string),
+        // Either convention may be the one pending, so report whichever is.
+        HookResult {
+            name: "SetEnvString",
+            installed: d_set_env_string.is_some() || d_set_env_string_sep.is_some(),
+            addr: d_set_env_string
+                .as_ref()
+                .map(|pending| pending.callee_addr)
+                .or_else(|| {
+                    d_set_env_string_sep
+                        .as_ref()
+                        .map(|pending| pending.callee_addr)
+                })
+                .unwrap_or(0),
+        },
+        hr!(super::user::CUSER_GET_STEAM_ID_NAME, d_cuser_get_steam_id),
     ];
 
     macro_rules! finalize {
@@ -1197,13 +1260,27 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR),
         d_is_cloud_enabled_for_account
     );
-    // Optional: without it native .so entries still reach the map, but Steam's
-    // own LD_PRELOAD write replaces them (see hk_set_env_string).
-    finalize!(
+    // Without it native .so entries still reach the map, but Steam's own
+    // LD_PRELOAD write replaces them (see hk_set_env_string). Exactly one of the
+    // two conventions can be pending, so the results are folded together.
+    let set_env_installed = finalize!(
         27,
         "SetEnvString",
         std::ptr::addr_of_mut!(super::env::SET_ENV_STRING_DETOUR),
         d_set_env_string
+    );
+    let set_env_sep_installed = finalize!(
+        27,
+        "SetEnvString",
+        std::ptr::addr_of_mut!(super::env::SET_ENV_STRING_SEP_DETOUR),
+        d_set_env_string_sep
+    );
+    hook_results[27].installed = set_env_installed || set_env_sep_installed;
+    finalize!(
+        28,
+        super::user::CUSER_GET_STEAM_ID_NAME,
+        std::ptr::addr_of_mut!(super::user::CUSER_GET_STEAM_ID_DETOUR),
+        d_cuser_get_steam_id
     );
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
@@ -1218,6 +1295,11 @@ fn do_install() {
         &[
             (hook_results[18].name, hook_results[18].installed),
             (hook_results[19].name, hook_results[19].installed),
+            // RecvPkt reads and rewrites the packet through this layout.
+            (
+                "CNetPacket layout",
+                super::network::packet_layout().is_some(),
+            ),
         ],
     );
     crate::capability::set_from_requirements(
@@ -1274,6 +1356,13 @@ fn do_install() {
     crate::capability::set_from_requirements(
         crate::capability::Capability::LegacyCdKeyControl,
         &[(hook_results[25].name, hook_results[25].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::SteamIdOverride,
+        &[
+            (hook_results[28].name, hook_results[28].installed),
+            ("current IPC AppID", super::current_app::is_ready()),
+        ],
     );
     crate::capability::set_from_requirements(
         crate::capability::Capability::DlcOverrides,

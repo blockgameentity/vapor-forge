@@ -129,8 +129,8 @@ impl PatternArch {
     fn patterns_path(self) -> PathBuf {
         let res_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../res");
         match self {
-            Self::X86 => res_dir.join("patterns.toml"),
-            Self::X86_64 => res_dir.join("patterns.x86_64.toml"),
+            Self::X86 => res_dir.join("patterns/x86.toml"),
+            Self::X86_64 => res_dir.join("patterns/x86_64.toml"),
         }
     }
 
@@ -280,7 +280,8 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     };
     for group in group_variants(&variants) {
         let entry = group[0];
-        let resolution = resolve_entry_group_with(segment.bytes, &group, Some(&accept));
+        let bitness = u32::from(segment.elf_class.bits());
+        let resolution = resolve_entry_group_with(segment.bytes, bitness, &group, Some(&accept));
         match resolution {
             Ok(result) => {
                 if group.len() == 1 {
@@ -777,7 +778,7 @@ mod tests {
             "--arch".to_owned(),
             "x86_64".to_owned(),
             "--patterns".to_owned(),
-            "res/patterns.x86_64.toml".to_owned(),
+            "res/patterns/x86_64.toml".to_owned(),
             "--steamclient".to_owned(),
             "steamclient.so".to_owned(),
         ])
@@ -789,7 +790,7 @@ mod tests {
     #[test]
     fn x86_patterns_have_semantic_validation() {
         let missing = missing_semantic_validations(
-            include_str!("../../../../res/patterns.toml"),
+            include_str!("../../../../res/patterns/x86.toml"),
             SemanticArch::X86,
         );
         assert!(
@@ -801,7 +802,7 @@ mod tests {
     #[test]
     fn x86_64_patterns_have_semantic_validation() {
         let missing = missing_semantic_validations(
-            include_str!("../../../../res/patterns.x86_64.toml"),
+            include_str!("../../../../res/patterns/x86_64.toml"),
             SemanticArch::X86_64,
         );
         assert!(
@@ -1047,6 +1048,11 @@ mod tests {
         place_asm64(&mut code, start + 0x20, |a| a.mov(ecx, 6));
         place_asm64(&mut code, start + 0x30, |a| {
             a.mov(dword_ptr(rsp + 0x70), -1)
+        });
+        // The license vector base, its count, and the license state: the check
+        // matches the distances between the three, not their absolute offsets.
+        place_asm64(&mut code, start + 0x08, |a| {
+            a.mov(rax, qword_ptr(rbx + 0x2488))
         });
         place_asm64(&mut code, start + 0x40, |a| {
             a.mov(edx, dword_ptr(rbx + 0x2498))
@@ -1323,6 +1329,46 @@ mod tests {
     }
 
     #[test]
+    fn update_ticket32_receiver_follows_the_vtable_adjustment() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0x10, |a| a.cmp(dword_ptr(ecx - 0x17d4), 4));
+        place_asm32(&mut code, 0x30, |a| a.sub(eax, 0x18b0));
+
+        assert!(update_ticket32_has_valid_receiver(&code, 0x18b0));
+        assert!(!update_ticket32_has_valid_receiver(&code, 0x18d8));
+    }
+
+    #[test]
+    fn is_subscribed_wrapper32_follows_the_vtable_adjustment() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0x10, |a| a.lea(eax, dword_ptr(esp + 0x10)));
+        place_asm32(&mut code, 0x20, |a| a.sub(eax, 0x18b0));
+
+        assert!(validate_is_subscribed_wrapper_abi(
+            &code,
+            0,
+            SemanticArch::X86,
+            0x18b0
+        ));
+        assert!(!validate_is_subscribed_wrapper_abi(
+            &code,
+            0,
+            SemanticArch::X86,
+            0x18d8
+        ));
+    }
+
+    #[test]
+    fn license_vector_base32_must_be_the_license_block() {
+        let mut code = vec![0x90; 0x40];
+        place_asm32(&mut code, 0x10, |a| a.lea(eax, dword_ptr(esi + 0x1af8)));
+
+        assert!(has_x86_license_vector_base32(&code, Some(0x1af8)));
+        assert!(!has_x86_license_vector_base32(&code, Some(0x1ae8)));
+        assert!(!has_x86_license_vector_base32(&code, None));
+    }
+
+    #[test]
     fn cuser_adapter_resolution_rejects_missing_implementation() {
         let code = vec![0x90; 0x200];
         assert_eq!(
@@ -1333,6 +1379,7 @@ mod tests {
                 CUserAdapterKind::IsSubscribedInTicket,
                 SemanticArch::X86_64,
                 &HashMap::new(),
+                0x1fd0,
             ),
             None
         );
@@ -1370,8 +1417,23 @@ mod tests {
                 CUserAdapterKind::IsSubscribedInTicket,
                 SemanticArch::X86_64,
                 &HashMap::new(),
+                0x1fd0,
             ),
             Some(implementation)
+        );
+        // The wrapper adjusts by 0x1fd0, so a vtable at another offset is not
+        // its owner.
+        assert_eq!(
+            resolve_cuser_adapter_implementation(
+                &code,
+                0,
+                wrapper,
+                CUserAdapterKind::IsSubscribedInTicket,
+                SemanticArch::X86_64,
+                &HashMap::new(),
+                0x1f88,
+            ),
+            None
         );
     }
 }

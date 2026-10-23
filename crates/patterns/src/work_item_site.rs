@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Runtime decode of Steam's own bare-`CWorkItem` post site.
 //!
 //! `CWebSocketConnection::PostDelayedCloseWorkItem` is the shortest place where
@@ -19,7 +17,8 @@
 //! Every value is fail-closed: a decode that does not produce all of them leaves
 //! native dispatch disabled rather than posting a half-formed item.
 //!
-//! Kept out of `client` so it compiles, and is tested, on non-Linux hosts too.
+//! The runtime and the offline scan both decode through here, so what the scan
+//! reports is what the hooks will use.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,27 +40,27 @@ const MAX_ITEM_SIZE: usize = 0x1000;
 const MIN_TIMER_VPTRS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkItemSite {
+pub struct WorkItemSite {
     /// Pointer slot holding the CNet `CWorkThreadPool`. Dereferenced at post
     /// time, not here: the pool is published after this decode runs.
-    pub(crate) pool_slot: usize,
+    pub pool_slot: usize,
     /// `CFastTimerCumulativeTimer` vtable shared by the item's embedded timers.
-    pub(crate) timer_vtable: usize,
+    pub timer_vtable: usize,
     /// Bytes Steam allocates for one item.
-    pub(crate) item_size: usize,
+    pub item_size: usize,
     /// Offsets the timer vtable is written to, ascending.
-    pub(crate) timer_vptr_offsets: Vec<usize>,
+    pub timer_vptr_offsets: Vec<usize>,
     /// The refcount, the one field the constructor initialises to 1. A caller
     /// reference is owned until the item's completion callback releases it.
-    pub(crate) refcount_offset: usize,
+    pub refcount_offset: usize,
     /// Offsets and widths, at most 8, of the "no value" sentinels set to -1.
-    pub(crate) sentinel_offsets: Vec<(usize, usize)>,
+    pub sentinel_offsets: Vec<(usize, usize)>,
     /// `CWorkThreadPool::AddWorkItem`, taken from this site's own call. Compared
     /// against the pattern-resolved address so a mis-scan of either is caught.
-    pub(crate) add_work_item: usize,
+    pub add_work_item: usize,
 }
 
-pub(crate) fn decode(
+pub fn decode(
     bitness: u32,
     code_base: usize,
     code: &[u8],
@@ -93,7 +92,6 @@ pub(crate) fn decode(
     let mut item_registers: HashSet<Register> = HashSet::new();
     let mut ones: Vec<usize> = Vec::new();
     let mut sentinels: Vec<(usize, usize)> = Vec::new();
-    let mut first_lea = None;
     let mut pool_slot = None;
     let mut last_immediate = None;
     let mut item_size = None;
@@ -111,9 +109,13 @@ pub(crate) fn decode(
             {
                 calls.push((ip, instruction.near_branch_target() as usize));
             }
-            // The allocation size is the argument in flight at the allocator
-            // call that follows the first resolved lea.
-            if item_size.is_none() && first_lea.is_some_and(|lea| lea < ip) {
+            // The allocator call is the first one whose in-flight argument is a
+            // plausible item size. Some builds load the pool global only after
+            // this call, so a preceding lea does not mark it; the size does.
+            if item_size.is_none()
+                && last_immediate
+                    .is_some_and(|size| (MIN_ITEM_SIZE..=MAX_ITEM_SIZE).contains(&size))
+            {
                 item_size = last_immediate;
                 item_registers.clear();
                 item_registers.insert(return_register(bitness));
@@ -127,7 +129,6 @@ pub(crate) fn decode(
         if instruction.mnemonic() == Mnemonic::Lea {
             if let Some(address) = resolve_lea(&instruction, pic) {
                 tracked.insert(instruction.op0_register().full_register(), address);
-                first_lea.get_or_insert(ip);
                 continue;
             }
         }
@@ -258,11 +259,18 @@ fn resolve_lea(instruction: &Instruction, pic: Option<(Register, usize)>) -> Opt
     ))
 }
 
-/// `mov reg, [tracked]`, which is how a pointer global is read through its slot.
+/// `mov reg, [tracked]` or `push [tracked]`, the two ways a pointer global is
+/// read through its slot. i686 builds that pass the pool on the stack push it
+/// straight from the slot.
 fn dereferenced(instruction: &Instruction, tracked: &HashMap<Register, usize>) -> Option<usize> {
-    if instruction.mnemonic() != Mnemonic::Mov
-        || instruction.op0_kind() != OpKind::Register
-        || instruction.op1_kind() != OpKind::Memory
+    let reads_slot = match instruction.mnemonic() {
+        Mnemonic::Mov => {
+            instruction.op0_kind() == OpKind::Register && instruction.op1_kind() == OpKind::Memory
+        }
+        Mnemonic::Push => instruction.op0_kind() == OpKind::Memory,
+        _ => false,
+    };
+    if !reads_slot
         || instruction.memory_index() != Register::None
         || instruction.memory_displacement64() != 0
     {
@@ -421,99 +429,320 @@ fn read_i32(code: &[u8], offset: usize) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::code_asm::*;
+    use iced_x86::{BlockEncoderOptions, Code, MemoryOperand};
 
-    /// `CWebSocketConnection::PostDelayedCloseWorkItem` from the i686 client,
-    /// captured from the function entry so the PIC prologue is in range.
-    const X86_FUNCTION: usize = 0x02d9_1fb0;
-    const X86_SITE: usize = 0x02d9_1fc2;
-    const X86_CODE: &[u8] = include_bytes!("testdata/post_delayed_close_x86.bin");
-    /// Offset of the prologue's `call __x86.get_pc_thunk.bx` within the fixture.
-    const X86_THUNK_CALL: usize = 0x07;
+    /// Addresses the synthetic sites refer to; only their relations matter.
+    const BASE: usize = 0x0200_0000;
+    const ALLOCATOR: u64 = 0x0280_0000;
+    const ADD_WORK_ITEM: u64 = 0x0280_1000;
+    const POOL_SLOT: usize = 0x0300_0040;
+    const TIMER_VTABLE: usize = 0x02f0_0100;
+    const ITEM_VTABLE: usize = 0x02f0_0800;
+    /// The i686 prologue's `add ebx, imm32`; globals are taken relative to the
+    /// address it produces.
+    const PIC_ADD: i32 = 0x0100_0000;
 
-    /// The same function from the steamrt x86_64 client.
-    const X64_BASE: usize = 0x027a_7929;
-    const X64_SITE: usize = 0x027a_7929;
-    const X64_CODE: &[u8] = include_bytes!("testdata/post_delayed_close_x64.bin");
+    struct Site {
+        code: Vec<u8>,
+        /// Where the decode starts: past the prologue on i686.
+        site: usize,
+        /// The `AddWorkItem` call.
+        enqueue: usize,
+    }
 
-    /// The real `__x86.get_pc_thunk.bx` sits tens of megabytes away in .text, so
-    /// the fixture cannot span it. Place one just ahead of the function and
-    /// retarget the prologue call; nothing the decode reads is otherwise
-    /// changed, and the anchor still resolves to the client's own 0x2f0e9ac.
-    fn x86_region(length: usize) -> (usize, Vec<u8>) {
-        const THUNK: [u8; 4] = [0x8b, 0x1c, 0x24, 0xc3]; // mov ebx, [esp] ; ret
-        let mut code = THUNK.to_vec();
-        code.resize(0x10, 0x90);
-        let function = code.len();
-        let base = X86_FUNCTION - function;
-        code.extend_from_slice(&X86_CODE[..length.min(X86_CODE.len())]);
-        let call = function + X86_THUNK_CALL;
-        let after = (base + call + 5) as u32;
-        let relative = (base as u32).wrapping_sub(after);
-        code[call + 1..call + 5].copy_from_slice(&relative.to_le_bytes());
-        (base, code)
+    /// What the inlined constructor writes, and so what the decode reads back.
+    struct Item {
+        size: u32,
+        refcount: i32,
+        timer_vptrs: [i32; 4],
+        /// Offset and width of each field set to -1.
+        sentinels: &'static [(i32, usize)],
+    }
+
+    const X86_ITEM: Item = Item {
+        size: 0xa4,
+        refcount: 0x04,
+        timer_vptrs: [0x24, 0x3c, 0x54, 0x6c],
+        sentinels: &[(0x84, 4), (0x88, 4), (0x98, 4)],
+    };
+    const X64_ITEM: Item = Item {
+        size: 0xd8,
+        refcount: 0x08,
+        timer_vptrs: [0x30, 0x50, 0x70, 0x90],
+        sentinels: &[(0xb0, 8), (0xc8, 4)],
+    };
+    const X64_LARGER_ITEM: Item = Item {
+        size: 0xe8,
+        refcount: 0x08,
+        timer_vptrs: [0x40, 0x60, 0x80, 0xa0],
+        sentinels: &[(0xc0, 8), (0xd8, 4)],
+    };
+
+    impl Item {
+        fn decoded(&self) -> WorkItemSite {
+            WorkItemSite {
+                pool_slot: POOL_SLOT,
+                timer_vtable: TIMER_VTABLE,
+                item_size: self.size as usize,
+                timer_vptr_offsets: self.timer_vptrs.map(|offset| offset as usize).to_vec(),
+                refcount_offset: self.refcount as usize,
+                sentinel_offsets: self
+                    .sentinels
+                    .iter()
+                    .map(|&(offset, width)| (offset as usize, width))
+                    .collect(),
+                add_work_item: ADD_WORK_ITEM as usize,
+            }
+        }
+
+        /// Fields after the sentinels: a copied value and a non-sentinel constant.
+        fn tail(&self) -> [i32; 2] {
+            [self.size as i32 - 0x0c, self.size as i32 - 0x08]
+        }
+    }
+
+    /// Assemble at `BASE` and return the code with the address of each label.
+    fn assemble<const N: usize>(
+        bitness: u32,
+        build: impl FnOnce(&mut CodeAssembler, &mut [CodeLabel; N]) -> Result<(), IcedError>,
+    ) -> (Vec<u8>, [usize; N]) {
+        let mut a = CodeAssembler::new(bitness).unwrap();
+        let mut labels = [(); N].map(|()| a.create_label());
+        build(&mut a, &mut labels).unwrap();
+        let result = a
+            .assemble_options(
+                BASE as u64,
+                BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let ips = labels.map(|label| result.label_ip(&label).unwrap() as usize);
+        (result.inner.code_buffer, ips)
+    }
+
+    /// `lea reg, [rip + target]` for an absolute target outside the code.
+    fn lea_rip(
+        a: &mut CodeAssembler,
+        register: AsmRegister64,
+        target: usize,
+    ) -> Result<(), IcedError> {
+        a.add_instruction(Instruction::with2(
+            Code::Lea_r64_m,
+            Register::from(register),
+            MemoryOperand::with_base_displ(Register::RIP, target as i64),
+        )?)
+    }
+
+    /// i686 PIC: a `get_pc_thunk` call in the prologue, the pool passed on the
+    /// stack, and the item kept in the allocator's return register throughout.
+    fn x86_site() -> Site {
+        let item = &X86_ITEM;
+        // Globals are addressed from the anchor, which is only known once the
+        // prologue is laid out. Every displacement is a full imm32 on both
+        // passes, so the layout does not move between them.
+        let layout = |anchor: usize| {
+            let from_anchor = |address: usize| address.wrapping_sub(anchor) as i32;
+            assemble(32, |a, [after_thunk, site, enqueue]| {
+                // `__x86.get_pc_thunk.bx`, placed ahead of the function so a
+                // truncated body still reaches it.
+                let mut thunk = a.create_label();
+                let mut exit = a.create_label();
+                a.set_label(&mut thunk)?;
+                a.mov(ebx, dword_ptr(esp))?;
+                a.ret()?;
+                a.push(edi)?;
+                a.push(esi)?;
+                a.push(ebx)?;
+                a.mov(esi, dword_ptr(esp + 0x10))?;
+                a.call(thunk)?;
+                a.set_label(after_thunk)?;
+                a.add(ebx, PIC_ADD)?;
+                a.set_label(site)?;
+                a.cmp(dword_ptr(esi + 0x10), 2)?;
+                a.jne(exit)?;
+                a.lea(eax, ptr(ebx + from_anchor(POOL_SLOT)))?;
+                a.sub(esp, 0x0c)?;
+                a.mov(edi, dword_ptr(eax))?;
+                a.push(item.size as i32)?;
+                a.call(ALLOCATOR)?;
+                a.mov(ecx, dword_ptr(esi + 0x0c))?;
+                a.lea(edx, ptr(ebx + from_anchor(TIMER_VTABLE)))?;
+                for offset in item.timer_vptrs {
+                    a.mov(dword_ptr(eax + offset), edx)?;
+                }
+                a.mov(dword_ptr(eax + item.refcount), 1)?;
+                a.mov(dword_ptr(eax + 0x08), 0)?;
+                for &(offset, _) in item.sentinels {
+                    a.mov(dword_ptr(eax + offset), -1)?;
+                }
+                a.lea(edx, ptr(ebx + from_anchor(ITEM_VTABLE)))?;
+                a.mov(dword_ptr(eax), edx)?;
+                let [copied, constant] = item.tail();
+                a.mov(dword_ptr(eax + copied), ecx)?;
+                a.mov(dword_ptr(eax + constant), 1000)?;
+                a.pop(ecx)?;
+                a.pop(esi)?;
+                a.push(eax)?;
+                a.push(edi)?;
+                a.set_label(enqueue)?;
+                a.call(ADD_WORK_ITEM)?;
+                a.add(esp, 0x10)?;
+                a.mov(eax, 1)?;
+                a.set_label(&mut exit)?;
+                a.pop(ebx)?;
+                a.pop(esi)?;
+                a.pop(edi)?;
+                a.ret()
+            })
+        };
+        let (_, [after_thunk, ..]) = layout(0);
+        let (code, [_, site, enqueue]) = layout(after_thunk.wrapping_add(PIC_ADD as usize));
+        Site {
+            code,
+            site,
+            enqueue,
+        }
+    }
+
+    /// x86_64 with the pool global read before the allocation and parked in a
+    /// callee-saved register, entered at the pattern match.
+    fn x64_site_pool_first() -> Site {
+        let item = &X64_ITEM;
+        let (code, [site, enqueue]) = assemble(64, |a, [site, enqueue]| {
+            let mut exit = a.create_label();
+            a.set_label(site)?;
+            a.cmp(dword_ptr(rdi + 0x18), 2)?;
+            a.jne(exit)?;
+            lea_rip(a, rax, POOL_SLOT)?;
+            a.mov(edi, item.size)?;
+            a.mov(rbp, qword_ptr(rax))?;
+            a.call(ALLOCATOR)?;
+            x64_constructor(a, item)?;
+            a.mov(rdi, rbp)?;
+            a.set_label(enqueue)?;
+            a.call(ADD_WORK_ITEM)?;
+            a.mov(eax, 1)?;
+            a.set_label(&mut exit)?;
+            a.ret()
+        });
+        Site {
+            code,
+            site,
+            enqueue,
+        }
+    }
+
+    /// x86_64 that reads the pool global only after filling the item in, so no
+    /// global load precedes the allocation size; entered at the function start.
+    fn x64_site_pool_last() -> Site {
+        let item = &X64_LARGER_ITEM;
+        let (code, [site, enqueue]) = assemble(64, |a, [site, enqueue]| {
+            let mut exit = a.create_label();
+            a.set_label(site)?;
+            a.push(rbx)?;
+            a.cmp(dword_ptr(rdi + 0x10), 2)?;
+            a.mov(rbx, rdi)?;
+            a.jne(exit)?;
+            a.mov(edi, item.size)?;
+            a.call(ALLOCATOR)?;
+            x64_constructor(a, item)?;
+            lea_rip(a, rax, POOL_SLOT)?;
+            a.mov(rdi, qword_ptr(rax))?;
+            a.set_label(enqueue)?;
+            a.call(ADD_WORK_ITEM)?;
+            a.mov(eax, 1)?;
+            a.set_label(&mut exit)?;
+            a.pop(rbx)?;
+            a.ret()
+        });
+        Site {
+            code,
+            site,
+            enqueue,
+        }
+    }
+
+    /// The inlined constructor: the item moves from rax to rsi, and rax is then
+    /// reused for both vtables.
+    fn x64_constructor(a: &mut CodeAssembler, item: &Item) -> Result<(), IcedError> {
+        a.mov(edx, dword_ptr(rbx + 0x14))?;
+        a.mov(rsi, rax)?;
+        a.mov(dword_ptr(rax + item.refcount), 1)?;
+        a.mov(qword_ptr(rax + 0x10), 0)?;
+        a.xor(eax, eax)?;
+        a.mov(word_ptr(rsi + 0x22), ax)?;
+        lea_rip(a, rax, TIMER_VTABLE)?;
+        for offset in item.timer_vptrs {
+            a.mov(qword_ptr(rsi + offset), rax)?;
+        }
+        lea_rip(a, rax, ITEM_VTABLE)?;
+        a.mov(qword_ptr(rsi), rax)?;
+        for &(offset, width) in item.sentinels {
+            match width {
+                8 => a.mov(qword_ptr(rsi + offset), -1)?,
+                _ => a.mov(dword_ptr(rsi + offset), -1)?,
+            }
+        }
+        let [copied, constant] = item.tail();
+        a.mov(dword_ptr(rsi + copied), edx)?;
+        a.mov(dword_ptr(rsi + constant), 1000)
     }
 
     #[test]
     fn decodes_the_i686_site() {
-        let (base, code) = x86_region(usize::MAX);
-        let site = decode(32, base, &code, X86_SITE).unwrap();
-        // ebx anchors at 0x2f0e9ac: pool slot +0x7226c, timer vtable -0xab5e0.
-        assert_eq!(site.pool_slot, 0x02f8_0c18);
-        assert_eq!(site.timer_vtable, 0x02e6_33cc);
-        assert_eq!(site.item_size, 0xa4);
-        assert_eq!(site.timer_vptr_offsets, vec![0x24, 0x3c, 0x54, 0x6c]);
-        assert_eq!(site.refcount_offset, 0x04);
-        assert_eq!(site.sentinel_offsets, vec![(0x84, 4), (0x88, 4), (0x98, 4)]);
-        assert_eq!(site.add_work_item, 0x02d9_79c0);
+        let site = x86_site();
+        assert_eq!(
+            decode(32, BASE, &site.code, site.site),
+            Ok(X86_ITEM.decoded())
+        );
     }
 
     #[test]
     fn decodes_the_x86_64_site() {
-        let site = decode(64, X64_BASE, X64_CODE, X64_SITE).unwrap();
-        assert_eq!(site.pool_slot, 0x031e_9920);
-        assert_eq!(site.timer_vtable, 0x02ff_2af0);
-        assert_eq!(site.item_size, 0xd8);
-        assert_eq!(site.timer_vptr_offsets, vec![0x30, 0x50, 0x70, 0x90]);
-        assert_eq!(site.refcount_offset, 0x08);
-        assert_eq!(site.sentinel_offsets, vec![(0xb0, 8), (0xc8, 4)]);
-        assert_eq!(site.add_work_item, 0x027a_c2e0);
+        let site = x64_site_pool_first();
+        assert_eq!(
+            decode(64, BASE, &site.code, site.site),
+            Ok(X64_ITEM.decoded())
+        );
     }
 
     #[test]
-    fn the_item_vtable_is_not_mistaken_for_the_timer_vtable() {
-        // Both are taken with the same instruction shape; only the timer vtable
-        // is stored more than once.
-        let (base, code) = x86_region(usize::MAX);
-        assert_ne!(
-            decode(32, base, &code, X86_SITE).unwrap().timer_vtable,
-            0x02d8_beac
-        );
-        assert_ne!(
-            decode(64, X64_BASE, X64_CODE, X64_SITE)
-                .unwrap()
-                .timer_vtable,
-            0x0311_74f8
+    fn decodes_the_x86_64_site_with_the_pool_load_after_the_allocation() {
+        let site = x64_site_pool_last();
+        assert_eq!(
+            decode(64, BASE, &site.code, site.site),
+            Ok(X64_LARGER_ITEM.decoded())
         );
     }
 
     #[test]
     fn a_truncated_site_fails_closed() {
-        assert!(decode(64, X64_BASE, &X64_CODE[..0x30], X64_SITE).is_err());
-        let (base, code) = x86_region(0x60);
-        assert!(decode(32, base, &code, X86_SITE).is_err());
+        for (bitness, site) in [(32, x86_site()), (64, x64_site_pool_first())] {
+            let cut = &site.code[..site.enqueue - BASE];
+            assert_eq!(
+                decode(bitness, BASE, cut, site.site),
+                Err("no enqueue call after the work item is filled in")
+            );
+        }
     }
 
     #[test]
     fn a_site_outside_the_code_region_fails_closed() {
-        assert!(decode(64, X64_BASE, X64_CODE, X64_BASE - 1).is_err());
-        assert!(decode(64, X64_BASE, X64_CODE, X64_BASE + X64_CODE.len()).is_err());
+        let site = x64_site_pool_first();
+        let end = BASE + site.code.len();
+        assert!(decode(64, BASE, &site.code, BASE - 1).is_err());
+        assert!(decode(64, BASE, &site.code, end).is_err());
     }
 
     #[test]
     fn an_i686_site_without_a_pic_prologue_fails_closed() {
-        // Starting at the pattern match itself puts the get_pc_thunk call out of
-        // reach, which is the shape a moved prologue would present.
-        let offset = X86_SITE - X86_FUNCTION;
-        assert!(decode(32, X86_SITE, &X86_CODE[offset..], X86_SITE).is_err());
+        // Starting at the site itself puts the get_pc_thunk call out of reach,
+        // which is the shape a moved prologue would present.
+        let site = x86_site();
+        let body = &site.code[site.site - BASE..];
+        assert_eq!(
+            decode(32, site.site, body, site.site),
+            Err("no i686 PIC anchor before the site")
+        );
     }
 }

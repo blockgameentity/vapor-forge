@@ -6,12 +6,22 @@ extern crate self as vapor_forge_patterns;
 use thiserror::Error;
 
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod arg_flow;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod cnet_packet;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod current_app;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cuser_adapter;
 pub mod elf;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;
 pub mod semantic;
 pub mod vtable_scan;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod work_item_site;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternToken {
@@ -37,6 +47,37 @@ pub enum PatternError {
     FollowUnsupportedOpcode,
     #[error("no call target found before RET")]
     NoCallTarget,
+}
+
+/// Frequency rank of each byte in x86 and x86_64 machine code, 255 for the most
+/// common. Counted over the `.text` of an i686 and an x86_64 steamclient.so.
+///
+/// The substring search prefilters on the anchor's two rarest bytes. Its
+/// built-in ranking is tuned for text, where it rates bytes such as `0x48` and
+/// `0x89` as rare, so on code it picks bytes that occur everywhere and checks
+/// far more candidates than it needs to.
+const MACHINE_CODE_BYTE_RANK: [u8; 256] = [
+    255, 245, 221, 203, 239, 193, 171, 190, 242, 133, 119, 96, 226, 112, 55, 249, 241, 114, 91, 62,
+    205, 130, 60, 66, 219, 72, 39, 36, 191, 44, 46, 216, 214, 51, 31, 27, 248, 131, 202, 33, 200,
+    122, 23, 126, 146, 56, 79, 22, 182, 210, 35, 43, 144, 123, 17, 26, 174, 197, 24, 163, 153, 137,
+    21, 58, 224, 228, 115, 181, 237, 233, 185, 173, 253, 218, 85, 61, 231, 167, 92, 63, 230, 127,
+    151, 208, 199, 213, 198, 194, 159, 81, 97, 201, 192, 207, 175, 161, 124, 4, 47, 125, 147, 90,
+    222, 19, 149, 49, 188, 57, 142, 32, 99, 108, 157, 30, 71, 107, 240, 225, 145, 83, 162, 34, 29,
+    100, 177, 150, 148, 140, 196, 168, 50, 250, 234, 243, 165, 128, 180, 252, 13, 251, 88, 247, 89,
+    74, 217, 18, 25, 73, 101, 129, 45, 28, 110, 5, 1, 7, 77, 82, 9, 16, 109, 2, 3, 11, 80, 10, 0,
+    6, 170, 12, 15, 41, 84, 14, 20, 40, 113, 8, 42, 48, 187, 166, 184, 65, 158, 94, 135, 64, 105,
+    143, 154, 87, 235, 209, 186, 223, 236, 141, 211, 232, 155, 156, 102, 37, 244, 53, 59, 52, 189,
+    104, 183, 69, 121, 54, 103, 68, 152, 120, 67, 106, 86, 70, 78, 164, 195, 76, 132, 38, 139, 95,
+    111, 134, 246, 229, 117, 212, 227, 118, 116, 172, 176, 75, 93, 179, 136, 98, 215, 160, 204,
+    138, 169, 178, 206, 220, 238, 254,
+];
+
+struct MachineCodeRank;
+
+impl memchr::arch::all::packedpair::HeuristicFrequencyRank for MachineCodeRank {
+    fn rank(&self, byte: u8) -> u8 {
+        MACHINE_CODE_BYTE_RANK[usize::from(byte)]
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,7 +161,8 @@ impl Pattern {
         };
 
         let mut matches = Vec::with_capacity(max_matches.min(16));
-        let finder = memchr::memmem::Finder::new(&anchor_bytes);
+        let finder = memchr::memmem::FinderBuilder::new()
+            .build_forward_with_ranker(MachineCodeRank, &anchor_bytes);
         let mut search_from = 0usize;
         while let Some(relative) = finder.find(&haystack[search_from..]) {
             let anchor_offset = search_from + relative;
@@ -202,6 +244,62 @@ impl Pattern {
 ///         check haystack[body_offset - i - j] == prologue[j]
 ///     if all match: return body_offset - i - prologue.len() + 1
 /// ```
+/// Bytes scanned back from a body match while looking for the entry's pushes.
+/// A prologue saves at most a handful of registers, so this only has to cover
+/// their encodings.
+const ENTRY_PUSH_SCAN: usize = 0x20;
+
+/// Walk back from `body_offset` over the register saves a function entry begins
+/// with, and return the entry.
+///
+/// `body_offset` must be the first byte after those saves. Unlike
+/// `find_prologue_upwards` this does not pin how many registers are saved, so
+/// one pattern covers builds whose entry saves a different number of them: the
+/// same code then resolves to the real entry instead of two bytes into it.
+///
+/// Only `push r32`/`push r64` encodings are crossed, which keeps the stop
+/// condition unambiguous. The bytes ahead of a function are padding or a
+/// terminator, neither of which decodes as a push.
+///
+/// `bitness` is 32 or 64. Bytes 0x40..=0x4f are REX prefixes only in 64-bit
+/// code; in 32-bit code they are one-byte `inc`/`dec`, which must stop the walk
+/// rather than be read as part of a push.
+pub fn find_entry_pushes(
+    haystack: &[u8],
+    body_offset: usize,
+    bitness: u32,
+) -> Result<usize, PatternError> {
+    if body_offset > haystack.len() {
+        return Err(PatternError::NoMatch);
+    }
+    let limit = ENTRY_PUSH_SCAN.min(body_offset);
+    let mut entry = body_offset;
+    loop {
+        let consumed = body_offset - entry;
+        // A REX-prefixed push spans two bytes, so prefer it when the byte ahead
+        // of a bare push is a REX prefix.
+        let two = (bitness == 64 && entry >= 2 && consumed + 2 <= limit)
+            .then(|| &haystack[entry - 2..entry])
+            .filter(|window| (0x40..=0x4f).contains(&window[0]) && is_push_opcode(window[1]));
+        let one = (entry >= 1 && consumed < limit)
+            .then(|| haystack[entry - 1])
+            .filter(|&byte| is_push_opcode(byte));
+        entry -= match (two, one) {
+            (Some(_), _) => 2,
+            (None, Some(_)) => 1,
+            (None, None) => break,
+        };
+    }
+    if entry == body_offset {
+        return Err(PatternError::NoMatch);
+    }
+    Ok(entry)
+}
+
+fn is_push_opcode(byte: u8) -> bool {
+    (0x50..=0x57).contains(&byte)
+}
+
 pub fn find_prologue_upwards(
     haystack: &[u8],
     body_offset: usize,
@@ -303,8 +401,8 @@ pub mod scan;
 #[cfg(test)]
 mod tests {
     use super::{
-        find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
-        PatternError, PatternToken,
+        find_entry_pushes, find_prologue_upwards, follow_last_call_before_ret,
+        follow_relative_call, Pattern, PatternError, PatternToken, MACHINE_CODE_BYTE_RANK,
     };
 
     #[test]
@@ -378,6 +476,73 @@ mod tests {
             wildcard.find_unique(&haystack),
             Err(PatternError::Ambiguous(2))
         );
+    }
+
+    /// `push r14; push r13; push r12; push rbp; push rbx`, the five-register
+    /// save, behind int3 padding.
+    const FIVE_SAVES: &[u8] = &[
+        0xcc, 0xcc, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xec, 0x20,
+    ];
+    /// The same entry with one register fewer.
+    const FOUR_SAVES: &[u8] = &[
+        0xcc, 0xcc, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xec, 0x28,
+    ];
+
+    #[test]
+    fn entry_push_scan_spans_either_register_save_count() {
+        // The body offset is the frame setup in both, and the entry is the
+        // first push, wherever that is.
+        assert_eq!(find_entry_pushes(FIVE_SAVES, 10, 64), Ok(2));
+        assert_eq!(find_entry_pushes(FOUR_SAVES, 8, 64), Ok(2));
+    }
+
+    #[test]
+    fn entry_push_scan_prefers_the_rex_prefixed_push() {
+        // Read one byte at a time, `41 55` would look like `push rbp` at the
+        // 0x55 and leave the 0x41 behind, landing two bytes into the function.
+        assert_eq!(find_entry_pushes(&[0xcc, 0x41, 0x55, 0x90], 3, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_reads_rex_bytes_as_instructions_in_32_bit_code() {
+        // `dec ebx; push ebx; push ebp`: in 32-bit code 0x4b is its own
+        // instruction, so the entry is the first push, not the dec.
+        let code = [0xcc, 0x4b, 0x53, 0x55, 0x90];
+        assert_eq!(find_entry_pushes(&code, 4, 32), Ok(2));
+        // The same bytes in 64-bit code are `push r11; push rbp`.
+        assert_eq!(find_entry_pushes(&code, 4, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_stops_at_a_terminator() {
+        // `ret` then two pushes: the scan must not cross the ret.
+        let code = [0xc3, 0x55, 0x53, 0x90];
+        assert_eq!(find_entry_pushes(&code, 3, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_rejects_a_body_with_no_saves() {
+        assert_eq!(
+            find_entry_pushes(&[0xcc, 0xcc, 0x90, 0x90], 3, 64),
+            Err(PatternError::NoMatch)
+        );
+        assert_eq!(
+            find_entry_pushes(&[0x55], 5, 64),
+            Err(PatternError::NoMatch)
+        );
+    }
+
+    #[test]
+    fn machine_code_rank_is_a_permutation() {
+        let mut seen = [false; 256];
+        for &rank in &MACHINE_CODE_BYTE_RANK {
+            assert!(!seen[usize::from(rank)]);
+            seen[usize::from(rank)] = true;
+        }
+        // Padding, REX.W and mov are among the most common bytes in code.
+        for byte in [0x00, 0x48, 0x89] {
+            assert!(MACHINE_CODE_BYTE_RANK[byte] > 240);
+        }
     }
 
     #[test]

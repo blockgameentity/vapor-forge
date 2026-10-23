@@ -834,7 +834,47 @@ fn scan_cuser_stats_adapters(
             failed = true;
         }
     }
+    failed |= scan_current_app_resolver(code, text_vaddr, service, progress_slot, arch);
     failed
+}
+
+/// The progress adapter's fallback to the calling pipe's AppID locates the
+/// engine slot and lookup helper behind `current_app` at runtime.
+fn scan_current_app_resolver(
+    code: &[u8],
+    text_vaddr: u64,
+    service: &vtable_scan::Interface,
+    progress_slot: usize,
+    arch: SemanticArch,
+) -> bool {
+    let name = "CUserStats current IPC AppID resolver";
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
+    let site = service
+        .methods
+        .get(progress_slot)
+        .and_then(|method| method.func_va.checked_sub(text_vaddr))
+        .and_then(|offset| usize::try_from(offset).ok())
+        .and_then(|offset| {
+            vapor_forge_patterns::current_app::resolve(code, text_vaddr, offset, bitness)
+        });
+    match site {
+        Some(site) => {
+            println!(
+                "  OK   {:<58} engine-slot=0x{:x} helper=0x{:x}",
+                name,
+                site.engine_slot,
+                text_vaddr + site.helper as u64
+            );
+            false
+        }
+        None => {
+            println!("  FAIL {:<58} required (no unique validated helper site)", name);
+            true
+        }
+    }
 }
 
 fn print_missing_user_stats_slot(name: &str) -> bool {
@@ -851,6 +891,7 @@ enum CUserAdapterKind {
     UpdateTicket,
     IsSubscribedInTicket,
     RequiresLegacyCdKey,
+    GetSteamId,
 }
 
 fn scan_cuser_adapters(
@@ -904,6 +945,7 @@ fn scan_cuser_adapters(
             CUserAdapterKind::IsSubscribedInTicket,
         ),
         ("RequiresLegacyCDKey", CUserAdapterKind::RequiresLegacyCdKey),
+        ("GetSteamID", CUserAdapterKind::GetSteamId),
     ];
 
     let mut failed = false;
@@ -938,9 +980,24 @@ fn scan_cuser_adapters(
                     }
                     let offset = method.func_va.checked_sub(text_vaddr)? as usize;
                     let implementation = resolve_cuser_adapter_implementation(
-                        code, text_vaddr, offset, kind, arch, resolved,
-                    )
-                    .unwrap_or(offset);
+                        code,
+                        text_vaddr,
+                        offset,
+                        kind,
+                        arch,
+                        resolved,
+                        vtable.offset_to_top.unsigned_abs(),
+                    );
+                    // The GetSteamID hook depends on the validated return
+                    // convention, and the IsUserSubscribedAppInTicket wrapper
+                    // has a different ABI from the implementation it calls, so
+                    // an unvalidated entry is not a match for either.
+                    if implementation.is_none() { eprintln!("PROBE unvalidated {name} 0x{:x}", method.func_va); }
+                    let implementation = match kind {
+                        CUserAdapterKind::GetSteamId
+                        | CUserAdapterKind::IsSubscribedInTicket => implementation?,
+                        _ => implementation.unwrap_or(offset),
+                    };
                     Some((
                         method.func_va,
                         vtable.offset_to_top,
@@ -986,6 +1043,9 @@ fn scan_cuser_adapters(
     failed
 }
 
+/// `this_adjust` is the IClientUser base offset inside `CUser`, the negated
+/// offset-to-top of the vtable the entry came from. Builds move that base, so
+/// the adapter checks take it from the vtable instead of a fixed list.
 fn resolve_cuser_adapter_implementation(
     code: &[u8],
     text_vaddr: u64,
@@ -993,30 +1053,52 @@ fn resolve_cuser_adapter_implementation(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> Option<usize> {
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
     if matches!(kind, CUserAdapterKind::RequiresLegacyCdKey) {
-        let bitness = match arch {
-            SemanticArch::X86 => 32,
-            SemanticArch::X86_64 => 64,
-        };
         return vapor_forge_patterns::cuser_adapter::resolve_requires_legacy_cdkey_implementation(
             code, text_vaddr, offset, bitness,
         );
     }
+    if matches!(kind, CUserAdapterKind::GetSteamId) {
+        return vapor_forge_patterns::cuser_adapter::resolve_get_steam_id_implementation(
+            code, text_vaddr, offset, bitness,
+        );
+    }
     if matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
-        && !validate_is_subscribed_wrapper_abi(code, offset, arch)
+        && !validate_is_subscribed_wrapper_abi(code, offset, arch, this_adjust)
     {
         return None;
     }
     if !matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
-        && validate_cuser_adapter_direct(code, text_vaddr, offset, kind, arch, resolved)
+        && validate_cuser_adapter_direct(
+            code,
+            text_vaddr,
+            offset,
+            kind,
+            arch,
+            resolved,
+            this_adjust,
+        )
     {
         return Some(offset);
     }
     let mut targets = direct_branch_target_offsets(code, text_vaddr, offset, 0x180, arch)
         .into_iter()
         .filter(|&target| {
-            validate_cuser_adapter_direct(code, text_vaddr, target, kind, arch, resolved)
+            validate_cuser_adapter_direct(
+                code,
+                text_vaddr,
+                target,
+                kind,
+                arch,
+                resolved,
+                this_adjust,
+            )
         })
         .collect::<Vec<_>>();
     targets.sort_unstable();
@@ -1028,16 +1110,22 @@ fn resolve_cuser_adapter_implementation(
     }
 }
 
-fn validate_is_subscribed_wrapper_abi(code: &[u8], offset: usize, arch: SemanticArch) -> bool {
+fn validate_is_subscribed_wrapper_abi(
+    code: &[u8],
+    offset: usize,
+    arch: SemanticArch,
+    this_adjust: u64,
+) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 
     let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x180))) else {
         return false;
     };
     if arch == SemanticArch::X86 {
-        let adjusts_this = has_seq(bytes, &[0x81, 0xee, 0xd4, 0x18, 0x00, 0x00])
-            || has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
-            || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00]);
+        let imm = (this_adjust as u32).to_le_bytes();
+        // sub esi, this_adjust | sub eax, this_adjust
+        let adjusts_this = has_seq(bytes, &[&[0x81, 0xee][..], &imm].concat())
+            || has_seq(bytes, &[&[0x2d][..], &imm].concat());
         return adjusts_this
             && bytes
                 .windows(4)
@@ -1078,7 +1166,7 @@ fn validate_is_subscribed_wrapper_abi(code: &[u8], offset: usize, arch: Semantic
         }
         if instruction.mnemonic() == Mnemonic::Lea
             && instruction.op0_register() == Register::RDI
-            && instruction.memory_displacement64() as i64 == -0x1fd0
+            && instruction.memory_displacement64() as i64 == -(this_adjust as i64)
         {
             adjusts_this = true;
         }
@@ -1093,10 +1181,11 @@ fn validate_cuser_adapter_direct(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> bool {
-    validate_cuser_adapter(code, offset, kind, arch, resolved)
+    validate_cuser_adapter(code, offset, kind, arch, resolved, this_adjust)
         && (!matches!(kind, CUserAdapterKind::TicketExtendedData)
-            || ticket_ext_semantics_are_reachable(code, text_vaddr, offset, arch))
+            || ticket_ext_semantics_are_reachable(code, text_vaddr, offset, arch, this_adjust))
 }
 
 fn validate_cuser_adapter(
@@ -1105,17 +1194,18 @@ fn validate_cuser_adapter(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> bool {
     let evidence = match (arch, kind) {
         (SemanticArch::X86, CUserAdapterKind::TicketExtendedData) => {
-            ticket_ext_data_mode4_thunk32_evidence(code, offset)
+            ticket_ext_data_mode4_thunk32_evidence(code, offset, this_adjust)
         }
         (SemanticArch::X86_64, CUserAdapterKind::TicketExtendedData) => {
-            ticket_ext_data_mode4_thunk64_evidence(code, offset)
+            ticket_ext_data_mode4_thunk64_evidence(code, offset, this_adjust)
         }
         (SemanticArch::X86, CUserAdapterKind::UpdateTicket) => resolved
             .get("CUser::CheckAppOwnership")
-            .and_then(|check| update_ticket32_evidence(code, offset, *check)),
+            .and_then(|check| update_ticket32_evidence(code, offset, *check, this_adjust)),
         (SemanticArch::X86_64, CUserAdapterKind::UpdateTicket) => resolved
             .get("CUser::CheckAppOwnership")
             .and_then(|check| update_ticket64_evidence(code, offset, *check)),
@@ -1126,7 +1216,7 @@ fn validate_cuser_adapter(
             is_user_subscribed_app_in_ticket64_evidence(code, offset)
         }
         // Resolved and validated by the shared cuser_adapter resolver instead.
-        (_, CUserAdapterKind::RequiresLegacyCdKey) => None,
+        (_, CUserAdapterKind::RequiresLegacyCdKey | CUserAdapterKind::GetSteamId) => None,
     };
     evidence.is_some_and(|evidence| evidence.is_complete())
 }
@@ -1187,20 +1277,21 @@ fn ticket_ext_semantics_are_reachable(
     text_vaddr: u64,
     offset: usize,
     arch: SemanticArch,
+    this_adjust: u64,
 ) -> bool {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 
     let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x160))) else {
         return false;
     };
-    let adjustments: &[&[u8]] = match arch {
-        SemanticArch::X86 => &[
-            &[0x2d, 0xd4, 0x18, 0x00, 0x00],
-            &[0x2d, 0xd8, 0x18, 0x00, 0x00],
-        ],
-        SemanticArch::X86_64 => &[
-            &[0x49, 0x8d, 0xbc, 0x24, 0x30, 0xe0, 0xff, 0xff],
-            &[0x48, 0x8d, 0xbb, 0x30, 0xe0, 0xff, 0xff],
+    let imm = (this_adjust as u32).to_le_bytes();
+    let disp = (this_adjust as u32).wrapping_neg().to_le_bytes();
+    // sub eax, this_adjust | lea rdi, [r12 - this_adjust] | lea rdi, [rbx - this_adjust]
+    let adjustments: Vec<Vec<u8>> = match arch {
+        SemanticArch::X86 => vec![[&[0x2d][..], &imm].concat()],
+        SemanticArch::X86_64 => vec![
+            [&[0x49, 0x8d, 0xbc, 0x24][..], &disp].concat(),
+            [&[0x48, 0x8d, 0xbb][..], &disp].concat(),
         ],
     };
     let reachable = reachable_instruction_offsets(
@@ -1215,7 +1306,7 @@ fn ticket_ext_semantics_are_reachable(
         bytes
             .windows(needle.len())
             .enumerate()
-            .any(|(index, window)| window == *needle && reachable.contains(&index))
+            .any(|(index, window)| window == needle.as_slice() && reachable.contains(&index))
     });
     let bitness = match arch {
         SemanticArch::X86 => 32,
@@ -1520,16 +1611,70 @@ fn discover_app_overview_change64_layout(
     })
 }
 
+/// The app map's offset inside `CSteamUIAppController`, which differs between
+/// builds.
+const APP_MAP_OFFSETS32: [i32; 2] = [0x9E0, 0xC38];
+const APP_MAP_OFFSETS64: [i32; 2] = [0xB58, 0xF80];
+
+fn has_app_map_load32(bytes: &[u8]) -> bool {
+    APP_MAP_OFFSETS32
+        .iter()
+        .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset))))
+}
+
+fn has_app_map_load64(bytes: &[u8]) -> bool {
+    APP_MAP_OFFSETS64
+        .iter()
+        .any(|&offset| has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax + offset))))
+}
+
+/// `mov byte ptr [reg + disp], imm` on any base register.
+fn has_byte_store_imm32(bytes: &[u8], disp: u8, imm: u8) -> bool {
+    bytes.windows(4).any(|window| {
+        window[0] == 0xc6
+            && (0x40..=0x47).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+            && window[3] == imm
+    })
+}
+
+/// `or dword ptr [reg + disp], imm8` on any base register.
+fn has_or_dword_imm32(bytes: &[u8], disp: u8, imm: u8) -> bool {
+    bytes.windows(4).any(|window| {
+        window[0] == 0x83
+            && (0x48..=0x4f).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+            && window[3] == imm
+    })
+}
+
+/// The change pointer stepped on by `disp`, as `add reg, disp` or
+/// `lea reg, [reg + disp]`. Builds differ in which of the two they emit.
+fn has_pointer_step32(bytes: &[u8], disp: u8) -> bool {
+    let added = bytes
+        .windows(3)
+        .any(|window| window[0] == 0x83 && (0xc0..=0xc7).contains(&window[1]) && window[2] == disp);
+    let leaed = bytes.windows(3).any(|window| {
+        window[0] == 0x8d
+            && (0x40..=0x7f).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+    });
+    added || leaed
+}
+
 fn discover_app_overview_change32_layout(
     code: &[u8],
     build_complete_offset: usize,
 ) -> Option<AppOverviewChangeLayout> {
     let bytes = bounded_tail(code, build_complete_offset, 0x120)?;
-    if !bytes.windows(3).any(|w| w == [0x83, 0xc2, 0x10]) {
-        return None;
-    }
-    if !bytes.windows(4).any(|w| w == [0xc6, 0x42, 0x2c, 0x01])
-        || !bytes.windows(4).any(|w| w == [0x83, 0x4a, 0x08, 0x01])
+    // Register-agnostic: the layout returned below is unchanged across builds,
+    // but which register holds the change object is not.
+    if !has_pointer_step32(bytes, 0x10)
+        || !has_byte_store_imm32(bytes, 0x2c, 1)
+        || !has_or_dword_imm32(bytes, 0x08, 1)
     {
         return None;
     }
@@ -1608,14 +1753,6 @@ fn has_x86_lea_ebx_disp32(bytes: &[u8]) -> bool {
         .any(|window| window[0] == 0x8D && window[1] == 0x83)
 }
 
-/// `push imm32`.
-fn has_x86_push_imm32(bytes: &[u8], value: u32) -> bool {
-    bytes.windows(5).any(|window| {
-        window[0] == 0x68
-            && u32::from_le_bytes([window[1], window[2], window[3], window[4]]) == value
-    })
-}
-
 /// `lea rax, [rip + disp32]`.
 fn has_x64_lea_rip_rel(bytes: &[u8]) -> bool {
     bytes
@@ -1635,15 +1772,6 @@ fn has_x86_mov_from_any_disp8(bytes: &[u8], disp: u8) -> bool {
         .any(|w| w[0] == 0x8b && (0x40..=0x7f).contains(&w[1]) && w[2] == disp)
 }
 
-fn has_x86_mov_edi_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool {
-    bytes.windows(6).any(|w| {
-        if w[0] != 0x8b || w[1] != 0xbe {
-            return false;
-        }
-        let disp = u32::from_le_bytes([w[2], w[3], w[4], w[5]]);
-        accepted_disps.is_empty() || accepted_disps.contains(&disp)
-    })
-}
 
 fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool {
     bytes.windows(6).any(|w| {
@@ -1655,12 +1783,12 @@ fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool
     })
 }
 
-fn has_x86_license_vector_load32(bytes: &[u8]) -> bool {
-    has_x86_mov_edi_from_esi_disp32(bytes, &[0x1B14, 0x1B18])
-}
 
-fn has_x86_license_vector_base32(bytes: &[u8]) -> bool {
-    has_x86_lea_eax_from_esi_disp32(bytes, &[0x1AE4, 0x1AE8])
+/// `lea eax, [esi + base]` on the license block found by `find_field_group`,
+/// so the check follows the block wherever a build places it in `CUser`.
+fn has_x86_license_vector_base32(bytes: &[u8], base: Option<u64>) -> bool {
+    base.and_then(|base| u32::try_from(base).ok())
+        .is_some_and(|base| has_x86_lea_eax_from_esi_disp32(bytes, &[base]))
 }
 
 fn has_x86_shl_rm32_by_2(bytes: &[u8]) -> bool {
@@ -1705,13 +1833,6 @@ fn find_x86_sub_eax_imm32_matching(
 
 fn has_x86_test_ebp_disp8_imm8(bytes: &[u8], disp: u8, imm: u8) -> bool {
     has_seq(bytes, &[0xf6, 0x45, disp, imm])
-}
-
-fn has_x86_cmp_rm32_imm8(bytes: &[u8], disp: u32, imm: u8) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(7)
-        .any(|w| w[0] == 0x83 && matches!(w[1], 0xb8..=0xbf) && w[2..6] == disp && w[6] == imm)
 }
 
 fn has_x86_rm32_disp32_load(bytes: &[u8], disp: u32) -> bool {
@@ -1811,15 +1932,6 @@ fn has_x64_push_rbp_negative_local_before_call(bytes: &[u8]) -> bool {
     })
 }
 
-fn has_x64_rm32_disp32_load(bytes: &[u8], disp: u32) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(6)
-        .any(|w| w[0] == 0x8b && matches!(w[1], 0x80..=0xbf) && w[2..6] == disp)
-        || bytes
-            .windows(7)
-            .any(|w| w[0] == 0x44 && w[1] == 0x8b && matches!(w[2], 0x80..=0xbf) && w[3..7] == disp)
-}
 
 fn has_x64_rip_lea(bytes: &[u8], modrm: u8) -> bool {
     bytes
@@ -1926,13 +2038,15 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86, "CCMConnection::RecvPkt") => ccm_recv_pkt32_evidence(code, offset),
         (SemanticArch::X86_64, "CCMConnection::RecvPkt") => ccm_recv_pkt64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Alloc") => cnet_packet_alloc32_evidence(code, offset),
-        (SemanticArch::X86_64, "CNetPacket::Alloc") => cnet_packet_alloc64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Init") => cnet_packet_init32_evidence(code, offset),
-        (SemanticArch::X86_64, "CNetPacket::Init") => cnet_packet_init64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Release") => cnet_packet_release32_evidence(code, offset),
+        (SemanticArch::X86, "CNetPacket::Alloc") => cnet_packet_alloc_evidence(32, code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Alloc") => cnet_packet_alloc_evidence(64, code, offset),
+        (SemanticArch::X86, "CNetPacket::Init") => cnet_packet_init_evidence(32, code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Init") => cnet_packet_init_evidence(64, code, offset),
+        (SemanticArch::X86, "CNetPacket::Release") => {
+            cnet_packet_release_evidence(32, code, offset)
+        }
         (SemanticArch::X86_64, "CNetPacket::Release") => {
-            cnet_packet_release64_evidence(code, offset)
+            cnet_packet_release_evidence(64, code, offset)
         }
         (SemanticArch::X86, "CWorkThreadPool::AddWorkItem") => {
             work_thread_pool_add_work_item32_evidence(code, offset)
@@ -2147,6 +2261,165 @@ fn has_x86_ebp_memory_access(bytes: &[u8], displacement: u64) -> bool {
                 && instruction.memory_displacement64() == displacement
         });
         if memory_operand {
+            return true;
+        }
+    }
+    false
+}
+
+/// `cmp dword ptr [base + any displacement], imm`.
+///
+/// The displacement is deliberately loose. Where a comparison only has to
+/// identify a function, and no hook reads that field itself, the base register
+/// and the constant carry the meaning: builds place such a field at different
+/// offsets while the code around it is identical.
+/// `movzx <r32>, byte ptr [base + any displacement]`.
+fn has_movzx_byte_field(bitness: u32, bytes: &[u8], base: iced_x86::Register) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let reads_byte_field = instruction.mnemonic() == Mnemonic::Movzx
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_size().size() == 1;
+        if reads_byte_field {
+            return true;
+        }
+    }
+    false
+}
+
+/// How many distinct fields of `base` the body takes the address of.
+///
+/// Steam's enqueue takes the address of the pool's own synchronisation objects;
+/// which ones, and where they sit, differ between builds, so only the fact
+/// that it addresses several of them is pinned.
+fn count_addressed_fields(bitness: u32, bytes: &[u8], base: iced_x86::Register) -> usize {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let addresses_field = instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() != 0;
+        if addresses_field && !offsets.contains(&instruction.memory_displacement64()) {
+            offsets.push(instruction.memory_displacement64());
+        }
+    }
+    offsets.len()
+}
+
+/// A register loaded with a plausible work-item allocation size.
+fn has_work_item_size(bitness: u32, bytes: &[u8]) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let sets_size = matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Push)
+            && instruction
+                .try_immediate(if instruction.mnemonic() == Mnemonic::Push { 0 } else { 1 })
+                .is_ok_and(|size| (0x40..=0x1000).contains(&size));
+        if sets_size {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lowest displacement of a group of object fields the body reads at fixed
+/// distances from each other, if it reads such a group.
+///
+/// Steam shifts whole blocks of `CUser` fields between builds without changing
+/// the distances inside a block or the code around them, and it spreads the
+/// reads over whichever base registers the register allocator picked. The
+/// distances are what recognise the function; no hook reads these fields
+/// itself, so their absolute position is not worth pinning.
+fn find_field_group(bitness: u32, bytes: &[u8], gaps: &[u64]) -> Option<u64> {
+    find_field_group_above(bitness, bytes, 0x400, gaps)
+}
+
+/// `find_field_group`, for objects whose fields start closer to the top.
+fn find_field_group_above(bitness: u32, bytes: &[u8], min_field: u64, gaps: &[u64]) -> Option<u64> {
+    use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
+
+    const MAX_FIELD: u64 = 0x8000;
+
+    let mut fields: Vec<u64> = Vec::new();
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let reads_field = (0..instruction.op_count())
+            .any(|index| instruction.op_kind(index) == OpKind::Memory)
+            && instruction.memory_index() == Register::None
+            && instruction.memory_base().is_gpr();
+        let displacement = instruction.memory_displacement64();
+        if reads_field && (min_field..=MAX_FIELD).contains(&displacement) {
+            fields.push(displacement);
+        }
+    }
+    fields
+        .iter()
+        .copied()
+        .filter(|base| gaps.iter().all(|gap| fields.contains(&(base + gap))))
+        .min()
+}
+
+fn has_cmp_field_imm(bitness: u32, bytes: &[u8], base: iced_x86::Register, imm: u64) -> bool {
+    has_cmp_field_imm_sized(bitness, bytes, base, 4, imm)
+}
+
+/// `cmp byte ptr [base + any displacement], imm`.
+fn has_cmp_byte_field_imm(
+    bitness: u32,
+    bytes: &[u8],
+    base: iced_x86::Register,
+    imm: u64,
+) -> bool {
+    has_cmp_field_imm_sized(bitness, bytes, base, 1, imm)
+}
+
+fn has_cmp_field_imm_sized(
+    bitness: u32,
+    bytes: &[u8],
+    base: iced_x86::Register,
+    width: usize,
+    imm: u64,
+) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let compares_field = instruction.mnemonic() == Mnemonic::Cmp
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_size().size() == width
+            && instruction.try_immediate(1).is_ok_and(|value| value == imm);
+        if compares_field {
             return true;
         }
     }
@@ -2454,9 +2727,9 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
         && (has_asm32(bytes, |a| a.mov(ecx, 8)) || has_asm32(bytes, |a| a.mov(ecx, 0x0D)))
         && (has_asm32(bytes, |a| a.mov(dword_ptr(eax), -1))
             || has_asm32(bytes, |a| a.mov(dword_ptr(esi), -1)));
-    let has_license_state = (has_x86_rm32_disp32_load(bytes, 0x1bd4)
-        && has_x86_rm32_disp32_load(bytes, 0x1bf0))
-        || (has_x86_rm32_disp32_load(bytes, 0x1bd0) && has_x86_rm32_disp32_load(bytes, 0x1bec));
+    // The license vector base, its count 0xc on, and the license state 0x28 on.
+    let license_block = find_field_group(32, bytes, &[0xc, 0x28]);
+    let has_license_state = license_block.is_some();
     let has_license_accumulators = (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x28), 1))
         || has_asm32(bytes, |a| a.mov(byte_ptr(esi + 0x28), 1)))
         && (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x30), 1))
@@ -2469,7 +2742,7 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let has_owned_app_iteration = (has_asm32(bytes, |a| a.mov(ecx, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x0C))))
-        && (has_x86_rm32_disp32_load(bytes, 0x1bc8) || has_x86_rm32_disp32_load(bytes, 0x1bc4))
+        && license_block.is_some()
         && (has_asm32(bytes, |a| a.lea(edx, dword_ptr(eax + eax * 8)))
             || has_asm32(bytes, |a| a.lea(ecx, dword_ptr(edx + edx * 8))));
 
@@ -2496,8 +2769,8 @@ fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let current_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
         && has_asm64(bytes, |a| a.mov(eax, -1))
         && has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax));
-    let has_license_state =
-        has_x64_rm32_disp32_load(bytes, 0x2498) && has_x64_rm32_disp32_load(bytes, 0x24bc);
+    // The license state pair sits 0x24 apart, 0x10 past the license vector base.
+    let has_license_state = find_field_group(64, bytes, &[0x10, 0x34]).is_some();
     let old_license_accumulators = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
         && has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x30), 1))
         && has_asm64(bytes, |a| a.mov(word_ptr(r14 + 0x33), r8w));
@@ -2576,33 +2849,34 @@ fn validate_get_subscribed_apps64(code: &[u8], offset: usize) -> Option<&'static
 
 fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x260)?;
-    let old_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
+    // The license vector base and its count, 0x10 apart.
+    let license_vector = find_field_group(64, bytes, &[0x10]);
+    // 0x50-byte license entries, indexed off the license vector base. The base
+    // is read from wherever the block sits, so only the shape is pinned.
+    let entry_stride = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
+        || has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r13 + r13 * 4)));
+    let entry_id_check = (has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
+        && has_asm64(bytes, |a| a.cmp(r13d, -1)))
+        || (has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rbx)))
+            && has_asm64(bytes, |a| a.cmp(r12d, -1)));
+    let has_license_entry = entry_stride
         && has_asm64(bytes, |a| a.shl(rbx, 4))
-        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(r12 + 0x2488)))
-        && has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
-        && has_asm64(bytes, |a| a.cmp(r13d, -1));
-    let current_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r13 + r13 * 4)))
-        && has_asm64(bytes, |a| a.shl(rbx, 4))
-        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(rdi + 0x2488)))
-        && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rbx)))
-        && has_asm64(bytes, |a| a.cmp(r12d, -1));
+        && entry_id_check
+        && license_vector.is_some();
     Some(Evidence::required([
         (
             "include hidden subscriptions flag",
             has_x64_rsp_store_cl(bytes),
         ),
-        (
-            "license vector count",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0x2498)))
-                || has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0x2498))),
-        ),
-        (
-            "known license entry layout",
-            old_license_entry || current_license_entry,
-        ),
+        ("license vector count", license_vector.is_some()),
+        ("known license entry layout", has_license_entry),
         (
             "package lookup state",
-            has_asm64(bytes, |a| a.add(rdi, 0x1018))
+            // The lookup sub-object's own offset in CUser differs between
+            // builds together with the surrounding fields; nothing else in
+            // this body pins it.
+            (has_asm64(bytes, |a| a.add(rdi, 0x1018))
+                || has_asm64(bytes, |a| a.add(rdi, 0x1440)))
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
         ),
     ]))
@@ -2999,7 +3273,9 @@ fn build_depot_dependency32_evidence(code: &[u8], offset: usize) -> Option<Evide
         ),
         (
             "dependency state/result path",
+            // The depot state sub-object's offset in CUser differs between builds.
             has_asm32(bytes, |a| a.add(edi, 0xB88u32))
+                || has_asm32(bytes, |a| a.add(edi, 0xEC0u32))
                 || has_asm32(bytes, |a| a.mov(dword_ptr(ebx + 0x14), eax)),
         ),
     ]))
@@ -3014,14 +3290,20 @@ fn validate_build_depot_dependency64(code: &[u8], offset: usize) -> Option<&'sta
 
 fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    // Only the app-state sub-object's offset in CUser differs between builds;
+    // the rest of this body is identical.
+    let app_state_base = [0xF20i32, 0x1348].iter().any(|&app_state| {
+        has_asm64(bytes, |a| a.add(rbp, app_state))
+            || has_asm64(bytes, |a| a.add(r12, app_state))
+    });
     let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1))
         && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r14 + 0xF8)))
-        && has_asm64(bytes, |a| a.add(rbp, 0xF20));
+        && app_state_base;
     let current_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2E0)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x110), -1))
         && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r15 + 0xF8)))
-        && (has_asm64(bytes, |a| a.add(rbp, 0xF20)) || has_asm64(bytes, |a| a.add(r12, 0xF20)));
+        && app_state_base;
     Some(Evidence::required([
         ("known depot dependency layout", old_shape || current_shape),
         (
@@ -3047,7 +3329,7 @@ fn websocket_send_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     Some(Evidence::required([
         (
             "websocket open-state check",
-            has_asm32(bytes, |a| a.cmp(dword_ptr(edx + 0x10), 2)),
+            has_cmp_field_imm(32, bytes, iced_x86::Register::EDX, 2),
         ),
         (
             "websocket frame header buffer",
@@ -3096,7 +3378,7 @@ fn websocket_send_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     Some(Evidence::required([
         (
             "websocket open-state check",
-            has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x18), 2)),
+            has_cmp_field_imm(64, bytes, iced_x86::Register::RDI, 2),
         ),
         (
             "known frame argument and mask layout",
@@ -3181,194 +3463,72 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
 }
 
 fn validate_cnet_packet_alloc32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_alloc32_evidence(code, offset),
-        "Steam allocator packet",
-    )
-}
-
-fn cnet_packet_alloc32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
-    Some(Evidence::required([
-        (
-            "packet allocation size 0x20",
-            has_asm32(bytes, |a| a.push(0x20)),
-        ),
-        ("allocator tag line", has_asm32(bytes, |a| a.push(0x7BF))),
-        (
-            "allocator allocation vtable slot",
-            has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14))),
-        ),
-        (
-            "packet clear/init helper",
-            has_asm32_call_after(bytes, |a| a.push(eax), 0x10),
-        ),
-    ]))
+    validate_cnet_packet_alloc(32, code, offset)
 }
 
 fn validate_cnet_packet_alloc64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_alloc64_evidence(code, offset),
-        "Steam allocator packet",
-    )
+    validate_cnet_packet_alloc(64, code, offset)
 }
 
-fn cnet_packet_alloc64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
-    Some(Evidence::required([
-        (
-            "packet allocation size 0x30",
-            has_asm64(bytes, |a| a.mov(esi, 0x30)),
-        ),
-        (
-            "allocator tag line",
-            has_asm64(bytes, |a| a.mov(ecx, 0x7BF)),
-        ),
-        (
-            "allocator allocation vtable slot",
-            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28))),
-        ),
-        (
-            "packet clear/init helper",
-            has_asm64_call_after(bytes, |a| a.mov(rdi, rax), 0x10),
-        ),
-    ]))
+fn validate_cnet_packet_alloc(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_alloc(bitness, code, offset)
+        .ok()
+        .map(|_| "allocator call + constructed packet")
+}
+
+fn cnet_packet_alloc_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_alloc(bitness, code, offset),
+    ))
 }
 
 fn validate_cnet_packet_init32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_init32_evidence(code, offset),
-        "packet fields + refcount",
-    )
-}
-
-fn cnet_packet_init32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    Some(Evidence::required([
-        (
-            "packet argument",
-            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
-        ),
-        (
-            "packet type/data/size/owned stores",
-            has_seq(
-                bytes,
-                &[
-                    0x89, 0x06, 0x8b, 0x45, 0x10, 0x89, 0x46, 0x04, 0x8b, 0x45, 0x14, 0x89, 0x46,
-                    0x08, 0x8b, 0x45, 0x18, 0x89, 0x46, 0x10,
-                ],
-            ) || has_seq(
-                bytes,
-                &[
-                    0x89, 0x4E, 0x10, 0xC7, 0x46, 0x18, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x1C,
-                    0x00, 0x00, 0x00, 0x00, 0x89, 0x06, 0x8B, 0x45,
-                ],
-            ),
-        ),
-        (
-            "tail fields zeroed",
-            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x18), 0))
-                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x1C), 0)),
-        ),
-        (
-            "initial refcount",
-            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x0C), 1)),
-        ),
-        (
-            "copy-on-write allocation path",
-            has_asm32(bytes, |a| a.push(0x45))
-                && has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14)))
-                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x10), eax)),
-        ),
-    ]))
+    validate_cnet_packet_init(32, code, offset)
 }
 
 fn validate_cnet_packet_init64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_init64_evidence(code, offset),
-        "packet fields + refcount",
-    )
+    validate_cnet_packet_init(64, code, offset)
 }
 
-fn cnet_packet_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    Some(Evidence::required([
-        (
-            "packet type/data/size/owned stores",
-            has_asm64(bytes, |a| a.mov(dword_ptr(rbx), r15d))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x08), r12))
-                && has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x10), ebp))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), r14)),
-        ),
-        (
-            "tail fields zeroed",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x28), 0)),
-        ),
-        (
-            "initial refcount",
-            has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x14), 1)),
-        ),
-        (
-            "copy-on-write allocation path",
-            has_asm64(bytes, |a| a.mov(ecx, 0x45))
-                && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28)))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), rax)),
-        ),
-    ]))
+fn validate_cnet_packet_init(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_init(bitness, code, offset)
+        .ok()
+        .map(|_| "argument stores into packet fields")
+}
+
+fn cnet_packet_init_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_init(bitness, code, offset),
+    ))
 }
 
 fn validate_cnet_packet_release32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_release32_evidence(code, offset),
-        "refcount release + delayed free list",
-    )
-}
-
-fn cnet_packet_release32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x140)?;
-    Some(Evidence::required([
-        (
-            "packet argument",
-            has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x40)))
-                || has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x50))),
-        ),
-        (
-            "refcount decrement",
-            has_asm32(bytes, |a| a.sub(dword_ptr(edi + 0x0C), 1)),
-        ),
-        (
-            "zero-ref delayed free-list path",
-            has_asm32(bytes, |a| a.mov(dword_ptr(eax), edi))
-                && (has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm0))
-                    || has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm1))),
-        ),
-    ]))
+    validate_cnet_packet_release(32, code, offset)
 }
 
 fn validate_cnet_packet_release64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_release64_evidence(code, offset),
-        "refcount release + delayed free list",
-    )
+    validate_cnet_packet_release(64, code, offset)
 }
 
-fn cnet_packet_release64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x140)?;
-    Some(Evidence::required([
-        (
-            "refcount decrement",
-            has_asm64(bytes, |a| a.sub(dword_ptr(rdi + 0x14), 1)),
-        ),
-        (
-            "zero-ref packet saved",
-            has_asm64(bytes, |a| a.mov(rbx, rdi))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rax), rbx)),
-        ),
-        (
-            "delayed free-list timestamp saved",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rax + 0x08), r13)),
-        ),
-    ]))
+fn validate_cnet_packet_release(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_release(bitness, code, offset)
+        .ok()
+        .map(|_| "refcount decrement")
+}
+
+fn cnet_packet_release_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_release(bitness, code, offset),
+    ))
+}
+
+/// Evidence for a decoder that reports the first thing it could not find.
+fn decoded_evidence<T>(result: Result<T, &'static str>) -> Evidence {
+    let mut evidence = Evidence::default();
+    if let Err(missing) = result {
+        evidence.require(missing, false);
+    }
+    evidence
 }
 
 fn validate_work_thread_pool_add_work_item32(code: &[u8], offset: usize) -> Option<&'static str> {
@@ -3387,26 +3547,26 @@ fn work_thread_pool_add_work_item32_evidence(code: &[u8], offset: usize) -> Opti
                 && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C))),
         ),
         (
+            // The pool object's layout differs between builds, so the gates
+            // are matched by shape: the state byte is read and two flags are
+            // tested, at whatever offsets the build uses.
             "pool state gates",
-            has_asm32(bytes, |a| a.movzx(eax, byte_ptr(esi + 0xCC)))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x60), 0))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x148), 0)),
+            has_movzx_byte_field(32, bytes, iced_x86::Register::ESI)
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::ESI, 0),
         ),
         (
             "pool capacity fields",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi + 0x8C)))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x14C), eax))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x268), 3)),
+            find_field_group_above(32, bytes, 0x40, &[0xC0]).is_some()
+                && has_cmp_field_imm(32, bytes, iced_x86::Register::ESI, 3),
         ),
         (
             "item state checks",
-            has_asm32(bytes, |a| a.cmp(byte_ptr(eax + 0x18), 0))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x04), 0x00FF_FFFE)),
+            has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x04), 0x00FF_FFFE))
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::EAX, 0),
         ),
         (
             "enqueue synchronization",
-            has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0xD0)))
-                && has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0x134))),
+            count_addressed_fields(32, bytes, iced_x86::Register::ESI) >= 2,
         ),
     ]))
 }
@@ -3426,36 +3586,31 @@ fn work_thread_pool_add_work_item64_evidence(code: &[u8], offset: usize) -> Opti
             has_asm64(bytes, |a| a.mov(rbp, rsi)) && has_asm64(bytes, |a| a.mov(rbx, rdi)),
         ),
         (
+            // The pool object's layout differs between builds, so the gates
+            // are matched by shape: the state byte is read and two flags are
+            // tested, at whatever offsets the build uses.
             "pool state gates",
-            (has_asm64(bytes, |a| a.movzx(r12d, byte_ptr(rdi + 0x134)))
-                || has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rdi + 0x134))))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rdi + 0x90), 0))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbx + 0x1C8), 0)),
+            has_movzx_byte_field(64, bytes, iced_x86::Register::RDI)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RDI, 0)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RBX, 0),
         ),
         (
             "pool capacity fields",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0xC8)))
-                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x1CC), eax))
-                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x320), 3)),
+            find_field_group_above(64, bytes, 0x40, &[0x104]).is_some()
+                && has_cmp_field_imm(64, bytes, iced_x86::Register::RBX, 3),
         ),
         (
             "item state checks",
             has_asm64(bytes, |a| a.cmp(dword_ptr(rbp + 0x08), 0x00FF_FFFE))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbp + 0x40), 0)),
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RBP, 0),
         ),
         (
             "enqueue synchronization",
-            has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x138)))
-                && has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x1B0))),
+            count_addressed_fields(64, bytes, iced_x86::Register::RBX) >= 2,
         ),
     ]))
 }
 
-/// The match sits on the connection-state compares, so every piece of evidence
-/// below is downstream of it. What the offline scan must prove is that this
-/// really is the poster that yields our two runtime values: a global holding a
-/// `CWorkThreadPool*`, dereferenced right before a work item of the fixed size
-/// this call site allocates.
 fn validate_websocket_delayed_close32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         websocket_delayed_close32_evidence(code, offset),
@@ -3464,21 +3619,23 @@ fn validate_websocket_delayed_close32(code: &[u8], offset: usize) -> Option<&'st
 }
 
 fn websocket_delayed_close32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
+    // Wide enough to reach the pool global on builds that load it after the
+    // allocation rather than before it.
+    let bytes = bounded_tail(code, offset, 0x200)?;
     Some(Evidence::required([
         (
             "connection state gates",
-            has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x10), 2))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x104), 0)),
+            has_cmp_field_imm(32, bytes, iced_x86::Register::ESI, 2)
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::ESI, 0),
         ),
         (
             "GOT-relative pool global load",
-            has_x86_lea_ebx_disp32(bytes) && has_asm32(bytes, |a| a.mov(edi, dword_ptr(eax))),
+            has_x86_lea_ebx_disp32(bytes)
+                && (has_asm32(bytes, |a| a.mov(edi, dword_ptr(eax)))
+                    // Builds that pass the pool on the stack push it from the slot.
+                    || has_asm32(bytes, |a| a.push(dword_ptr(eax)))),
         ),
-        (
-            "work item allocation size 0xa4",
-            has_x86_push_imm32(bytes, 0xA4),
-        ),
+        ("work item allocation size", has_work_item_size(32, bytes)),
     ]))
 }
 
@@ -3490,23 +3647,23 @@ fn validate_websocket_delayed_close64(code: &[u8], offset: usize) -> Option<&'st
 }
 
 fn websocket_delayed_close64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
+    // Wide enough to reach the pool global on builds that load it after the
+    // allocation rather than before it.
+    let bytes = bounded_tail(code, offset, 0x180)?;
     Some(Evidence::required([
         (
             "connection state gates",
-            has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x18), 2))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rdi + 0x154), 0)),
+            has_cmp_field_imm(64, bytes, iced_x86::Register::RDI, 2)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RDI, 0),
         ),
         (
             "RIP-relative pool global load",
             has_x64_lea_rip_rel(bytes)
                 && (has_asm64(bytes, |a| a.mov(rbp, qword_ptr(rax)))
-                    || has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax)))),
+                    || has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax)))
+                    || has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax)))),
         ),
-        (
-            "work item allocation size 0xd8",
-            has_asm64(bytes, |a| a.mov(edi, 0xD8)),
-        ),
+        ("work item allocation size", has_work_item_size(64, bytes)),
     ]))
 }
 
@@ -3812,13 +3969,19 @@ fn validate_mark_license_changed32(code: &[u8], offset: usize) -> Option<&'stati
 
 fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    // The license state block: base, count 0xc on, and the hash table fields
+    // 0x20, 0x30 and 0x40 on.
+    let license_block = find_field_group(32, bytes, &[0xc, 0x20, 0x30, 0x40]);
     Some(Evidence::required([
-        ("license vector load", has_x86_license_vector_load32(bytes)),
+        ("license vector load", license_block.is_some()),
         (
             "dirty flag write",
             has_asm32(bytes, |a| a.mov(byte_ptr(esp + 0x1C), al)),
         ),
-        ("license vector base", has_x86_license_vector_base32(bytes)),
+        (
+            "license vector base",
+            has_x86_license_vector_base32(bytes, license_block),
+        ),
         (
             "license id hash",
             has_asm32(bytes, |a| a.imul_3(edi, edi, 0x85EBCA6Bu32))
@@ -3826,16 +3989,15 @@ fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         ),
         (
             "license state hash table",
-            (has_x86_rm32_disp32_load(bytes, 0x1ae4)
-                && has_x86_rm32_disp32_load(bytes, 0x1af0)
-                && has_x86_rm32_disp32_load(bytes, 0x1b04))
-                || (has_x86_rm32_disp32_load(bytes, 0x1ae8)
-                    && has_x86_rm32_disp32_load(bytes, 0x1af4)
-                    && has_x86_rm32_disp32_load(bytes, 0x1b08)),
+            find_field_group(32, bytes, &[0xc, 0x20]).is_some(),
         ),
         (
             "package app-state lookup",
-            has_x86_rm32_disp32_load(bytes, 0x0c58) && has_x86_rm32_disp32_load(bytes, 0x0c6c),
+            // A separate sub-object whose offset differs between builds by its
+            // own amount; no neighbouring read in this body pins it relatively.
+            (has_x86_rm32_disp32_load(bytes, 0x0c58) && has_x86_rm32_disp32_load(bytes, 0x0c6c))
+                || (has_x86_rm32_disp32_load(bytes, 0x0f90)
+                    && has_x86_rm32_disp32_load(bytes, 0x0fa4)),
         ),
     ]))
 }
@@ -3903,12 +4065,10 @@ fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Opt
     let bytes = bounded_tail(code, offset, 0x220)?;
     Some(Evidence::required([
         (
-            "pending-license count offset",
-            has_x86_rm32_disp32_load(bytes, 0x1bd0) || has_x86_rm32_disp32_load(bytes, 0x1bd4),
-        ),
-        (
-            "pending-license vector base",
-            has_x86_rm32_disp32_load(bytes, 0x1bc4) || has_x86_rm32_disp32_load(bytes, 0x1bc8),
+            "pending-license vector fields",
+            // The changed-license flag, then the vector base 0xb0 on and its
+            // count 0xbc on.
+            find_field_group(32, bytes, &[0xb0, 0xbc]).is_some(),
         ),
         (
             "pending-license entry stride",
@@ -3930,10 +4090,7 @@ fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Opt
             "removed entry compaction",
             has_x86_sub_eax_imm8(bytes, 1) && has_x86_push_edx_call_after(bytes, 0x20),
         ),
-        (
-            "changed-license followup",
-            has_x86_rm32_disp32_load(bytes, 0x1b14) || has_x86_rm32_disp32_load(bytes, 0x1b18),
-        ),
+
     ]))
 }
 
@@ -3946,21 +4103,22 @@ fn validate_process_pending_license_updates64(code: &[u8], offset: usize) -> Opt
 
 fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    // The license count, and the pending-license count 0xd8 further on.
+    let pending_vector = find_field_group(64, bytes, &[0xd8]);
+    // The app-state sub-object's own offset in CUser, which differs between
+    // builds by its own amount rather than with the license block.
+    let package_block = has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0x1348)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0x1348)));
     let old_package_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x50)))
         && has_asm64(bytes, |a| a.mov(ebp, dword_ptr(rax + r14 * 4)))
-        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)));
+        && package_block;
     let current_package_iteration = has_asm64(bytes, |a| a.mov(r8d, dword_ptr(r14 + 0x50)))
         && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rax + r15 * 4)))
-        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)));
+        && package_block;
     Some(Evidence::required([
-        (
-            "pending-license count offset",
-            has_asm64(bytes, |a| a.mov(edx, dword_ptr(rdi + 0x2570))),
-        ),
-        (
-            "pending-license vector base",
-            has_asm64(bytes, |a| a.add(rax, 0x2560)),
-        ),
+        ("pending-license vector fields", pending_vector.is_some()),
         (
             "pending-license entry stride",
             has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + rbx * 4)))
@@ -3977,8 +4135,9 @@ fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Opt
         ),
         (
             "pending update state write",
-            has_asm64(bytes, |a| a.mov(byte_ptr(rax + 0x233E), 0))
-                || has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x233E), 0)),
+            // Two adjacent state bytes, cleared together; the pair sits wherever
+            // the rest of the block does.
+            find_field_group(64, bytes, &[0x1]).is_some(),
         ),
     ]))
 }
@@ -4156,13 +4315,14 @@ fn spawn_process32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 && has_asm32(bytes, |a| a.cmp(eax, 0x31673)),
         ),
         (
+            // As on x86_64: the context's size differs between builds, and its
+            // "no value" sentinel is its last dword, so the two are matched as
+            // a pair.
             "launch context allocation",
-            has_asm32_call_after(bytes, |a| a.push(0x94), 0x20),
-        ),
-        (
-            "launch context init",
-            has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0x90), -1))
-                || has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0xC0), -1)),
+            [0x94i32, 0x4C].iter().any(|&size| {
+                has_asm32_call_after(bytes, |a| a.push(size), 0x20)
+                    && has_asm32(bytes, |a| a.mov(dword_ptr(edx + (size - 4)), -1))
+            }) || has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0xC0), -1)),
         ),
         (
             "environment block builder call",
@@ -4181,8 +4341,7 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x240)?;
     let old_shape = has_asm64(bytes, |a| a.mov(r15, rdi))
         && has_asm64(bytes, |a| a.mov(rbx, rsi))
-        && has_asm64(bytes, |a| a.mov(r12, r8))
-        && has_asm64_call_after(bytes, |a| a.mov(r8, r12), 0x10);
+        && has_asm64(bytes, |a| a.mov(r12, r8));
     let current_shape = has_asm64(bytes, |a| a.mov(r14, rdi))
         && has_asm64(bytes, |a| a.mov(rbx, r8))
         && has_asm64(bytes, |a| a.mov(r8, r15));
@@ -4194,10 +4353,15 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 && has_asm64(bytes, |a| a.cmp(eax, 0x31673)),
         ),
         (
+            // The context's size differs between builds, but its "no value"
+            // sentinel is always the last qword-aligned slot, so the size and the
+            // sentinel are matched as a pair rather than pinned.
             "launch context allocation",
-            has_asm64(bytes, |a| a.mov(edi, 0xC8))
-                && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + 0xC0), -1))
-                    || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + 0xC0), -1))),
+            [0xC8i32, 0x68].iter().any(|&size| {
+                has_asm64(bytes, |a| a.mov(edi, size))
+                    && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + (size - 8)), -1))
+                        || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + (size - 8)), -1)))
+            }),
         ),
         (
             "environment block builder call",
@@ -4288,21 +4452,32 @@ fn validate_set_env_string32(code: &[u8], offset: usize) -> Option<&'static str>
     evidence_result(set_env_string32_evidence(code, offset), "env map insertion")
 }
 
+/// `mov <r32>, [ebp + disp]`, whichever register the build happened to pick.
+fn has_x86_ebp_arg_load(bytes: &[u8], disp: u8) -> bool {
+    bytes
+        .windows(3)
+        .any(|window| window[0] == 0x8b && window[1] & 0xc7 == 0x45 && window[2] == disp)
+}
+
 fn set_env_string32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    // The map, key and value, in whichever registers the build chose. Three
+    // builds pick three different sets, so only the stack slots are pinned.
+    let writer_args = has_x86_ebp_arg_load(bytes, 0x08)
+        && has_x86_ebp_arg_load(bytes, 0x0C)
+        && has_x86_ebp_arg_load(bytes, 0x10);
+    let key_value_map = has_x86_mov_from_any_disp8(bytes, 0x78);
+    let key_value_insert = has_asm32(bytes, |a| a.push(0x417)) && has_asm32(bytes, |a| a.push(1));
+    // `(envMap, key, value, flag, separator)`, which builds the entry on its own
+    // stack and walks the map here instead of in a helper.
+    let separator_map = has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
+        && has_asm32(bytes, |a| a.mov(edx, dword_ptr(edi + 0x30)));
+    let separator_insert = has_asm32(bytes, |a| a.cmp(dword_ptr(ebp + 0x14), 1));
+
     Some(Evidence::required([
-        (
-            "three cdecl arguments",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
-                && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
-                && has_asm32(bytes, |a| a.test(eax, eax)),
-        ),
-        (
-            "environment map load",
-            has_x86_mov_from_any_disp8(bytes, 0x78),
-        ),
-        ("setenv key hash", has_asm32(bytes, |a| a.push(0x417))),
-        ("insert mode argument", has_asm32(bytes, |a| a.push(1))),
+        ("writer arguments", writer_args),
+        ("environment map fields", key_value_map || separator_map),
+        ("insert mode", key_value_insert || separator_insert),
     ]))
 }
 
@@ -4324,20 +4499,29 @@ fn set_env_string64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         && has_asm64(bytes, |a| a.test(r13, r13));
     let ordinary_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbp + 0xA4)));
     let steamrt_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4)));
+    let key_value_insert =
+        has_asm64(bytes, |a| a.mov(edx, 0x417)) && has_asm64(bytes, |a| a.mov(ecx, 1));
+    // `(envMap, key, value, flag, separator)`, which builds the entry on its own
+    // stack and walks the map here instead of in a helper.
+    let separator_arguments = has_asm64(bytes, |a| a.mov(r15, rdi))
+        && has_asm64(bytes, |a| a.mov(rbx, rsi))
+        && has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.mov(r12d, ecx))
+        && has_asm64(bytes, |a| a.mov(r13d, r8d));
+    let separator_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0x10)))
+        && has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x44)));
+    let separator_insert = has_asm64(bytes, |a| a.cmp(r12d, 1));
+
     Some(Evidence::required([
         (
-            "three SysV arguments",
-            ordinary_arguments || steamrt_arguments,
+            "writer arguments",
+            ordinary_arguments || steamrt_arguments || separator_arguments,
         ),
         (
-            "environment map load",
-            ordinary_map || steamrt_map,
+            "environment map fields",
+            ordinary_map || steamrt_map || separator_map,
         ),
-        (
-            "setenv key hash",
-            has_asm64(bytes, |a| a.mov(edx, 0x417)),
-        ),
-        ("insert mode argument", has_asm64(bytes, |a| a.mov(ecx, 1))),
+        ("insert mode", key_value_insert || separator_insert),
     ]))
 }
 
@@ -4351,8 +4535,9 @@ fn steamui_run_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidence> 
         ("frame time store", has_x86_fstp_esp_disp8(bytes, 0x0C)),
         (
             "app controller state load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0xB30)))
-                || has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0xB70))),
+            [0xB30i32, 0xB3C, 0xB70]
+                .iter()
+                .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset)))),
         ),
     ]))
 }
@@ -4565,7 +4750,7 @@ fn get_app_by_id32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         ),
         (
             "app map load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x9E0))),
+            has_app_map_load32(bytes),
         ),
     ]))
 }
@@ -4601,7 +4786,7 @@ fn mark_app_change32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     Some(Evidence::required([
         (
             "library app map load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x9E0))),
+            has_app_map_load32(bytes),
         ),
         (
             "change flag materialization",
@@ -4623,7 +4808,7 @@ fn mark_app_change64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         ("change kind filter", has_asm64(bytes, |a| a.cmp(edi, 7))),
         (
             "library app map load",
-            has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax + 0xB58))),
+            has_app_map_load64(bytes),
         ),
         ("app object save", has_asm64(bytes, |a| a.mov(r12, rax))),
     ]))
@@ -4733,6 +4918,9 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         STEAMCLIENT64_SEMANTIC_CHECKS,
         SemanticArch::X86_64,
     );
+    failed |= scan_cnet_packet_layout(code, vaddr, resolved, 64);
+    failed |= scan_work_item_site(code, vaddr, resolved, 64);
+    failed |= scan_env_writer_abi(code, vaddr, resolved, 64);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4781,6 +4969,9 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         STEAMCLIENT32_SEMANTIC_CHECKS,
         SemanticArch::X86,
     );
+    failed |= scan_cnet_packet_layout(code, vaddr, resolved, 32);
+    failed |= scan_work_item_site(code, vaddr, resolved, 32);
+    failed |= scan_env_writer_abi(code, vaddr, resolved, 32);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4820,12 +5011,142 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     failed
 }
 
-fn ticket_ext_data_mode4_thunk32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+/// Decode the bare work-item post site exactly as the runtime does, and check
+/// its enqueue call against the separately resolved `AddWorkItem`.
+fn scan_work_item_site(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    const LABEL: &str = "CWebSocketConnection::PostDelayedCloseWorkItem item";
+    let (Some(&site), Some(&add_work_item)) = (
+        resolved.get("CWebSocketConnection::PostDelayedCloseWorkItem"),
+        resolved.get("CWorkThreadPool::AddWorkItem"),
+    ) else {
+        // Each unresolved function is already reported on its own line.
+        return false;
+    };
+    let base = vaddr as usize;
+    let decoded = vapor_forge_patterns::work_item_site::decode(bitness, base, code, base + site)
+        .and_then(|decoded| {
+            if decoded.add_work_item == base + add_work_item {
+                Ok(decoded)
+            } else {
+                Err("enqueue call to the resolved AddWorkItem")
+            }
+        });
+    match decoded {
+        Ok(decoded) => {
+            println!(
+                "  OK   {:<58} pool=0x{:x} timer_vtable=0x{:x} size=0x{:x} vptrs={:x?} refs=0x{:x} sentinels={:x?}",
+                LABEL,
+                decoded.pool_slot,
+                decoded.timer_vtable,
+                decoded.item_size,
+                decoded.timer_vptr_offsets,
+                decoded.refcount_offset,
+                decoded.sentinel_offsets
+            );
+            false
+        }
+        Err(missing) => {
+            print_evidence_failure(
+                LABEL,
+                vaddr + site as u64,
+                Some(&decoded_evidence::<()>(Err(missing))),
+                "site decode failed",
+            );
+            true
+        }
+    }
+}
+
+/// Classify `SetEnvString`'s parameter count exactly as the runtime does.
+fn scan_env_writer_abi(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    const LABEL: &str = "SetEnvString parameters";
+    let Some(&offset) = resolved.get("SetEnvString") else {
+        return false;
+    };
+    match vapor_forge_patterns::env_writer::decode_abi(bitness, code, offset) {
+        Some(abi) => {
+            let form = match abi {
+                vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValue => "(envMap, key, value)",
+                vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValueSeparator => {
+                    "(envMap, key, value, flag, separator)"
+                }
+            };
+            println!("  OK   {LABEL:<58} {form}");
+            false
+        }
+        None => {
+            print_evidence_failure(
+                LABEL,
+                vaddr + offset as u64,
+                None,
+                "neither three nor five parameters",
+            );
+            true
+        }
+    }
+}
+
+/// Decode the CNetPacket layout exactly as the runtime does, and report it.
+fn scan_cnet_packet_layout(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    let (Some(&alloc), Some(&init), Some(&release)) = (
+        resolved.get("CNetPacket::Alloc"),
+        resolved.get("CNetPacket::Init"),
+        resolved.get("CNetPacket::Release"),
+    ) else {
+        // Each unresolved function is already reported on its own line.
+        return false;
+    };
+    match vapor_forge_patterns::cnet_packet::decode_api(bitness, code, alloc, init, release) {
+        Ok(api) => {
+            println!(
+                "  OK   {:<58} conn_id=0x{:x} data=0x{:x} size=0x{:x} owned=0x{:x} refs=0x{:x} object=0x{:x}",
+                "CNetPacket layout",
+                api.fields.conn_id,
+                api.fields.data,
+                api.fields.size,
+                api.fields.owned_data,
+                api.refcount,
+                api.object_size
+            );
+            false
+        }
+        Err(missing) => {
+            print_evidence_failure(
+                "CNetPacket layout",
+                vaddr + init as u64,
+                Some(&decoded_evidence::<()>(Err(missing))),
+                "layout discovery failed",
+            );
+            true
+        }
+    }
+}
+
+fn ticket_ext_data_mode4_thunk32_evidence(
+    code: &[u8],
+    offset: usize,
+    this_adjust: u64,
+) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x160)?;
 
     let has_mode4 = has_asm32(bytes, |a| a.push(4));
     let adjusts_this_to_cuser =
-        find_x86_sub_eax_imm32_matching(bytes, |imm| matches!(imm, 0x18d4 | 0x18d8)).is_some();
+        find_x86_sub_eax_imm32_matching(bytes, |imm| u64::from(imm) == this_adjust).is_some();
     let calls_shared_builder_after_mode = has_call_after_mode4_push(bytes);
 
     let mut evidence = Evidence::default();
@@ -4838,12 +5159,17 @@ fn ticket_ext_data_mode4_thunk32_evidence(code: &[u8], offset: usize) -> Option<
     Some(evidence)
 }
 
-fn ticket_ext_data_mode4_thunk64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+fn ticket_ext_data_mode4_thunk64_evidence(
+    code: &[u8],
+    offset: usize,
+    this_adjust: u64,
+) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x100)?;
 
     let has_mode4 = has_asm64(bytes, |a| a.push(4));
-    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 - 0x1FD0)))
-        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx - 0x1FD0)));
+    let adjust = -(this_adjust as i32);
+    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 + adjust)))
+        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + adjust)));
     let calls_shared_builder_after_mode = has_call_after_mode4_push(bytes);
 
     let mut evidence = Evidence::default();
@@ -4860,6 +5186,7 @@ fn update_ticket32_evidence(
     code: &[u8],
     offset: usize,
     check_ownership_offset: usize,
+    this_adjust: u64,
 ) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x280)?;
     let has_force_arg_branch = has_asm32(bytes, |a| a.cmp(byte_ptr(ebp + 0x10), 0));
@@ -4869,7 +5196,7 @@ fn update_ticket32_evidence(
             .any(|w| w[0] == 0xc7 && w[1] == 0x45 && w[3..7] == [0xff, 0xff, 0xff, 0xff]);
     let calls_check_ownership =
         has_relative_call_to(code, offset, bytes.len(), check_ownership_offset);
-    let receiver_is_valid = update_ticket32_has_valid_receiver(bytes);
+    let receiver_is_valid = update_ticket32_has_valid_receiver(bytes, this_adjust);
 
     let mut evidence = Evidence::default();
     evidence.require("force argument branch", has_force_arg_branch);
@@ -4879,18 +5206,31 @@ fn update_ticket32_evidence(
     Some(evidence)
 }
 
-fn update_ticket32_has_valid_receiver(bytes: &[u8]) -> bool {
+/// The receiver is the IClientUser pointer: the body moves it into `CUser`
+/// and compares a low `CUser` field (0xf8, 0xdc on later builds) with 4
+/// through the unadjusted pointer.
+fn update_ticket32_has_valid_receiver(bytes: &[u8], this_adjust: u64) -> bool {
     let receiver_adjust_window = &bytes[..bytes.len().min(0x100)];
-    if find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| {
-        matches!(imm, 0x18d4 | 0x18d8)
-            && has_x86_cmp_rm32_imm8(bytes, 0u32.wrapping_sub(imm - 0xf8), 0x04)
-    })
-    .is_some()
-    {
+    let adjusts_this =
+        find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| u64::from(imm) == this_adjust)
+            .is_some();
+    if adjusts_this && has_x86_cmp_cuser_field_imm8(bytes, this_adjust as u32, 0x04) {
         return true;
     }
 
     has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0xF8), 4))
+}
+
+/// `cmp dword [reg - this_adjust + field], imm` for a field in the first 0x200
+/// bytes of `CUser`.
+fn has_x86_cmp_cuser_field_imm8(bytes: &[u8], this_adjust: u32, imm: u8) -> bool {
+    bytes.windows(7).any(|w| {
+        let disp = u32::from_le_bytes([w[2], w[3], w[4], w[5]]);
+        w[0] == 0x83
+            && matches!(w[1], 0xb8..=0xbf)
+            && w[6] == imm
+            && this_adjust.wrapping_add(disp) < 0x200
+    })
 }
 
 fn update_ticket64_evidence(
@@ -5323,6 +5663,14 @@ fn find_x64_node_key_off(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(5)
         .find_map(|w| (w[0..2] == [0x8b, 0x4a] && w[3..5] == [0x39, 0xcb]).then_some(w[2] as usize))
+        .or_else(|| {
+            // `cmp r32, [base + disp8]`, which builds that compare the key in
+            // place emit instead of loading it first.
+            bytes.windows(3).find_map(|w| {
+                (w[0] == 0x3b && w[1] & 0xc0 == 0x40 && w[1] & 0x07 != 0x04)
+                    .then_some(w[2] as usize)
+            })
+        })
 }
 
 fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
@@ -5332,6 +5680,13 @@ fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
         .or_else(|| {
             bytes.windows(5).find_map(|w| {
                 (w[0..4] == [0x4c, 0x8b, 0x6c, 0x06]).then_some(w[4] as usize)
+            })
+        })
+        .or_else(|| {
+            // `mov r13, [base + disp8]`, the same load without a scaled index.
+            bytes.windows(4).find_map(|w| {
+                (w[0..2] == [0x4c, 0x8b] && w[2] & 0xf8 == 0x68 && w[2] & 0x07 != 0x04)
+                    .then_some(w[3] as usize)
             })
         })
 }
