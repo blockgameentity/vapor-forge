@@ -319,6 +319,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     }
 
     if module == "steamclient" {
+        failed |= scan_engine_work_item_layout(&data, &segment);
         failed |= scan_public_wrapper_collisions(path, segment.vaddr, &resolved);
         failed |= if is_elf64 {
             scan_steamclient64_layouts(segment.bytes, segment.vaddr, &resolved)
@@ -367,6 +368,51 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     println!();
 
     Ok(failed)
+}
+
+fn scan_engine_work_item_layout(data: &[u8], segment: &ExecutableSegment<'_>) -> bool {
+    let label = "CSteamEngine work-item queue and allocator";
+    let result = vapor_forge_patterns::engine_work_item_site::discover(
+        u32::from(segment.elf_class.bits()),
+        segment.vaddr as usize,
+        segment.bytes,
+    );
+    let discovered = match result {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            println!("  FAIL {label:<58} required ({error})");
+            return true;
+        }
+    };
+    let site = discovered.site;
+    let image = match ElfImage::parse(data) {
+        Ok(image) => image,
+        Err(error) => {
+            println!("  FAIL {label:<58} required ({error})");
+            return true;
+        }
+    };
+    if !image.in_module(site.engine_slot as u64)
+        || image.in_text(site.engine_slot as u64)
+        || !image.in_text(site.grow as u64)
+        || !image.in_text(site.allocate as u64)
+    {
+        println!(
+            "  FAIL {label:<58} required (decoded addresses have invalid segment permissions)"
+        );
+        return true;
+    }
+    println!(
+        "  OK   {label:<58} engine=0x{:x} mutex=0x{:x} queue=0x{:x} item_size={} allocate=0x{:x} grow=0x{:x} producers={}",
+        site.engine_slot,
+        site.mutex_offset,
+        site.queue_offset,
+        site.item_size,
+        site.allocate,
+        site.grow,
+        discovered.agreeing_producers
+    );
+    false
 }
 
 fn scan_public_wrapper_collisions(
@@ -682,6 +728,28 @@ fn executable_segment(data: &[u8]) -> Result<ExecutableSegment<'_>, String> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn spawn_environment_validator_checks_frameless_output_arguments() {
+        for output_offset in [0x3230, 0x3228] {
+            let mut code = [0xcc; 0x240];
+            place_asm64(&mut code, 0, |a| {
+                a.mov(rax, qword_ptr(rsp + output_offset))?;
+                a.mov(r14, qword_ptr(rsp + 0x3238))?;
+                a.mov(qword_ptr(rsp + 0x28), rsi)?;
+                a.mov(qword_ptr(rsp + 0x20), rcx)?;
+                a.mov(byte_ptr(rsp + 0x21E0), 0)?;
+                a.mov(r8d, 0x2f)?;
+                a.mov(esi, 0x1000)?;
+                a.mov(edx, -1)?;
+                a.call(0x1000u64)
+            });
+            assert_eq!(
+                validate_build_spawn_env_block64(&code, 0).is_some(),
+                output_offset == 0x3230
+            );
+        }
+    }
 
     fn place_asm32(
         code: &mut [u8],

@@ -65,6 +65,16 @@ pattern = "41 57 ? 89 ? 41 56 ? ? ? ? ? 41 54 55 53 48 ? ? ? ? ? ? ? ? ? ? ? ? ?
 follow = "none"
 pattern = "48 8B 05 ? ? ? ? 8B 40 7C 85 C0 75 ? 31 C0 C3 ? ? ? ? ? ? ? 41 54"
 
+# Returns the account that holds the family library lock on an app, or 0 when
+# the app is free, a lender is available, or the lock is held by this account.
+[steamclient."CFamilySharing::GetLockingAccount"]
+follow = "none"
+pattern = "48 63 87 ? ? ? ? 83 F8 FF 74 ? 48 8B 97 ? ? ? ? EB ? ? ? ? 48 63 00 83 F8 FF 74 ? 48 6B C0 38 48 01 D0 39 70 10 77 ? 73 ? 48 63 40 04 83 F8 FF 75 ? 45 31 C0"
+
+# steamrt holds the node array in RCX and the result in ESI.
+[[steamclient."CFamilySharing::GetLockingAccount".variants]]
+pattern = "48 63 87 ? ? ? ? 83 F8 FF 74 ? 48 8B 8F ? ? ? ? EB ? ? ? ? ? ? ? ? ? ? ? ? 48 63 00 83 F8 FF 74 ? 48 6B C0 38 48 01 C8 8B 50 10 39 D6 72 ? 39 F2 73 ? 48 63 40 04 83 F8 FF 75 ? 31 F6"
+
 [steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame"]
 follow = "none"
 pattern = "41 57 41 56 41 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 85 ? ? ? ? ? ? ? ? ? ? ? ? 00 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 8D ? 24 20 B9 40 00 00 00 BA 0E 00 00 00 48"
@@ -106,6 +116,11 @@ pattern = "48 83 EC ? 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 8
 [steamclient."CWebSocketConnection::PostDelayedCloseWorkItem"]
 follow = "none"
 pattern = "83 7F ? 02 0F 85 ? ? ? ? 80 BF ? ? 00 00 00 0F 85 ? ? ? ? 48 8D 05 ? ? ? ? BF ? ? 00 00"
+
+# steamrt reorders the connection save and pool load around the state gates.
+# The body validator verifies the pool load and complete work-item allocation.
+[[steamclient."CWebSocketConnection::PostDelayedCloseWorkItem".variants]]
+pattern = "83 7F ? 02"
 
 # CHTTPRequestJob start boundary. The local-cloud hook first uses this as an
 # observation point; x64 request layout is validated before transfer bypass.
@@ -150,6 +165,14 @@ pattern = "55 48 89 E5 41 57 ? ? ? ? ? 41 55 41 54 ? ? ? ? 48 ? ? ? ? ? ? ? ? ? 
 [steamclient."CUser::BuildSpawnEnvBlock"]
 follow = "none"
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
+
+# Some steamrt builds use the same frame-pointer entry.
+[[steamclient."CUser::BuildSpawnEnvBlock".variants]]
+pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
+
+# steamrt addresses saved arguments and local buffers through RSP.
+[[steamclient."CUser::BuildSpawnEnvBlock".variants]]
+pattern = "41 57 41 56 41 55 41 54 55 53 48 81 EC ? 31 00 00 48 8B 84 24 ? 32 00 00 48 89 74 24 ? 48 89 4C 24"
 
 [steamclient."SetEnvString"]
 follow = "none"

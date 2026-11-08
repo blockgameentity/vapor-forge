@@ -11,9 +11,10 @@ use vapor_forge_steam_native_abi::{
     package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
     ProcessPendingLicenseUpdatesFn,
 };
+use vapor_forge_steam_protocol::LicensedPackage;
 
-use crate::engine_work_item_site::EngineWorkItemSite;
 use crate::pattern_resolver::CodeRegion;
+use vapor_forge_patterns::engine_work_item_site::EngineWorkItemSite;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -325,19 +326,25 @@ pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
 }
 
 fn resolve_engine_work_item_site(code: &CodeRegion) {
-    let discovered =
-        match crate::engine_work_item_site::discover(usize::BITS, code.base, code.bytes) {
-            Ok(discovered) => discovered,
-            Err(error) => {
-                warn!(error, "package: engine work-item queue was not discovered");
-                return;
-            }
-        };
+    let discovered = match vapor_forge_patterns::engine_work_item_site::discover(
+        usize::BITS,
+        code.base,
+        code.bytes,
+    ) {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            warn!(error, "package: engine work-item queue was not discovered");
+            return;
+        }
+    };
     let code_end = code.base.saturating_add(code.bytes.len());
-    if !(code.base..code_end).contains(&discovered.site.grow) {
+    if !(code.base..code_end).contains(&discovered.site.grow)
+        || !(code.base..code_end).contains(&discovered.site.allocate)
+    {
         warn!(
             grow = format_args!("0x{:x}", discovered.site.grow),
-            "package: decoded queue grow function is outside steamclient code"
+            allocate = format_args!("0x{:x}", discovered.site.allocate),
+            "package: decoded queue functions are outside steamclient code"
         );
         return;
     }
@@ -360,6 +367,7 @@ fn resolve_engine_work_item_site(code: &CodeRegion) {
         mutex_offset = format_args!("0x{:x}", discovered.site.mutex_offset),
         queue_offset = format_args!("0x{:x}", discovered.site.queue_offset),
         grow = format_args!("0x{:x}", discovered.site.grow),
+        allocate = format_args!("0x{:x}", discovered.site.allocate),
         item_size = discovered.site.item_size,
         producers = discovered.agreeing_producers,
         "package: engine work-item queue discovered"
@@ -541,24 +549,26 @@ pub fn queue_reload(controlled: Vec<AppId>) {
 // Genuine ownership from the account's license list
 // ---------------------------------------------------------------------------
 
-// Packages (id, access token) from the last CMsgClientLicenseList, kept until
-// every package's info is available and the controlled apps were re-evaluated.
+// Packages from the last CMsgClientLicenseList, kept until every package's
+// info is available and the controlled apps were re-evaluated.
 static PENDING_LICENSES: Mutex<Option<PendingLicenses>> = Mutex::new(None);
 const MAX_LICENSE_REFRESH_ATTEMPTS: u32 = 40;
 
 struct PendingLicenses {
-    packages: Vec<(u32, u64)>,
+    packages: Vec<LicensedPackage>,
+    self_account_id: u32,
     attempts: u32,
 }
 
 /// Remember the account's licenses; the next GetSubscribedApps call, which
 /// Steam makes after processing a license change, re-evaluates ownership.
-pub(crate) fn note_license_list(packages: Vec<(u32, u64)>) {
+pub(crate) fn note_license_list(packages: Vec<LicensedPackage>, self_account_id: u32) {
     let mut pending = PENDING_LICENSES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *pending = Some(PendingLicenses {
         packages,
+        self_account_id,
         attempts: 0,
     });
 }
@@ -590,19 +600,21 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             *guard = None;
             return;
         }
-        pending.packages.clone()
+        (pending.packages.clone(), pending.self_account_id)
     };
+    let (packages, self_account_id) = packages;
     // SAFETY: resolved once before hook installation and read-only afterward.
     let Some(get_pkg) = (unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) }) else {
         return;
     };
     let this = CPKG_INFO_PTR.load(Ordering::Acquire) as *mut c_void;
     let mut owned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut family: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut missing = 0usize;
-    for &(package_id, access_token) in &packages {
+    for license in &packages {
         // SAFETY: the receiver was captured from Steam's own GetPackageInfo
         // call and the callable was validated against this ABI.
-        let pkg = unsafe { get_pkg(this, package_id, access_token) };
+        let pkg = unsafe { get_pkg(this, license.package_id, license.access_token) };
         if pkg.is_null() {
             missing += 1;
             continue;
@@ -618,7 +630,12 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
         let base = app_ids.m_memory.m_p_memory;
         if count > 0 && !base.is_null() {
             // SAFETY: Steam's vector header describes `count` live u32 elements.
-            owned.extend(unsafe { std::slice::from_raw_parts(base as *const u32, count) });
+            let apps = unsafe { std::slice::from_raw_parts(base as *const u32, count) };
+            if self_account_id != 0 && license.is_held_by_other_account(self_account_id) {
+                family.extend(apps);
+            } else {
+                owned.extend(apps);
+            }
         }
     }
     let runtime = crate::client::install::runtime_snapshot();
@@ -629,9 +646,12 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
     // in one of the missing ones. Downgrades wait for a complete picture.
     let complete = missing == 0;
     let mut changed = Vec::new();
+    let mut family_changed = Vec::new();
     let mut owned_controlled = 0usize;
-    for app_id in controlled {
-        let is_owned = owned.contains(&app_id.0);
+    for &app_id in &controlled {
+        let self_owned = owned.contains(&app_id.0);
+        let family_shared = !self_owned && family.contains(&app_id.0);
+        let is_owned = self_owned || family_shared;
         if is_owned {
             owned_controlled += 1;
         }
@@ -642,6 +662,11 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
         vapor_forge_features::apps::record_actual_ownership(app_id, is_owned);
         if before != vapor_forge_features::apps::actual_ownership(app_id) {
             changed.push(app_id.0);
+        }
+        if (family_shared || complete)
+            && vapor_forge_features::apps::record_family_shared(app_id, family_shared)
+        {
+            family_changed.push(app_id.0);
         }
     }
     let attempts = {
@@ -662,8 +687,14 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             owned_controlled,
             changed = changed.len(),
             changed_apps = ?changed.iter().take(16).collect::<Vec<_>>(),
+            family_changed_apps = ?family_changed.iter().take(16).collect::<Vec<_>>(),
             "package: ownership refreshed from license list"
         );
+    }
+    // Family-shared apps stay out of pkg0, so a change in that set changes
+    // what pkg0 has to carry.
+    if !family_changed.is_empty() && crate::client::install::PKG0_INJECTED.load(Ordering::Acquire) {
+        queue_reload(controlled);
     }
 }
 
@@ -723,6 +754,17 @@ fn try_post_update() {
     warn!(generation, "package: update work item could not be posted");
 }
 
+/// Controlled apps that pkg0 should carry. An app a family member's license
+/// already grants is left to Steam, which then presents it as borrowed from
+/// that member instead of as a license of this account.
+fn without_family_shared(controlled: &[AppId]) -> Vec<AppId> {
+    controlled
+        .iter()
+        .copied()
+        .filter(|&app_id| !vapor_forge_features::apps::is_family_shared(app_id))
+        .collect()
+}
+
 fn run_update_work_item(generation: u64) {
     let controlled = {
         let mut dispatch = UPDATE_DISPATCH
@@ -769,7 +811,7 @@ fn run_update_work_item(generation: u64) {
             if !super::ownership::snapshot_actual_ownership(cuser, &controlled) {
                 return false;
             }
-            let plan = package_state.compute_injection(&controlled);
+            let plan = package_state.compute_injection(&without_family_shared(&controlled));
             let injection = access.inject(&plan.app_ids);
             package_state.record_injected(&injection.appended);
             if !injection.complete {
@@ -787,10 +829,12 @@ fn run_update_work_item(generation: u64) {
         if !package_state.is_active() {
             return false;
         }
-        let diff = package_state.compute_hot_reload_diff(&controlled);
+        let diff = package_state.compute_hot_reload_diff(&without_family_shared(&controlled));
         if !super::ownership::snapshot_actual_ownership(cuser, &diff.additions) {
             return false;
         }
+        // The snapshot may have found family licenses for new additions.
+        let diff = package_state.compute_hot_reload_diff(&without_family_shared(&controlled));
         let applied = access.apply_reload_diff(&diff);
         package_state.apply_diff(&applied);
         info!(
@@ -837,26 +881,6 @@ unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: 
     if engine.is_null() {
         return false;
     }
-    // SAFETY: libc malloc returns storage aligned for any pointer field.
-    let item = unsafe { libc::malloc(site.item_size) as *mut u8 };
-    if item.is_null() {
-        return false;
-    }
-    // SAFETY: item owns site.item_size writable bytes.
-    unsafe {
-        item.write_bytes(0, site.item_size);
-        item.cast::<usize>().write(WORK_ITEM_NAME.as_ptr() as usize);
-        item.add(pointer_size)
-            .cast::<u64>()
-            .write_unaligned(generation);
-        item.add(pointer_size * 3)
-            .cast::<usize>()
-            .write(package_update_manager as *const () as usize);
-        item.add(pointer_size * 4)
-            .cast::<usize>()
-            .write(package_update_invoker as *const () as usize);
-    }
-
     // SAFETY: offsets and the mutex relationship were proved by the native
     // producer decoder. The engine owns this mutex for the queue's lifetime.
     let mutex = unsafe {
@@ -866,8 +890,6 @@ unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: 
     };
     // SAFETY: mutex points to Steam's live queue mutex.
     if unsafe { libc::pthread_mutex_lock(mutex) } != 0 {
-        // SAFETY: Steam did not take ownership of item.
-        unsafe { libc::free(item.cast()) };
         return false;
     }
     // SAFETY: the mutex remains locked and engine_slot remains mapped.
@@ -876,24 +898,20 @@ unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: 
         false
     } else {
         // SAFETY: queue_offset identifies the native CUtlVector<void *> header.
-        unsafe { append_engine_work_item(site, engine, item.cast()) }
+        unsafe { append_engine_work_item(site, engine, generation) }
     };
     // SAFETY: this call balances the successful lock above.
     let unlock_result = unsafe { libc::pthread_mutex_unlock(mutex) };
-    if !inserted || unlock_result != 0 {
-        if !inserted {
-            // SAFETY: Steam did not take ownership of item.
-            unsafe { libc::free(item.cast()) };
-        }
-        return false;
+    if unlock_result != 0 {
+        warn!(unlock_result, "package: engine queue mutex unlock failed");
     }
-    true
+    inserted
 }
 
 unsafe fn append_engine_work_item(
     site: EngineWorkItemSite,
     engine: *mut u8,
-    item: *mut c_void,
+    generation: u64,
 ) -> bool {
     let pointer_size = std::mem::size_of::<usize>();
     // SAFETY: caller holds the decoded queue mutex and engine is current.
@@ -928,9 +946,32 @@ unsafe fn append_engine_work_item(
     if storage.is_null() || !storage.is_aligned() {
         return false;
     }
+    type AllocateFn = unsafe extern "C" fn(usize) -> *mut u8;
+    // SAFETY: discovery captured the native producer's size-only allocation call.
+    let allocate = unsafe { std::mem::transmute::<usize, AllocateFn>(site.allocate) };
+    // SAFETY: the same native allocation entry creates Steam's own queue items.
+    let item = unsafe { allocate(site.item_size) };
+    if item.is_null() {
+        return false;
+    }
+    // No fallible operation remains before ownership passes to Steam's queue.
+    // SAFETY: the native allocator returned item_size writable bytes.
+    unsafe {
+        item.write_bytes(0, site.item_size);
+        item.cast::<usize>().write(WORK_ITEM_NAME.as_ptr() as usize);
+        item.add(pointer_size)
+            .cast::<u64>()
+            .write_unaligned(generation);
+        item.add(pointer_size * 3)
+            .cast::<usize>()
+            .write(package_update_manager as *const () as usize);
+        item.add(pointer_size * 4)
+            .cast::<usize>()
+            .write(package_update_invoker as *const () as usize);
+    }
     // SAFETY: capacity exceeds count and caller holds the native queue mutex.
     unsafe {
-        storage.add(count as usize).write(item);
+        storage.add(count as usize).write(item.cast());
         queue.add(count_offset).cast::<i32>().write(count + 1);
     }
     true
@@ -1006,6 +1047,95 @@ pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vapor_forge_steam_native_abi::{CUtlMemory, CUtlVector};
+
+    unsafe extern "C" fn no_queue_growth(_queue: *mut c_void, _count: i32) {}
+
+    fn queue_site(allocate: unsafe extern "C" fn(usize) -> *mut u8) -> EngineWorkItemSite {
+        EngineWorkItemSite {
+            engine_slot: 0,
+            mutex_offset: 0,
+            queue_offset: 0,
+            grow: no_queue_growth as *const () as usize,
+            allocate: allocate as *const () as usize,
+            item_size: std::mem::size_of::<usize>() * 5,
+        }
+    }
+
+    #[test]
+    fn queue_item_uses_native_allocator_and_preserves_callable_storage() {
+        static REQUESTED_SIZE: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn allocate(size: usize) -> *mut u8 {
+            REQUESTED_SIZE.store(size, Ordering::Relaxed);
+            // SAFETY: the test releases the returned allocation with this same libc.
+            unsafe { libc::malloc(size).cast() }
+        }
+        let site = queue_site(allocate);
+        let mut slots = [core::ptr::null_mut::<c_void>(); 1];
+        let mut queue = CUtlVector {
+            m_memory: CUtlMemory {
+                m_p_memory: slots.as_mut_ptr(),
+                m_n_allocation_count: 1,
+                m_n_grow_size: 0,
+            },
+            m_size: 0,
+        };
+        let generation = 0x1234_5678_9abc_def0;
+        // SAFETY: queue has one writable slot and no concurrent readers.
+        assert!(unsafe {
+            append_engine_work_item(site, (&mut queue as *mut CUtlVector<_>).cast(), generation)
+        });
+        assert_eq!(REQUESTED_SIZE.load(Ordering::Relaxed), site.item_size);
+        assert_eq!(queue.m_size, 1);
+        assert!(!slots[0].is_null());
+        let item = slots[0].cast::<u8>();
+        let pointer_size = std::mem::size_of::<usize>();
+        // SAFETY: append published a fully initialized five-word native item.
+        unsafe {
+            assert_eq!(
+                item.cast::<usize>().read(),
+                WORK_ITEM_NAME.as_ptr() as usize
+            );
+            assert_eq!(
+                item.add(pointer_size).cast::<u64>().read_unaligned(),
+                generation
+            );
+            assert_eq!(
+                item.add(pointer_size * 3).cast::<usize>().read(),
+                package_update_manager as *const () as usize
+            );
+            assert_eq!(
+                item.add(pointer_size * 4).cast::<usize>().read(),
+                package_update_invoker as *const () as usize
+            );
+            libc::free(item.cast());
+        }
+    }
+
+    #[test]
+    fn rejected_queue_never_allocates_a_native_item() {
+        static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn allocate(_size: usize) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            core::ptr::null_mut()
+        }
+        let site = queue_site(allocate);
+        for (count, capacity) in [(-1, 1), (2, 1), (0, 0), (0, 1)] {
+            let mut queue = CUtlVector::<*mut c_void> {
+                m_memory: CUtlMemory {
+                    m_p_memory: core::ptr::null_mut(),
+                    m_n_allocation_count: capacity,
+                    m_n_grow_size: 0,
+                },
+                m_size: count,
+            };
+            // SAFETY: the header is live; invalid states must be rejected before allocation.
+            assert!(!unsafe {
+                append_engine_work_item(site, (&mut queue as *mut CUtlVector<_>).cast(), 7)
+            });
+        }
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    }
 
     fn dispatch() -> UpdateDispatch {
         UpdateDispatch {
