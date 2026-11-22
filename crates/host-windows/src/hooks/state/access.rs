@@ -78,6 +78,17 @@ impl HostState {
         &self.achievements
     }
 
+    /// The Lua achievement intent declared for `app_id`, if any.
+    ///
+    /// The stats-merge body reads this on Steam's thread: the map is attached once
+    /// before publication and never mutated afterwards, so no lock is taken here.
+    pub fn achievement_overrides(
+        &self,
+        app_id: AppId,
+    ) -> Option<&std::collections::BTreeMap<String, vapor_forge_core::AchievementIntent>> {
+        self.achievement_overrides.get(&app_id)
+    }
+
     /// What the CM dispatch hook recorded, for diagnostics.
     pub fn netpacket(&self) -> &NetPacketLedger {
         &self.netpacket

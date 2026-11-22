@@ -12,12 +12,13 @@
 //! capabilities whose symbols did not resolve are disabled immediately
 //! afterwards.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use vapor_forge_config::{AppId, DepotId, RuntimeConfig};
+use vapor_forge_core::AchievementIntent;
 use vapor_forge_features::family::FamilySettings;
 use vapor_forge_features::package::PackageState;
 use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
@@ -77,6 +78,10 @@ pub struct HostState {
     /// and attaches it here, so a hook body reads the value the feature pass
     /// applied rather than a second copy of the config.
     achievements: AchievementSettings,
+    /// The achievement intent the Lua scripts declared, per app and key: attached
+    /// once before publication (like [`Self::lua_tickets`]) and read-only after.
+    /// The one achievements input that does not come from Steam.
+    achievement_overrides: HashMap<AppId, BTreeMap<String, AchievementIntent>>,
     /// What the CM dispatch hook saw, bounded and read-only once recorded.
     ///
     /// A hook body runs on Steam's networking thread, so the record is a fixed
@@ -142,6 +147,7 @@ impl HostState {
             depot_keys: HashMap::new(),
             identity: IdentitySettings::default(),
             achievements: AchievementSettings::default(),
+            achievement_overrides: HashMap::new(),
             netpacket: NetPacketLedger::new(),
             layout: RwLock::new(None),
             request_codes: RequestCodeCache::new(),
@@ -154,7 +160,10 @@ impl HostState {
     /// Publish the decoded packet layout. Idempotent: the first decode wins, so
     /// a second module's pass cannot replace a layout a hook already read.
     pub fn set_layout(&self, layout: Layout) {
-        let mut current = self.layout.write().unwrap_or_else(|error| error.into_inner());
+        let mut current = self
+            .layout
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         if current.is_none() {
             *current = Some(layout);
         }
@@ -162,7 +171,10 @@ impl HostState {
 
     /// The packet layout this process decoded, if any.
     pub fn layout(&self) -> Option<Layout> {
-        *self.layout.read().unwrap_or_else(|error| error.into_inner())
+        *self
+            .layout
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// The request codes this process holds.
@@ -179,7 +191,10 @@ impl HostState {
     /// Publish the decoded stats-reply geometry. First decode wins, like
     /// [`Self::set_layout`].
     pub fn set_reply_geometry(&self, reply: JobReply) {
-        let mut current = self.reply.write().unwrap_or_else(|error| error.into_inner());
+        let mut current = self
+            .reply
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         if current.is_none() {
             *current = Some(reply);
         }
@@ -239,11 +254,22 @@ impl HostState {
 
     /// Attach the resolved `[achievements]` settings.
     ///
-    /// Without this the body sees [`AchievementSettings::default`], i.e. the
-    /// rebuild off, which is the same behaviour as a user who never enabled it.
+    /// Without this the body sees [`AchievementSettings::default`] and refuses,
+    /// which is the same behaviour as a user who turned the rewrite off.
     #[must_use]
     pub fn with_achievement_settings(mut self, achievements: AchievementSettings) -> Self {
         self.achievements = achievements;
+        self
+    }
+
+    /// Attach the achievement intent the Lua scripts declared; empty is the normal
+    /// case and means "no override anywhere".
+    #[must_use]
+    pub fn with_achievement_overrides(
+        mut self,
+        overrides: HashMap<AppId, BTreeMap<String, AchievementIntent>>,
+    ) -> Self {
+        self.achievement_overrides = overrides;
         self
     }
 }

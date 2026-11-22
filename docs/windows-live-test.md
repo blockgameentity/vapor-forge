@@ -110,9 +110,13 @@ These are known, not bugs to chase:
 - **`ticket-overrides` installs** as of the vtable mining pass
   (`CUser::GetAppTicket`, both live builds). If it still disables itself, the
   report's reason is the evidence to send back.
-- **`achievements` rewrites the reply** when `[achievements] local_rebuild` is on:
-  the merge body decodes the response, substitutes the rebuilt set and restores
-  Steam's bytes afterwards. If the flag is off, behaviour is exactly Steam's.
+- **`achievements` rewrites the reply** when `[achievements] local_rebuild` is on
+  (the shipped default): the merge body decodes the response, composes schema
+  definitions, Steam's own unlock map and the `setachievement` intent your Lua
+  scripts declare, substitutes the result and restores Steam's bytes afterwards.
+  With no `setachievement` anywhere the composition is byte-identical to Steam's
+  reply and nothing is swapped, so the default costs nothing; set
+  `local_rebuild = false` to keep every reply on the schema path outright.
 - **Request codes are fetched, then served.** The dispatch body parses the
   request payload, and if a code for that `(depot, gid)` is already cached it hands
   Steam the encoded response for that call; on a miss the hook only *enqueues* the
@@ -137,7 +141,8 @@ These are known, not bugs to chase:
    host. The flags that matter for this test:
    - `[apps.shared] validate_lender` / `clean_borrower_markers` — set `false` to
      restore pre-fix family labelling.
-   - `[achievements] local_rebuild` — leave `false` unless testing that path.
+   - `[achievements] local_rebuild` — on by default and inert without a
+     `setachievement` override; set `false` to rule the rewrite out entirely.
    - `[ticket] denuvo_mode`, `source_order`, `denuvo_detection` — Denuvo paths.
 3. **Remove the host entirely** by deleting `version.dll` next to `steam.exe`.
    Steam then loads the real system `version.dll` again. Nothing else is touched:

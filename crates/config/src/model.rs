@@ -292,7 +292,7 @@ pub struct ScriptingSection {
 }
 
 /// Achievement/stats schema configuration.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AchievementsSection {
     #[serde(default)]
@@ -300,13 +300,31 @@ pub struct AchievementsSection {
     /// Rebuild achievement replies from the local definition set when the schema
     /// cache is absent or unreadable.
     ///
-    /// Off by default. The rebuild is only meaningful when the host has an
-    /// independent local definition set; today both hosts derive their definitions
-    /// from the same schema cache the rebuild is meant to stand in for, so turning
-    /// this on changes nothing except re-deriving the schema. See
+    /// **On by default since the Lua override landed**, because the rebuild is now
+    /// inert without one. The reply is composed as schema definitions, then
+    /// Steam's own unlock map, then the user's `setachievement` intent; when no
+    /// override changes a defined achievement the composed reply is byte for byte
+    /// what Steam sent, so nothing is swapped and no behaviour changes. With an
+    /// override it is what puts a requested achievement on a controlled app's
+    /// page. Set it to `false` to leave every reply on the schema path. See
     /// `features::achievements::local::LocalRebuildSettings`.
-    #[serde(default)]
+    #[serde(default = "default_local_rebuild")]
     pub local_rebuild: bool,
+}
+
+/// `[achievements] local_rebuild` defaults to on: safe because the rebuild only
+/// swaps a reply it can prove differs from Steam's own bytes.
+fn default_local_rebuild() -> bool {
+    true
+}
+
+impl Default for AchievementsSection {
+    fn default() -> Self {
+        Self {
+            offline_schema: false,
+            local_rebuild: default_local_rebuild(),
+        }
+    }
 }
 
 /// AppAvatar: map a real AppId to another for networking.

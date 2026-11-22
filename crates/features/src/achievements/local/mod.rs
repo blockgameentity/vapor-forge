@@ -22,9 +22,11 @@
 //!   are nested under groups - falls back to the local set, which is what keeps a
 //!   modern grouped layout from blanking the page.
 //!
-//! The whole path is behind [`set_local_rebuild`] and is off by default: with the
-//! flag off nothing here runs, so the response path keeps its previous behaviour
-//! until a host opts in.
+//! The whole path is behind [`set_local_rebuild`], which a host applies from its
+//! config. That flag is on by default and inert without a Lua override: the reply
+//! is composed as schema definitions, then Steam's own unlock map, then the
+//! `setachievement` intent ([`super::overrides`]), and a composition that says
+//! what Steam already said is not swapped in.
 
 mod definitions;
 mod groups;

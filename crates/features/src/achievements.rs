@@ -17,6 +17,10 @@
 //! * [`local`] rebuilds the achievement payload from locally known definitions
 //!   when the schema path cannot describe it. It is off unless a host turns it
 //!   on, see [`set_local_rebuild`].
+//! * [`overrides`] is the one input that does not come from Steam: the user's Lua
+//!   intent (`setachievement`), composed on top of the schema's definitions and
+//!   Steam's own unlock map. Nothing is rewritten until an override actually
+//!   changes what Steam reported, which is why the rebuild can be on by default.
 
 use prost::Message;
 use tracing::{debug, info};
@@ -30,6 +34,7 @@ pub use local::{
     LocalAchievementSet, LocalDefinitionError, LocalRebuildSettings, RebuildSource,
     RebuiltAchievement, RebuiltAchievementGroup, RebuiltAchievements, MAX_LOCAL_ACHIEVEMENT_BIT,
 };
+pub use overrides::{compose_unlocks, ComposedUnlocks};
 pub use send::{
     on_send_legacy_stats, on_send_service_stats, plan_send_legacy_stats, plan_send_service_stats,
     StatsSendPlan,
@@ -37,6 +42,7 @@ pub use send::{
 pub use tracking::{drain_offline_responses, has_legacy_pending, has_pending, OfflineResponse};
 
 mod local;
+mod overrides;
 mod send;
 mod tracking;
 

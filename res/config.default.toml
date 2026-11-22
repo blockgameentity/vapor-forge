@@ -131,10 +131,13 @@ min_interval_ms = 1000
 # Offline achievement schema support.
 [achievements]
 # Rebuild achievement replies from local definitions when the schema cache is
-# missing or unreadable. Off by default: both hosts currently derive their "local"
-# definitions from that same schema cache, so enabling this re-derives what it was
-# given. It is the switch for a host that supplies an independent definition set.
-local_rebuild = false
+# missing or unreadable. On by default, and safe to leave on: the reply is composed
+# as schema definitions, then Steam's own unlock map, then the `setachievement`
+# intent your Lua scripts declare. With no override the composed reply is byte for
+# byte what Steam sent, so nothing is swapped; with an override it is what makes a
+# controlled app's page show the achievement you asked for. Turn it off to leave
+# every reply on the schema path.
+local_rebuild = true
 offline_schema = false
 
 # Native library injection into launched games.

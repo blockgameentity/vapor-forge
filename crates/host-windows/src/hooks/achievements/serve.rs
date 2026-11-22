@@ -20,6 +20,8 @@
 
 use core::ffi::c_void;
 
+use vapor_forge_config::AppId;
+
 use crate::capability::Capability;
 use crate::features::achievements::{decide_rebuild, RebuildPlan, RebuildRequest};
 use crate::hooks::state::HostState;
@@ -57,7 +59,11 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
     let settings = state.achievement_settings();
     // The gate first, with an empty request: capability, flag and the process-wide
     // switch are all decided before a byte of Steam's memory is read.
-    let gate = decide_rebuild(capability_reason.as_deref(), settings, &RebuildRequest::default());
+    let gate = decide_rebuild(
+        capability_reason.as_deref(),
+        settings,
+        &RebuildRequest::default(),
+    );
     if matches!(
         gate,
         RebuildPlan::CapabilityDisabled(_) | RebuildPlan::FlagOff | RebuildPlan::SwitchOff
@@ -69,7 +75,11 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
     }
     let Some(geometry) = state.reply_geometry() else {
         return Prepared {
-            observation: observation(eresult, gate, ReplyOutcome::NoGeometry(geometry::NO_GEOMETRY)),
+            observation: observation(
+                eresult,
+                gate,
+                ReplyOutcome::NoGeometry(geometry::NO_GEOMETRY),
+            ),
             swap: None,
         };
     };
@@ -90,11 +100,7 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
         Ok(shape) => shape,
         Err(blocker) => {
             return Prepared {
-                observation: observation(
-                    eresult,
-                    gate,
-                    ReplyOutcome::Unreadable(blocker.reason()),
-                ),
+                observation: observation(eresult, gate, ReplyOutcome::Unreadable(blocker.reason())),
                 swap: None,
             };
         }
@@ -105,11 +111,7 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
             // No app means no key to remember the schema under: a reply that names
             // no app teaches this host nothing.
             return Prepared {
-                observation: observation(
-                    eresult,
-                    gate,
-                    ReplyOutcome::Unreadable(blocker.reason()),
-                ),
+                observation: observation(eresult, gate, ReplyOutcome::Unreadable(blocker.reason())),
                 swap: None,
             };
         }
@@ -127,6 +129,12 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
         local: reply::definitions_from(&mappings).unwrap_or_default(),
         unlocks: reply::unlocks(&shape, &mappings),
         schema: reply::schema(&shape).map(<[u8]>::to_vec),
+        // The one input that does not come from Steam. Keyed by the app the reply
+        // names, and empty for every app no script wrote intent for.
+        overrides: state
+            .achievement_overrides(AppId(app_id))
+            .cloned()
+            .unwrap_or_default(),
     };
     let plan = decide_rebuild(capability_reason.as_deref(), settings, &request);
     let RebuildPlan::Rebuild(rebuilt) = &plan else {
@@ -149,11 +157,7 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
         Some(swap) => {
             let bytes = swap.served_size();
             Prepared {
-                observation: observation(
-                    eresult,
-                    plan,
-                    ReplyOutcome::Served { bytes },
-                ),
+                observation: observation(eresult, plan, ReplyOutcome::Served { bytes }),
                 swap: Some(swap),
             }
         }
@@ -185,7 +189,12 @@ unsafe fn read_body(this: *mut c_void, geometry: JobReply) -> Option<Vec<u8>> {
     }
     // SAFETY: the caller guarantees the job object, and `JobReply::new` validated
     // that `reply_field` is pointer-aligned and inside it.
-    let reply_object = unsafe { *(this.cast::<u8>().add(geometry.reply_field).cast::<*const u8>()) };
+    let reply_object = unsafe {
+        *(this
+            .cast::<u8>()
+            .add(geometry.reply_field)
+            .cast::<*const u8>())
+    };
     if reply_object.is_null() {
         return None;
     }

@@ -95,17 +95,24 @@ achievement schema and fetches none (checked: no `GetSchemaForGame`, no schema
 store, nothing under `src/` or `cheesetool-sourcer`). Making it the source would
 mean either handing it the same `appcache/stats/UserGameStatsSchema_*.bin` files VF
 already parses — circular — or pointing it at a schema service / a WebAPI key,
-which is precisely the third-party-egress category this project excludes. So the
-flag stays off and nothing is fabricated. The one in-policy path: if CT's sourcer
-ever archives schemas the way it archives manifests, CT would hold an *independent*
-copy and writing definitions becomes both possible and honest.
+which is precisely the third-party-egress category this project excludes. So no
+definition is fabricated and none is fetched. The one in-policy path: if CT's
+sourcer ever archives schemas the way it archives manifests, CT would hold an
+*independent* copy and writing definitions becomes both possible and honest.
  On *both* hosts the
 "local" definition set is derived from the same schema cache the rebuild stands in
 for (`hooks::achievement_local::definitions` and the Windows `reply::definitions`
-both parse the cached schema). So `[achievements] local_rebuild` is off by default
-and turning it on re-derives what it was given; a real parity feature needs an
-independent definition source (for instance cheesetool writing achievement
-definitions it owns), not a flag flip.
+both parse the cached schema). A real parity feature would need an independent
+definition source (for instance cheesetool writing achievement definitions it
+owns), not a flag flip.
+
+What the gap *does* have is an honest user-facing fix, and it is the one shipped:
+`setachievement(appid, key, unlocked|time)`. The user's Lua is intent, so nothing is
+invented and nothing is fetched; the reply is composed as schema definitions, then
+Steam's own unlock map, then that intent, and only a composition that differs from
+Steam's bytes is swapped in. Because of that composition order the rebuild is
+inert without an override, which is why `[achievements] local_rebuild` is on by
+default: with no `setachievement` anywhere the reply is byte-identical to Steam's.
 
 **D. Platform shape differences.** The family lock is the clearest example: Linux
 queries `CFamilySharing::GetLockingAccount`, Windows has no such class and instead

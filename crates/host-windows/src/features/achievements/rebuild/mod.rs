@@ -41,20 +41,34 @@
 //!    schema keeps the schema path authoritative, exactly as on Linux, and the
 //!    rebuild is not consulted for it.
 //!
+//! and one input that is a source rather than a derivation:
+//!
+//! 4. **The user's intent** — `setachievement(appid, key, unlocked|time)` in a Lua
+//!    script, carried on [`RebuildRequest::overrides`]. It is composed on top of
+//!    Steam's unlock map by `features::achievements::compose_unlocks`, and only
+//!    where the definitions name the key.
+//!
 //! So the rewrite fires for a schema-less legacy reply whose app this process has
-//! already seen a schema for. That is the same fallback order the Linux host
-//! applies, and it means the first reply for an app teaches this host and a later
-//! one is answered.
+//! already seen a schema for **and** whose Lua overrides change a defined
+//! achievement. That second half is what makes the flag safe to leave on: with no
+//! overrides the composed map is Steam's own, [`RebuildPlan::OverridesInert`] is
+//! the answer, and not a byte of Steam's reply is touched. It is also the same
+//! fallback order the Linux host applies, so the first reply for an app teaches
+//! this host and a later one is answered.
 //!
 //! [`decide`] is the portable half the body consults: it runs the **real** feature
 //! entry point
 //! (`rebuild_local_achievements_if_enabled`), so the flag, the schema precedence
 //! and the definitions all behave exactly as the Linux path does.
 
+use std::collections::BTreeMap;
+
 use vapor_forge_config::AppId;
+use vapor_forge_core::AchievementIntent;
 use vapor_forge_features::achievements::{
-    local_rebuild_enabled, rebuild_local_achievements_if_enabled, AchievementCounts,
-    AchievementUnlockState, LocalAchievementSet, RebuildSource, RebuiltAchievements,
+    compose_unlocks, local_rebuild_enabled, rebuild_local_achievements_if_enabled,
+    AchievementCounts, AchievementUnlockState, LocalAchievementSet, RebuildSource,
+    RebuiltAchievements,
 };
 
 use super::AchievementSettings;
@@ -62,7 +76,8 @@ use super::AchievementSettings;
 /// One stats reply the host is asked about.
 ///
 /// `unlocks` and `schema` are what the reply would carry; `local` is what the host
-/// knows locally about `app_id`. Nothing here is read from the module image.
+/// knows locally about `app_id`; `overrides` is what the user's scripts asked for.
+/// Nothing here is read from the module image.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RebuildRequest {
     /// The app the reply is about. `0` means "not a known app", which the Linux
@@ -74,6 +89,9 @@ pub struct RebuildRequest {
     pub unlocks: Vec<AchievementUnlockState>,
     /// The schema the reply carries, when it carries one.
     pub schema: Option<Vec<u8>>,
+    /// The user's Lua intent for this app, keyed by achievement key. Empty for an
+    /// app nothing was written for, which is every app by default.
+    pub overrides: BTreeMap<String, AchievementIntent>,
 }
 
 /// What the host should answer with.
@@ -95,6 +113,10 @@ pub enum RebuildPlan {
     /// The flag is on and the reply carries no schema, but the host knows no
     /// definitions for this app, so there is nothing to build a page from.
     NoLocalDefinitions,
+    /// The rebuild could run, but nothing it would say differs from Steam's own
+    /// reply: no Lua override changed a defined achievement. Forwarded untouched,
+    /// which is what makes the flag inert without overrides.
+    OverridesInert,
     /// The payload the host would serve, and every count the log needs.
     Rebuild(RebuiltAchievements),
 }
@@ -119,8 +141,9 @@ impl RebuildPlan {
             Self::SchemaAvailable => {
                 "the reply carries a schema; the schema path stays authoritative".to_owned()
             }
-            Self::NoLocalDefinitions => {
-                "no local achievement definitions for this app".to_owned()
+            Self::NoLocalDefinitions => "no local achievement definitions for this app".to_owned(),
+            Self::OverridesInert => {
+                "no Lua override changes this reply, so Steam's bytes stand".to_owned()
             }
             Self::Rebuild(rebuilt) => format!(
                 "rebuilt {} achievement(s) from {} definitions ({} unlocked)",
@@ -161,20 +184,35 @@ pub fn decide(
     if request.app_id == 0 {
         return RebuildPlan::NoApp;
     }
-    if request.schema.as_ref().is_some_and(|schema| !schema.is_empty()) {
+    if request
+        .schema
+        .as_ref()
+        .is_some_and(|schema| !schema.is_empty())
+    {
         return RebuildPlan::SchemaAvailable;
     }
     if request.local.achievements.is_empty() {
         return RebuildPlan::NoLocalDefinitions;
     }
-    let app_id = AppId(request.app_id);
-    let schema = request.schema.as_deref().filter(|schema| !schema.is_empty());
-    match rebuild_local_achievements_if_enabled(
-        app_id.0,
+    // Compose before rebuilding: the reply is Steam's unlock map with the user's
+    // intent on top, and a map that says what Steam already said needs no rebuild
+    // and no swap. This is the whole reason the flag can stay on by default.
+    let composed = compose_unlocks(
+        request.app_id,
         &request.local,
         &request.unlocks,
-        schema,
-    ) {
+        Some(&request.overrides),
+    );
+    if !composed.changed {
+        return RebuildPlan::OverridesInert;
+    }
+    let app_id = AppId(request.app_id);
+    let schema = request
+        .schema
+        .as_deref()
+        .filter(|schema| !schema.is_empty());
+    match rebuild_local_achievements_if_enabled(app_id.0, &request.local, &composed.unlocks, schema)
+    {
         Some(rebuilt) => RebuildPlan::Rebuild(rebuilt),
         // The feature refused although the switch looked on, or it produced
         // nothing: both mean "behave as before", never "serve an empty page".

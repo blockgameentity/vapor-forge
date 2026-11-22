@@ -14,6 +14,14 @@
 //!   never seen has no definitions and is left on the schema path.
 //! * **unlock state** — the last snapshot read from Steam's own stats map, kept
 //!   per app so a schema reply and the following state reply agree.
+//! * **Lua intent** — `setachievement(appid, key, unlocked|time)` as the user's
+//!   scripts declared it, read from the process's published `ScriptState` and
+//!   composed on top of the snapshot by
+//!   [`vapor_forge_features::achievements::compose_unlocks`]. This is the only
+//!   input that does not come from Steam, and the only one that can make the
+//!   rebuilt payload differ from the reply it replaces: with no intent for an app
+//!   the composition says what Steam said and nothing is rebuilt, which is why
+//!   `[achievements] local_rebuild` can be on by default.
 //! * **schema** — the same bytes, handed to the rebuild so a schema that parses
 //!   keeps owning the wire ids (the rebuild prefers it and falls back to the
 //!   local set only when it is missing or unusable).
@@ -28,12 +36,13 @@
 //! (Steam caps one at 256 KiB) and only the definitions parsed from it are ever
 //! used, so the byte cache is dropped on an account switch and never grows past
 //! [`MAX_CACHED_SCHEMAS`].
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info};
+use vapor_forge_core::AchievementIntent;
 use vapor_forge_features::achievements::{
-    local_rebuild_enabled, rebuild_local_achievements_if_enabled, AchievementUnlockState,
-    LocalAchievement, LocalAchievementSet, RebuiltAchievements,
+    compose_unlocks, local_rebuild_enabled, rebuild_local_achievements_if_enabled,
+    AchievementUnlockState, LocalAchievement, LocalAchievementSet, RebuiltAchievements,
 };
 use vapor_forge_steam_protocol::parse_achievement_bit_mappings;
 
@@ -142,14 +151,34 @@ pub(crate) fn definitions(app_id: u32) -> Option<LocalAchievementSet> {
     })
 }
 
+/// The achievement intent the user's Lua scripts declared for `app_id`.
+///
+/// Read from the published `ScriptState`, which the runtime builds once from
+/// `<steam>/config/lua` and the user's script directories. Nothing is fetched
+/// here and nothing is invented: an app no script wrote intent for composes to
+/// exactly what Steam reported.
+pub(crate) fn overrides_for(app_id: u32) -> BTreeMap<String, AchievementIntent> {
+    crate::client::install::script_state()
+        .achievement_overrides
+        .get(&vapor_forge_core::AppId(app_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Rebuild `app_id`'s achievement payload, while the flag allows it.
 ///
-/// `None` with the flag off (the pre-rebuild behaviour), with no local
-/// definitions to rebuild from, or when the rebuild cannot address a single
-/// achievement. The flag is read once up front so a host that never turned the
-/// rebuild on does not even parse the schema: the decision itself still goes
-/// through `rebuild_local_achievements_if_enabled`, which refuses on its own.
-pub(crate) fn rebuild_for_reply(app_id: u32) -> Option<RebuiltAchievements> {
+/// `overrides` is the user's Lua intent, applied on top of the cached unlock
+/// state and only for keys the schema defines. `None` with the flag off (the
+/// pre-rebuild behaviour), with no local definitions to rebuild from, when no
+/// override changes what Steam reported, or when the rebuild cannot address a
+/// single achievement. The flag is read once up front so a host that never
+/// turned the rebuild on does not even parse the schema: the decision itself
+/// still goes through `rebuild_local_achievements_if_enabled`, which refuses on
+/// its own.
+pub(crate) fn rebuild_for_reply(
+    app_id: u32,
+    overrides: &BTreeMap<String, AchievementIntent>,
+) -> Option<RebuiltAchievements> {
     if !local_rebuild_enabled() {
         debug!(
             app_id,
@@ -159,15 +188,29 @@ pub(crate) fn rebuild_for_reply(app_id: u32) -> Option<RebuiltAchievements> {
     }
     let local = definitions(app_id)?;
     let unlocks = cached_unlocks(app_id);
+    // Definitions, then Steam's own unlock map, then the user's intent on top.
+    let composed = compose_unlocks(app_id, &local, &unlocks, Some(overrides));
+    if !composed.changed {
+        debug!(
+            app_id,
+            applied = composed.applied,
+            ignored = composed.ignored,
+            "achievements: no Lua override changes this app, so the reply keeps its bytes"
+        );
+        return None;
+    }
     let schema = cached_schema(app_id);
     let schema_bytes = schema.as_deref().map(|content| content.as_slice());
-    let rebuilt = rebuild_local_achievements_if_enabled(app_id, &local, &unlocks, schema_bytes)?;
+    let rebuilt =
+        rebuild_local_achievements_if_enabled(app_id, &local, &composed.unlocks, schema_bytes)?;
     info!(
         app_id,
         source = ?rebuilt.source,
         total = rebuilt.counts.total,
         unlocked = rebuilt.counts.unlocked,
         groups = rebuilt.groups.len(),
+        overrides_applied = composed.applied,
+        overrides_ignored = composed.ignored,
         "achievements: local rebuild answered the reply"
     );
     Some(rebuilt)
@@ -177,8 +220,13 @@ pub(crate) fn rebuild_for_reply(app_id: u32) -> Option<RebuiltAchievements> {
 ///
 /// `schema` is what the reply is about to carry. A usable one keeps the schema
 /// path authoritative and this returns `None`; only an absent or unusable schema
-/// reaches [`rebuild_for_reply`].
-pub(crate) fn reply_for(app_id: u32, schema: &[u8]) -> Option<RebuiltAchievements> {
+/// reaches [`rebuild_for_reply`], and even then only an override that changes a
+/// defined achievement produces a payload.
+pub(crate) fn reply_for(
+    app_id: u32,
+    schema: &[u8],
+    overrides: &BTreeMap<String, AchievementIntent>,
+) -> Option<RebuiltAchievements> {
     if app_id == 0 || !schema.is_empty() {
         debug!(
             app_id,
@@ -187,7 +235,7 @@ pub(crate) fn reply_for(app_id: u32, schema: &[u8]) -> Option<RebuiltAchievement
         );
         return None;
     }
-    rebuild_for_reply(app_id)
+    rebuild_for_reply(app_id, overrides)
 }
 
 #[cfg(test)]

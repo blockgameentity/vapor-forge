@@ -37,7 +37,16 @@ fn request() -> RebuildRequest {
             unlock_time: Some(1_600_000_000),
         }],
         schema: None,
+        overrides: BTreeMap::new(),
     }
+}
+
+/// The same request with one Lua override, which is the only thing that makes the
+/// rebuild differ from Steam's own reply.
+fn overridden(key: &str, intent: AchievementIntent) -> RebuildRequest {
+    let mut request = request();
+    request.overrides.insert(key.to_owned(), intent);
+    request
 }
 
 #[test]
@@ -105,16 +114,49 @@ fn no_local_definitions_means_nothing_to_rebuild_from() {
 }
 
 #[test]
-fn an_enabled_flag_rebuilds_through_the_feature_entry_point() {
+fn without_an_override_the_flag_is_inert() {
     let _guard = serial();
     set_local_rebuild(true);
     let plan = decide(None, &on(), &request());
+    assert_eq!(
+        plan,
+        RebuildPlan::OverridesInert,
+        "the composed map is Steam's own, so nothing may be rewritten"
+    );
+    assert!(!plan.rebuilds());
+    assert!(counts(&plan).is_none());
+    assert!(plan.summary().contains("Steam's bytes stand"));
+    set_local_rebuild(false);
+}
+
+#[test]
+fn an_override_for_a_key_the_schema_does_not_define_changes_nothing() {
+    let _guard = serial();
+    set_local_rebuild(true);
+    let plan = decide(
+        None,
+        &on(),
+        &overridden("ACH_NOT_IN_THE_SCHEMA", AchievementIntent::unlocked()),
+    );
+    assert_eq!(plan, RebuildPlan::OverridesInert);
+    set_local_rebuild(false);
+}
+
+#[test]
+fn an_enabled_flag_rebuilds_through_the_feature_entry_point() {
+    let _guard = serial();
+    set_local_rebuild(true);
+    let plan = decide(
+        None,
+        &on(),
+        &overridden("ACH_ONE", AchievementIntent::unlocked_at(1_700_000_000)),
+    );
     let RebuildPlan::Rebuild(rebuilt) = &plan else {
-        panic!("an enabled flag with local definitions must rebuild: {plan:?}");
+        panic!("an override that changes a defined achievement must rebuild: {plan:?}");
     };
     assert_eq!(rebuilt.app_id, 480);
     assert_eq!(rebuilt.counts.total, 2);
-    assert_eq!(rebuilt.counts.unlocked, 1);
+    assert_eq!(rebuilt.counts.unlocked, 2, "the override adds the second");
     assert_eq!(rebuilt.source, RebuildSource::Local);
     assert_eq!(rebuilt.achievements.len(), 2);
     assert_eq!(counts(&plan), Some(rebuilt.counts));
@@ -124,5 +166,12 @@ fn an_enabled_flag_rebuilds_through_the_feature_entry_point() {
         rebuilt.achievements[0].display,
         AchievementDisplay::from_key("ACH_ONE")
     );
+    let one = rebuilt
+        .achievements
+        .iter()
+        .find(|achievement| achievement.key == "ACH_ONE")
+        .expect("ACH_ONE is in the list");
+    assert!(one.unlocked);
+    assert_eq!(one.unlock_time, Some(1_700_000_000));
     set_local_rebuild(false);
 }

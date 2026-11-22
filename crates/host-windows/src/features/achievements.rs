@@ -1,15 +1,15 @@
 //! The local achievement rebuild flag, surfaced (and applied) by the host.
 //!
 //! `vapor_forge_features::achievements` rebuilds the achievement payload from
-//! locally known definitions when the schema path cannot describe it. The whole
-//! path is behind a process-wide switch that is off by default, so with the flag
-//! off the stats response path behaves exactly as it did before the rebuild
-//! existed - no stealth behaviour change.
+//! locally known definitions when the schema path cannot describe it. The reply is
+//! composed in a fixed order — schema definitions, then Steam's own unlock map,
+//! then the user's Lua `setachievement` intent — and only a composition that
+//! differs from Steam's bytes is ever swapped in. That is why
+//! `[achievements] local_rebuild` defaults to true: a host with no Lua override
+//! produces byte-identical replies and touches nothing.
 //!
-//! Before this module the Windows host never touched that switch, so the feature
-//! was unreachable: the flag stayed off no matter what the user configured.
-//! [`apply`] is now the only place the host writes it, and only when the
-//! `achievements` capability is enabled.
+//! [`apply`] is the only place the host writes the feature's process-wide switch,
+//! and only when the `achievements` capability is enabled.
 //!
 //! [`rebuild`] is the other half: the decision that would answer a stats reply with
 //! a locally rebuilt payload. Both win64 stats-job sites are anchored
@@ -25,22 +25,32 @@ use vapor_forge_features::achievements::{local_rebuild_enabled, set_local_rebuil
 
 pub mod rebuild;
 
-pub use rebuild::{counts as rebuild_counts, decide as decide_rebuild, RebuildPlan, RebuildRequest};
+pub use rebuild::{
+    counts as rebuild_counts, decide as decide_rebuild, RebuildPlan, RebuildRequest,
+};
 
 /// The flag the host resolved from config.
+///
+/// [`Default`] is the *unresolved* value (`false`), not the user-facing default:
+/// `[achievements] local_rebuild` is on in the shipped config, and the worker
+/// copies the applied value onto this struct before the state is published. A
+/// state built without it therefore refuses rather than serving something no
+/// config asked for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AchievementSettings {
-    /// Off by default, like the feature itself.
+    /// Whether the reply rewrite may run at all.
     pub local_rebuild: bool,
 }
 
 /// What the flag means for the report. Pure: does not touch the switch.
 pub fn state(settings: &AchievementSettings) -> FeatureState {
     if settings.local_rebuild {
-        FeatureState::active("local achievement rebuild is on")
+        FeatureState::active(
+            "reply rewrite is on; a Lua setachievement override is what makes a reply differ",
+        )
     } else {
         FeatureState::inactive(
-            "local achievement rebuild is off ([achievements] local_rebuild = false); \
+            "reply rewrite is off ([achievements] local_rebuild = false); \
              the schema path is unchanged",
         )
     }

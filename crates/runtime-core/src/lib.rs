@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -146,6 +146,70 @@ pub struct ScriptState {
     /// Per-app max mtime across every `.lua` file that contributed the
     /// app via `addappid`; used to stamp the library's "purchased" date.
     pub app_purchase_times: HashMap<AppId, u32>,
+    /// Per-app achievement state the user's Lua scripts asked for, keyed by
+    /// achievement key and sorted so a reply always composes in the same order.
+    ///
+    /// This is the only source of achievement *intent* that does not come from
+    /// Steam: definitions still come from the schema a reply carries, and the
+    /// unlock state still starts from Steam's own reply. An override is applied
+    /// last, which is what makes a controlled app's page show an achievement the
+    /// donor account never unlocked.
+    pub achievement_overrides: HashMap<AppId, BTreeMap<String, AchievementIntent>>,
+}
+
+/// The longest achievement key a Lua script may register.
+///
+/// A bound, not a layout fact: Steam's own API names are well under this, so a
+/// longer one is a typo or an attempt to grow the state without limit.
+pub const MAX_ACHIEVEMENT_KEY_LEN: usize = 128;
+
+/// What a Lua script asked the achievements path to report for one key.
+///
+/// Only `unlocked` decides the wire flag. `unlock_time` is the rtime32 a client
+/// renders next to an unlocked achievement; `None` means "unlocked, time
+/// unknown", which Steam encodes with its own sentinel rather than a zero the
+/// client would read as "never unlocked".
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+pub struct AchievementIntent {
+    pub unlocked: bool,
+    pub unlock_time: Option<u32>,
+}
+
+impl AchievementIntent {
+    /// Unlocked, with the time to show.
+    pub fn unlocked_at(unlock_time: u32) -> Self {
+        Self {
+            unlocked: true,
+            unlock_time: Some(unlock_time),
+        }
+    }
+
+    /// Unlocked, with no time known.
+    pub fn unlocked() -> Self {
+        Self {
+            unlocked: true,
+            unlock_time: None,
+        }
+    }
+
+    /// Locked, which clears any time Steam or an earlier script reported.
+    pub fn locked() -> Self {
+        Self {
+            unlocked: false,
+            unlock_time: None,
+        }
+    }
+
+    /// Whether `key` may be used as an achievement key at all.
+    ///
+    /// Empty, whitespace-only and over-long keys are refused here rather than
+    /// trimmed: an achievement key is an identifier Steam's schema owns, so
+    /// "nearly right" would silently match nothing.
+    pub fn key_is_valid(key: &str) -> bool {
+        !key.trim().is_empty() && key.len() <= MAX_ACHIEVEMENT_KEY_LEN && !key.contains('\0')
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +297,48 @@ pub fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lifecycle, RuntimePhase, SteamModuleKind, SteamModuleState};
+    use super::{
+        AchievementIntent, Lifecycle, RuntimePhase, ScriptState, SteamModuleKind, SteamModuleState,
+        MAX_ACHIEVEMENT_KEY_LEN,
+    };
+
+    #[test]
+    fn achievement_intent_has_one_meaning_per_constructor() {
+        assert_eq!(
+            AchievementIntent::unlocked_at(1_700_000_000),
+            AchievementIntent {
+                unlocked: true,
+                unlock_time: Some(1_700_000_000),
+            }
+        );
+        assert_eq!(
+            AchievementIntent::unlocked(),
+            AchievementIntent {
+                unlocked: true,
+                unlock_time: None,
+            }
+        );
+        assert_eq!(AchievementIntent::locked(), AchievementIntent::default());
+    }
+
+    #[test]
+    fn achievement_keys_are_bounded_and_non_blank() {
+        assert!(AchievementIntent::key_is_valid("ACH_WIN"));
+        assert!(!AchievementIntent::key_is_valid(""));
+        assert!(!AchievementIntent::key_is_valid("   "));
+        assert!(!AchievementIntent::key_is_valid("ACH\0WIN"));
+        assert!(AchievementIntent::key_is_valid(
+            &"A".repeat(MAX_ACHIEVEMENT_KEY_LEN)
+        ));
+        assert!(!AchievementIntent::key_is_valid(
+            &"A".repeat(MAX_ACHIEVEMENT_KEY_LEN + 1)
+        ));
+    }
+
+    #[test]
+    fn script_state_starts_with_no_achievement_intent() {
+        assert!(ScriptState::default().achievement_overrides.is_empty());
+    }
 
     #[test]
     fn lifecycle_only_moves_forward_until_closing() {

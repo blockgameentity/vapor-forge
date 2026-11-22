@@ -100,8 +100,8 @@ mod tests {
         );
         assert!(defaults.family.clean_borrower_markers);
         assert!(
-            !defaults.achievements_local_rebuild,
-            "no stealth behaviour change: the rebuild stays off unless configured"
+            defaults.achievements_local_rebuild,
+            "the shipped default is on, and inert without a Lua override"
         );
     }
 }

@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
 use vapor_forge_core::{AppId, DepotId};
 use vapor_forge_scripting::{
-    execute_scripts_report_with_options, ManifestOverride, ScriptCallReport,
+    execute_scripts_report_with_options, AchievementIntent, ManifestOverride, ScriptCallReport,
     ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport, ScriptState,
 };
 
@@ -196,6 +196,36 @@ fn print_state(state: &ScriptState) {
     print_u64_map("stat_steam_ids", &state.stat_steam_ids);
     print_app_map("avatars", &state.avatars);
     print_u64_map("access_tokens", &state.access_tokens);
+    print_achievement_overrides(&state.achievement_overrides);
+}
+
+fn print_achievement_overrides(values: &HashMap<AppId, BTreeMap<String, AchievementIntent>>) {
+    println!("achievement_overrides:");
+    let mut apps = values.iter().collect::<Vec<_>>();
+    apps.sort_by_key(|(app_id, _)| app_id.0);
+
+    if apps.is_empty() {
+        println!("  (none)");
+    } else {
+        for (app_id, overrides) in apps {
+            for (key, intent) in overrides {
+                match (intent.unlocked, intent.unlock_time) {
+                    (true, Some(time)) => {
+                        println!("  - app={} key={key} unlocked=true time={time}", app_id.0)
+                    }
+                    (true, None) => {
+                        println!(
+                            "  - app={} key={key} unlocked=true time=(unknown)",
+                            app_id.0
+                        )
+                    }
+                    (false, _) => {
+                        println!("  - app={} key={key} unlocked=false", app_id.0)
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn print_list(label: &str, values: &[String]) {
@@ -433,6 +463,7 @@ struct JsonState {
     stat_steam_ids: Vec<JsonU64Entry>,
     avatars: Vec<JsonAvatarEntry>,
     access_tokens: Vec<JsonU64Entry>,
+    achievement_overrides: Vec<JsonAchievementOverride>,
 }
 
 impl JsonState {
@@ -446,6 +477,7 @@ impl JsonState {
             stat_steam_ids: u64_entries(&state.stat_steam_ids),
             avatars: avatar_entries(&state.avatars),
             access_tokens: u64_entries(&state.access_tokens),
+            achievement_overrides: achievement_entries(&state.achievement_overrides),
         }
     }
 }
@@ -474,6 +506,33 @@ struct JsonU64Entry {
 struct JsonAvatarEntry {
     app_id: u32,
     avatar: u32,
+}
+
+#[derive(Serialize)]
+struct JsonAchievementOverride {
+    app_id: u32,
+    key: String,
+    unlocked: bool,
+    unlock_time: Option<u32>,
+}
+
+fn achievement_entries(
+    values: &HashMap<AppId, BTreeMap<String, AchievementIntent>>,
+) -> Vec<JsonAchievementOverride> {
+    let mut apps = values.iter().collect::<Vec<_>>();
+    apps.sort_by_key(|(app_id, _)| app_id.0);
+    apps.into_iter()
+        .flat_map(|(app_id, overrides)| {
+            overrides
+                .iter()
+                .map(move |(key, intent)| JsonAchievementOverride {
+                    app_id: app_id.0,
+                    key: key.clone(),
+                    unlocked: intent.unlocked,
+                    unlock_time: intent.unlock_time,
+                })
+        })
+        .collect()
 }
 
 fn bytes_entries<K>(values: &HashMap<K, Vec<u8>>) -> Vec<JsonBytesEntry>

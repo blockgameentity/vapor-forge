@@ -49,14 +49,16 @@ use super::model::{AchievementDisplay, AchievementUnlockState, LocalAchievementS
 /// without it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LocalRebuildSettings {
-    /// Off by default.
+    /// Off until a host applies the config.
     ///
-    /// Not because the rebuild is dangerous, but because today the only source of
-    /// "local" definitions is the schema cache itself (`hooks::achievement_local`
-    /// derives them from it), so with the flag on and a schema present the host
-    /// re-derives the same definitions it was given, and with no schema there is
-    /// nothing to derive. The flag exists for a host that supplies an independent
-    /// local definition set; until one does, leaving it off changes nothing.
+    /// The user-facing default is **on** (`[achievements] local_rebuild`), and it
+    /// is safe because the rebuild is inert without a Lua override: the reply is
+    /// composed as schema definitions, then Steam's own unlock map, then the
+    /// `setachievement` intent, and a composition that says what Steam already
+    /// said is never swapped in. This field stays `false` as the *unapplied*
+    /// value so a process that never ran the config pass keeps behaving exactly as
+    /// it did before the rebuild existed, rather than half-enabling a path no
+    /// config asked for.
     pub local_rebuild: bool,
 }
 
@@ -71,9 +73,12 @@ pub fn local_rebuild_settings() -> LocalRebuildSettings {
 
 /// Turn the local achievement rebuild on or off.
 ///
-/// Wired by the host config later: `crates/config` owns the user-facing setting,
-/// so this setter is the seam that config calls once it grows one. Until then the
-/// rebuild stays off, which is what "no stealth behaviour changes" requires.
+/// Wired by the host config: `crates/config` owns the user-facing setting
+/// (`[achievements] local_rebuild`, on by default) and
+/// `features::config_apply::apply` is the one place that calls this. Turning it on
+/// is inert on its own — only a Lua `setachievement` override that changes a
+/// defined achievement makes a reply differ from Steam's — so the flag is a kill
+/// switch rather than an opt-in.
 pub fn set_local_rebuild(enabled: bool) {
     let mut settings = SETTINGS.lock().unwrap_or_else(|error| error.into_inner());
     if settings.local_rebuild == enabled {

@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use mlua::prelude::*;
-use vapor_forge_core::{AppId, DepotId, ManifestId};
+use vapor_forge_core::{AchievementIntent, AppId, DepotId, ManifestId};
 
 use crate::report::{ScriptCallReport, ScriptExecutionOptions};
 use crate::{ManifestOverride, ScriptState};
@@ -97,6 +97,9 @@ pub(crate) struct RuntimeState {
     avatars: HashMap<AppId, AppId>,
     access_tokens: HashMap<AppId, u64>,
     app_purchase_times: HashMap<AppId, u32>,
+    /// Achievement intent from `setachievement`, per app and key. Sorted so one
+    /// reply always composes from the same order.
+    pub(crate) achievement_overrides: HashMap<AppId, BTreeMap<String, AchievementIntent>>,
 
     // Per-file bookkeeping backing incremental parse / unload.
     current_file: Option<PathBuf>,
@@ -134,7 +137,7 @@ impl ScriptRunContext {
         path.clone_into(&mut lock_shared(&self.path));
     }
 
-    fn push_call(&self, function: &'static str, detail: String) {
+    pub(crate) fn push_call(&self, function: &'static str, detail: String) {
         if !self.record_calls {
             return;
         }
@@ -307,6 +310,7 @@ pub(crate) fn snapshot_state(state: &Shared<RuntimeState>) -> ScriptState {
         avatars: state.avatars.clone(),
         access_tokens: state.access_tokens.clone(),
         app_purchase_times: state.app_purchase_times.clone(),
+        achievement_overrides: state.achievement_overrides.clone(),
     }
 }
 
@@ -434,6 +438,7 @@ pub(crate) fn install_lua_api(
     install_setstat(lua, &globals, &registry, state, ctx)?;
     install_setavatar(lua, &globals, &registry, state, ctx)?;
     install_addtoken(lua, &globals, &registry, state, ctx)?;
+    crate::achievement_intent::install(lua, &globals, &registry, state, ctx)?;
     install_http_api(
         lua,
         &globals,
@@ -444,7 +449,10 @@ pub(crate) fn install_lua_api(
     )
 }
 
-fn install_case_insensitive_lookup(lua: &Lua, globals: &LuaTable) -> LuaResult<LuaTable> {
+pub(crate) fn install_case_insensitive_lookup(
+    lua: &Lua,
+    globals: &LuaTable,
+) -> LuaResult<LuaTable> {
     let registry = lua.create_table()?;
     let lookup = registry.clone();
     let metatable = globals.metatable().unwrap_or(lua.create_table()?);
@@ -464,7 +472,7 @@ fn install_case_insensitive_lookup(lua: &Lua, globals: &LuaTable) -> LuaResult<L
     Ok(registry)
 }
 
-fn register_function(
+pub(crate) fn register_function(
     globals: &LuaTable,
     registry: &LuaTable,
     name: &'static str,

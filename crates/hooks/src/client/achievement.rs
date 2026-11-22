@@ -56,7 +56,7 @@ pub(crate) fn register_packet_schema(app_id: u32, content: &[u8]) -> bool {
     // The definition set changed, so the local rebuild's view of this app is
     // refreshed now rather than at the next reply: with the flag off this is the
     // one `debug` line the feature emits, and nothing is computed.
-    let _ = achievement_local::rebuild_for_reply(app_id);
+    let _ = achievement_local::rebuild_for_reply(app_id, &achievement_local::overrides_for(app_id));
     super::user_stats::register_snapshot_schema(app_id, content)
 }
 
@@ -65,12 +65,15 @@ pub(crate) fn register_packet_schema(app_id: u32, content: &[u8]) -> bool {
 ///
 /// This is the one call into `features::achievements`' local rebuild on this
 /// host. `None` means "the reply keeps today's bytes": the flag is off, the reply
-/// carries its own schema, or nothing local is known about the app.
+/// carries its own schema, nothing local is known about the app, or no Lua
+/// override changes a defined achievement. The overrides come from the published
+/// `ScriptState`, so the intent a script declared reaches the reply without any
+/// second source being consulted.
 pub(crate) fn local_reply(
     app_id: u32,
     schema: &[u8],
 ) -> Option<vapor_forge_features::achievements::RebuiltAchievements> {
-    achievement_local::reply_for(app_id, schema)
+    achievement_local::reply_for(app_id, schema, &achievement_local::overrides_for(app_id))
 }
 
 pub(crate) fn observe_local_snapshot(

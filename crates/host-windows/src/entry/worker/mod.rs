@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::{info, warn};
-use vapor_forge_config::RuntimeConfig;
 use vapor_forge_config::AppId;
+use vapor_forge_config::RuntimeConfig;
 use vapor_forge_features::config_apply;
 use vapor_forge_features::package::controlled_app_ids;
 
@@ -138,12 +138,14 @@ pub fn run(
     let scripts = vapor_forge_scripting::execute_scripts_runtime(&lua_dirs);
     let script = &scripts.state;
     notes.push(format!(
-        "lua: {} dir(s), {} app(s), {} depot key(s), {} manifest(s), {} ticket(s)",
+        "lua: {} dir(s), {} app(s), {} depot key(s), {} manifest(s), {} ticket(s), \
+         {} app(s) with achievement intent",
         lua_dirs.len(),
         script.apps.len(),
         script.depot_keys.len(),
         script.manifests.len(),
-        script.app_tickets.len()
+        script.app_tickets.len(),
+        script.achievement_overrides.len()
     ));
 
     let mut settings = HostSettings::resolve(&config, script);
@@ -175,7 +177,11 @@ pub fn run(
         // The stats-merge hook consults the flag this pass applied, so the
         // resolved setting travels with the state instead of being re-read from
         // the config inside a hook body on Steam's thread.
-        .with_achievement_settings(settings.achievements),
+        .with_achievement_settings(settings.achievements)
+        // The only achievements input that is not derived from Steam: what the
+        // user's scripts asked `setachievement` for, attached once before any
+        // entry is patched.
+        .with_achievement_overrides(script.achievement_overrides.clone()),
     );
     // Published before any entry is patched: a body reached during the batch
     // sees the real configuration, and the gate is tightened as soon as the
