@@ -10,6 +10,7 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Capability {
+    CallbackEvents,
     Ownership,
     PackageInjection,
     TicketOverrides,
@@ -17,13 +18,24 @@ pub enum Capability {
     FamilyLockBypass,
     DlcOverrides,
     CmInterception,
+    NativeResponseDelivery,
+    ShaderCacheControl,
     CloudControl,
+    CloudHttp,
+    LaunchEnvironment,
+    LegacyCdKeyControl,
+    SteamIdOverride,
+    LibraryUi,
+    OverviewMetadata,
+    LibrarySnapshot,
+    ConflictUiBridge,
     Achievements,
     RequestCodes,
 }
 
 impl Capability {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 21] = [
+        Self::CallbackEvents,
         Self::Ownership,
         Self::PackageInjection,
         Self::TicketOverrides,
@@ -31,13 +43,24 @@ impl Capability {
         Self::FamilyLockBypass,
         Self::DlcOverrides,
         Self::CmInterception,
+        Self::NativeResponseDelivery,
+        Self::ShaderCacheControl,
         Self::CloudControl,
+        Self::CloudHttp,
+        Self::LaunchEnvironment,
+        Self::LegacyCdKeyControl,
+        Self::SteamIdOverride,
+        Self::LibraryUi,
+        Self::OverviewMetadata,
+        Self::LibrarySnapshot,
+        Self::ConflictUiBridge,
         Self::Achievements,
         Self::RequestCodes,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::CallbackEvents => "callback-events",
             Self::Ownership => "ownership",
             Self::PackageInjection => "package-injection",
             Self::TicketOverrides => "ticket-overrides",
@@ -45,7 +68,17 @@ impl Capability {
             Self::FamilyLockBypass => "family-lock-bypass",
             Self::DlcOverrides => "dlc-overrides",
             Self::CmInterception => "cm-interception",
+            Self::NativeResponseDelivery => "native-response-delivery",
             Self::CloudControl => "cloud-control",
+            Self::ShaderCacheControl => "shader-cache-control",
+            Self::CloudHttp => "cloud-http",
+            Self::LaunchEnvironment => "launch-environment",
+            Self::LegacyCdKeyControl => "legacy-cdkey-control",
+            Self::SteamIdOverride => "steamid-override",
+            Self::LibraryUi => "library-ui",
+            Self::OverviewMetadata => "overview-metadata",
+            Self::LibrarySnapshot => "library-snapshot",
+            Self::ConflictUiBridge => "conflict-ui-bridge",
             Self::Achievements => "achievements",
             Self::RequestCodes => "request-codes",
         }
