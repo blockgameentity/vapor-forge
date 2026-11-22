@@ -30,7 +30,10 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     ),
     ("CUser::GetAppTicket", &[Capability::TicketOverrides]),
     ("CUser::GetUserStats", &[Capability::Achievements]),
-    ("CloseAppCloud", &[Capability::CloudControl]),
+    (
+        "CloseAppCloud",
+        &[Capability::CloudControl, Capability::CloudHttp],
+    ),
     ("PchMsgNameFromEMsg", &[Capability::CmInterception]),
     ("IPCProcessMessage", &[Capability::CmInterception]),
     ("BBuildAndAsyncSendFrame", &[Capability::CmInterception]),
@@ -70,13 +73,23 @@ mod tests {
         );
         assert_eq!(
             capabilities_for_symbol("CloseAppCloud"),
-            &[Capability::CloudControl]
+            &[Capability::CloudControl, Capability::CloudHttp]
         );
     }
 
     #[test]
     fn unknown_symbols_have_no_dependency() {
         assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
+    }
+
+    #[test]
+    fn the_one_cloud_symbol_gates_both_cloud_capabilities() {
+        // `CloseAppCloud` is the only cloud site the win64 corpus anchors, so a
+        // failed install there has to cost both cloud capabilities.
+        assert_eq!(
+            capabilities_for_symbol("CloseAppCloud"),
+            &[Capability::CloudControl, Capability::CloudHttp]
+        );
     }
 
     #[test]

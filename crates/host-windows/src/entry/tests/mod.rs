@@ -15,11 +15,12 @@ use crate::hooks::state::HostState;
 use crate::install::{DetourInstaller, InstallError, Installed};
 use crate::module::{self, ModuleIdentity};
 
-use super::worker::{HostEnv, LoadedModule, StateSink};
+use super::worker::{self, HostEnv, LoadedModule, StateSink};
 
 const OWNERSHIP: &str = "CUser::CheckAppOwnership";
 const DEPOT: &str = "GetDecryptionKey";
 const CLOUD: &str = "CloseAppCloud";
+const KEYVALUES: &str = "KeyValues_FindOrCreateKey";
 const TICKET: &str = "CUser::GetAppTicket";
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -158,6 +159,21 @@ fn factory(
     }
 }
 
+/// Run the worker while holding the process-global test lock.
+///
+/// `worker::run` finishes in `features::run`, which writes the process-wide
+/// local-rebuild switch. `features::tests::gate` asserts on that switch, so both
+/// sides take [`crate::test_lock::serial`]: a lock only one side holds is not a
+/// lock.
+fn run_serialized(
+    env: &mut dyn HostEnv,
+    installer: &mut worker::InstallerFactory<'_>,
+    sink: &mut dyn StateSink,
+) -> worker::HostOutcome {
+    let _guard = crate::test_lock::serial();
+    worker::run(env, installer, sink)
+}
+
 /// The environment the worker reads, with every part replaceable.
 struct FakeEnv {
     config: Option<PathBuf>,
@@ -228,3 +244,4 @@ impl StateSink for RecordingSink {
 }
 
 mod flow;
+mod flow_lua;

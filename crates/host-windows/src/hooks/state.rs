@@ -17,13 +17,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_config::{AppId, DepotId, RuntimeConfig};
 use vapor_forge_features::family::FamilySettings;
 use vapor_forge_features::package::PackageState;
 use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
 use vapor_forge_features::ticket::TicketCache;
 
 use crate::capability::{Capability, Gate};
+use crate::features::{CloudPlan, IdentitySettings};
 use crate::hooks::depot_store::DepotPlan;
 
 /// Everything a hook body may consult. Immutable except for the gate and the
@@ -46,6 +47,20 @@ pub struct HostState {
     /// expiry observable.
     authorisation: Option<AuthorisationWindow>,
     depot: DepotPlan,
+    /// The cloud route plan, resolved once at start-up.
+    ///
+    /// Empty by default ([`CloudPlan::default`] leaves every app alone), so a
+    /// body reached before the worker attaches one sees "no redirection" rather
+    /// than a placeholder endpoint.
+    cloud: CloudPlan,
+    /// Lua-registered depot decryption keys, from `<steam>/config/lua`.
+    ///
+    /// The same map the Linux host feeds to
+    /// `features::depot_key::should_skip_shader_depot`; a depot with no entry is
+    /// keyless, which is exactly what the shader decision has to know.
+    depot_keys: HashMap<DepotId, Vec<u8>>,
+    /// The per-game SteamID overrides, config and script state merged.
+    identity: IdentitySettings,
 }
 
 impl HostState {
@@ -67,6 +82,9 @@ impl HostState {
             lua_tickets: HashMap::new(),
             authorisation,
             depot,
+            cloud: CloudPlan::default(),
+            depot_keys: HashMap::new(),
+            identity: IdentitySettings::default(),
         }
     }
 
@@ -85,6 +103,30 @@ impl HostState {
     #[must_use]
     pub fn with_authorisation(mut self, authorisation: Option<AuthorisationWindow>) -> Self {
         self.authorisation = authorisation;
+        self
+    }
+
+    /// Attach the resolved cloud plan.
+    ///
+    /// The plan is what `features::cloud` decided from the settings the worker
+    /// resolved, so the cloud body consults one decision, not a second opinion.
+    #[must_use]
+    pub fn with_cloud_plan(mut self, cloud: CloudPlan) -> Self {
+        self.cloud = cloud;
+        self
+    }
+
+    /// Attach the Lua-registered depot keys.
+    #[must_use]
+    pub fn with_depot_keys(mut self, depot_keys: HashMap<DepotId, Vec<u8>>) -> Self {
+        self.depot_keys = depot_keys;
+        self
+    }
+
+    /// Attach the resolved per-game SteamID overrides.
+    #[must_use]
+    pub fn with_identity_settings(mut self, identity: IdentitySettings) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -123,6 +165,21 @@ impl HostState {
 
     pub fn depot(&self) -> &DepotPlan {
         &self.depot
+    }
+
+    /// The cloud plan resolved at start-up.
+    pub fn cloud(&self) -> &CloudPlan {
+        &self.cloud
+    }
+
+    /// The Lua-registered depot decryption keys.
+    pub fn depot_keys(&self) -> &HashMap<DepotId, Vec<u8>> {
+        &self.depot_keys
+    }
+
+    /// The resolved per-game SteamID overrides.
+    pub fn identity_settings(&self) -> &IdentitySettings {
+        &self.identity
     }
 
     /// The Denuvo lease this process holds, if `[ticket] denuvo_mode` asked for

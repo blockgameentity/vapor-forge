@@ -27,6 +27,7 @@
 //!    be undefined behaviour, so the trampoline types return `u8` and every body
 //!    produces its own `0`/`1`.
 
+pub mod cloud;
 pub mod depot;
 pub mod ownership;
 pub mod package;

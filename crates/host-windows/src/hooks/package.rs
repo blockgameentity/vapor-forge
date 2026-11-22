@@ -25,6 +25,7 @@ use vapor_forge_features::family::marker::MarkerOutcome;
 
 use crate::abi::package::GetPackageInfoFn;
 use crate::capability::Capability;
+use crate::hooks::family_play;
 use crate::hooks::original;
 use crate::hooks::state::{self, HostState};
 
@@ -79,6 +80,12 @@ pub fn refresh_borrower_markers(state: &HostState) -> usize {
     for &app in state.controlled_apps() {
         let injected_by_us = state.package().is_injected_into_pkg0(app);
         let real = apps::provenance(app, injected_by_us, self_account, settings);
+        // Concurrent play is consulted at this boundary too: a package refresh is
+        // where a lapsed share shows up, and the lock is what decides whether the
+        // app may still start. `consult` logs the reason it reached.
+        if apps::is_family_shared(app) {
+            family_play::consult(state, app, family_play::observed_lock(app));
+        }
         match state.package().remove_borrower_marker(app, real, settings) {
             MarkerOutcome::Removed { lender } => {
                 removed += 1;

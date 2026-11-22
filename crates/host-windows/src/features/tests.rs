@@ -14,7 +14,7 @@
 //!   depotcache write, no identity selection, no achievement switch flip.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use vapor_forge_config::{AppId, DepotId, ManifestId};
 use vapor_forge_features::achievements::local_rebuild_enabled;
@@ -29,12 +29,11 @@ use crate::features::{
 use crate::install::RunReport;
 
 /// `run` writes the process-wide achievement switch, so tests that call it are
-/// serialised; no test can then observe another test's flip. The fakes and the
-/// helpers below are shared by the per-property submodules.
-static RUN_LOCK: Mutex<()> = Mutex::new(());
-
+/// serialised; no test can then observe another test's flip. The lock is shared
+/// with `entry::tests`, whose `worker::run` reaches the same switch. The fakes and
+/// the helpers below are shared by the per-property submodules.
 fn serial() -> MutexGuard<'static, ()> {
-    RUN_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    crate::test_lock::serial()
 }
 
 fn manifest(depot: u32, manifest: u64) -> Candidate {
