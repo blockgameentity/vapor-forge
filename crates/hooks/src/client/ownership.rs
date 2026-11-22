@@ -1,5 +1,6 @@
 use core::ffi::c_void;
 use std::sync::atomic::Ordering;
+use tracing::debug;
 
 use vapor_forge_config::AppId;
 use vapor_forge_features::apps::{OwnershipDecision, OwnershipObservation};
@@ -78,6 +79,16 @@ unsafe { original(this, app_id, out) };
         ownership_observation(result, info),
     );
     let result = apply_ownership_decision(info, decision);
+    // The label is `features::family`'s decision, made from the same recorded
+    // licence state the Windows host reads: a genuine entitlement must never
+    // keep reading back as "from family library". Only controlled apps are
+    // labelled, exactly as on Windows: an app of ours that Steam presents on its
+    // own is never touched here. The extra clear this authorises is gated by
+    // `[apps.shared] validate_lender`; with that flag off the record is left
+    // exactly as today and only `decide_check_ownership` may clear it.
+    if cfg.is_controlled_app(app_id) {
+        apply_family_label(cfg, app_id, info);
+    }
     if vapor_forge_features::apps::classify_app(cfg, app_id).requires_injected_ownership() {
         let purchase_time = runtime.purchase_time(app_id);
         if purchase_time != 0 {
@@ -103,6 +114,51 @@ fn apply_ownership_decision(info: &mut CAppOwnershipInfo, decision: OwnershipDec
         info.clear_family_shared();
     }
     decision.result
+}
+/// Apply the family decision to Steam's record once ownership was normalized.
+///
+/// Two writes, each `features::family`'s answer, and nothing else — the record
+/// is otherwise Steam's:
+///
+/// * a lender we can name stamps the borrower marker, so the library keeps
+///   presenting the app as borrowed while that lender covers it;
+/// * a label that says the app is ours clears a stale family-share bit, which is
+///   what stops our own injection from reading back as "from family library".
+///
+/// Everything is logged once per call at `debug`: the provenance, the label and
+/// the reason it came out that way.
+fn apply_family_label(
+    config: &vapor_forge_config::RuntimeConfig,
+    app_id: AppId,
+    info: &mut CAppOwnershipInfo,
+) {
+    let settings = super::family_decide::settings();
+    if let Some(lender) =
+        super::family_decide::lender(app_id, super::family_decide::self_account_id())
+    {
+        super::install::package_state().stamp_borrower_marker(app_id, lender);
+    }
+    let family = super::family_decide::label(
+        config,
+        app_id,
+        super::family_decide::injected_by_us(super::install::package_state(), app_id),
+        settings,
+    );
+    if super::family_decide::clears_recorded_share(
+        info.is_family_shared(),
+        &family.report,
+        settings,
+    ) {
+        info.clear_family_shared();
+    }
+    debug!(
+        app_id = app_id.0,
+        provenance = family.real.label(),
+        reported = family.report.reported.label(),
+        reason = family.report.reason,
+        lock_unlocked = family.report.lock_unlocked,
+        "ownership: family label decided"
+    );
 }
 
 fn snapshot_with_original(original: CheckAppOwnershipFn, this: *mut c_void, app_ids: &[AppId]) {
