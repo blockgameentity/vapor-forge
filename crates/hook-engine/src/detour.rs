@@ -1,62 +1,46 @@
-use retour::GenericDetour;
-use std::sync::Mutex;
-use tracing::{debug, error, info, warn};
+//! Detour installation: plan validation, trampoline creation, PIC repair, and
+//! the process-lifetime storage slots hooks call through.
+//!
+//! The backend is chosen per target (`retour` on unix, the engine's own writer on
+//! Windows); everything in this module is shared. Callers see one type,
+//! [`Detour`], and one way to reach the original entry point,
+//! [`crate::original::original_detour`].
+
+use tracing::{debug, error, info};
 
 use crate::pic_repair;
+use crate::pic_thunk;
 use crate::plan::ValidatedHookTarget;
-use crate::protect::{self, Protection};
 
-/// Trampolines this process has created, in creation order.
-///
-/// `retour` allocates trampolines in executable memory that is writable while
-/// the detour is being built. The addresses are kept so an install pass can
-/// reopen them ([`ensure_trampoline_pages_writable`]) and harden them back to
-/// read-execute afterwards ([`restore_trampoline_pages_rx`]). Each entry is a
-/// raw trampoline address; page rounding is the protection backend's job.
-static TRAMPOLINES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+mod trampolines;
 
-/// Function-pointer types the active backend can hook.
-///
-/// Callers bound their generics on this instead of naming the backend, so the
-/// backend can be swapped per target architecture.
-pub use retour::Function as HookFn;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
-/// An installed detour owning the patch and its trampoline.
-///
-/// Backend-specific; callers hold it opaquely and reach the original entry
-/// point through [`crate::original::original_detour`].
-///
-/// # Platform behaviour
-///
-/// The backend is `retour`, which patches 32-bit and 64-bit x86 on both unix
-/// and Windows, so this type has the same shape and the same API on either
-/// platform: `new`, `enable`, `disable`, `is_enabled`, `trampoline`, and the
-/// original-entry-point lookup through
-/// [`crate::original::original_detour`] all behave identically. There is no
-/// Windows-only restriction on the type.
-///
-/// Two engine-level steps around the backend do differ, and are stated here so
-/// no caller assumes otherwise:
-///
-/// * PIC-thunk repair ([`create_detour`] → the `finalize` path) is 32-bit ELF
-///   only. On MS-x64 it is skipped by design: x64 reaches globals through
-///   RIP-relative operands, so a copied prologue holds no
-///   `call __x86.get_pc_thunk.*` whose return address would need rewriting.
-///   The `pic_thunk` gate refuses instead of decoding 32-bit bytes on a
-///   64-bit target.
-/// * The backend's patcher changes page protection through its own allocator
-///   and does not marshal the instruction-cache flush. This crate's own writer
-///   ([`crate::patch::write_code_patch`]) does, via
-///   [`protect::flush_instruction_cache`] (`FlushInstructionCache` on Windows).
-///   Prefer that writer when installing a patch on Windows outside `retour`.
-pub type Detour<F> = GenericDetour<F>;
+#[cfg(unix)]
+use unix as backend;
+#[cfg(windows)]
+use windows as backend;
 
+pub use backend::{Detour, HookFn};
+pub use trampolines::restore_rx as restore_trampoline_pages_rx;
+
+/// A created detour that has not been enabled yet.
+///
+/// The entry still holds its original bytes; enabling it is
+/// [`store_and_finalize`]'s job so hook callbacks can find the stored detour
+/// first.
 pub struct PendingDetour<F: HookFn> {
     pub detour: Detour<F>,
     pub callee_addr: usize,
 }
 
 /// Create a detour without enabling it.
+///
+/// On unix this asks `retour` for a trampoline; on Windows it plans the entry
+/// patch, allocates the trampoline, and leaves the entry untouched.
 ///
 /// # Safety
 /// The validated target and replacement addresses must both point to functions
@@ -66,9 +50,9 @@ pub unsafe fn create_detour<F: HookFn>(
     target: ValidatedHookTarget,
 ) -> Option<PendingDetour<F>> {
     let callee_addr = target.target_address;
-    // Sanity check: reject obviously invalid target addresses.
-    // During la_objopen, steamclient.so may not be fully relocated yet,
-    // which can produce garbage addresses from pattern resolution.
+    // Sanity check: reject obviously invalid target addresses. During
+    // la_objopen an image may not be fully relocated yet, which can produce
+    // garbage addresses from pattern resolution.
     if callee_addr < 0x10000 {
         error!(
             hook = name,
@@ -78,7 +62,7 @@ pub unsafe fn create_detour<F: HookFn>(
         return None;
     }
 
-    ensure_trampoline_pages_writable();
+    trampolines::make_writable();
 
     // SAFETY: caller guarantees the validated addresses use signature F.
     let target_fn = unsafe { F::from_ptr(target.target_address as *const ()) };
@@ -86,10 +70,10 @@ pub unsafe fn create_detour<F: HookFn>(
     let replacement_fn = unsafe { F::from_ptr(target.replacement_address as *const ()) };
 
     // SAFETY: caller guarantees both function pointers are valid.
-    // Note: GenericDetour::new() does NOT overwrite the original function.
-    // that only happens on enable(). So the original prologue is still
-    // readable at callee_addr until finalize_detour calls enable().
-    match unsafe { GenericDetour::new(target_fn, replacement_fn) } {
+    // Note: creating a detour does NOT overwrite the original function; that
+    // only happens on enable(), so the original prologue is still readable at
+    // callee_addr until `finalize_detour` enables it.
+    match unsafe { Detour::new(target_fn, replacement_fn) } {
         Ok(detour) => {
             debug!(hook = name, "detour created");
             Some(PendingDetour {
@@ -98,18 +82,10 @@ pub unsafe fn create_detour<F: HookFn>(
             })
         }
         Err(e) => {
-            error!(hook = name, error = %e, "retour detour creation failed");
+            error!(hook = name, error = %e, "detour creation failed");
             None
         }
     }
-}
-
-/// Restore all trampoline pages touched by PIC repair to RX.
-///
-/// Called after a loader-consistent install pass. A future create_detour call
-/// will reopen these pages before asking retour to allocate again.
-pub fn restore_trampoline_pages_rx() {
-    set_trampoline_pages_protection(Protection::READ_EXECUTE, "RX");
 }
 
 /// Store a pending detour into its process-lifetime slot and finalize it.
@@ -117,8 +93,8 @@ pub fn restore_trampoline_pages_rx() {
 /// Returns whether a detour was present and finalized.
 ///
 /// # Safety
-/// `storage` must point to a valid `Option<Detour<F>>` slot that lives
-/// for the process lifetime.
+/// `storage` must point to a valid `Option<Detour<F>>` slot that lives for the
+/// process lifetime.
 pub unsafe fn store_and_finalize<F: HookFn>(
     name: &str,
     storage: *mut Option<Detour<F>>,
@@ -140,44 +116,6 @@ pub unsafe fn store_and_finalize<F: HookFn>(
     }
 }
 
-fn ensure_trampoline_pages_writable() {
-    set_trampoline_pages_protection(Protection::READ_WRITE_EXECUTE, "RWX");
-}
-
-fn set_trampoline_pages_protection(protection: Protection, label: &str) {
-    let Ok(trampolines) = TRAMPOLINES.lock() else {
-        warn!("trampoline list is poisoned, leaving trampoline protection alone");
-        return;
-    };
-    if trampolines.is_empty() {
-        return;
-    }
-    let mut failures = 0usize;
-    for &trampoline in trampolines.iter() {
-        // `trampoline` is the start of a trampoline retour allocated for this
-        // process: it stays mapped for the process lifetime, and one byte is
-        // enough for the backend to find the page that contains it.
-        if protect::set_protection(trampoline, 1, protection).is_err() {
-            failures += 1;
-        }
-    }
-    let trampolines = trampolines.len();
-    if failures == 0 {
-        debug!(
-            trampolines,
-            protection = label,
-            "trampoline protection applied"
-        );
-    } else {
-        warn!(
-            trampolines,
-            failures,
-            protection = label,
-            "trampoline protection failed"
-        );
-    }
-}
-
 /// Apply PIC-thunk repair to a trampoline and enable the detour.
 ///
 /// # Safety
@@ -188,14 +126,18 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     callee_addr: usize,
 ) -> bool {
     let tramp_addr = detour.trampoline() as *const _ as usize;
-    remember_trampoline(tramp_addr);
+    trampolines::remember(tramp_addr);
 
-    // Read the original prologue NOW, before enable() overwrites it.
+    // The prologue is only read for PIC-thunk repair, which exists on 32-bit
+    // ELF alone. Everywhere else the buffer stays zeroed and the repair returns
+    // immediately, so a target is never read for a repair that cannot apply.
     let mut prologue = [0u8; 16];
-    // SAFETY: enable() hasn't been called yet, so callee_addr still has
-    // the original function bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(callee_addr as *const u8, prologue.as_mut_ptr(), 16);
+    if pic_thunk::SUPPORTED {
+        // SAFETY: enable() hasn't been called yet, so callee_addr still has
+        // the original function bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(callee_addr as *const u8, prologue.as_mut_ptr(), 16);
+        }
     }
 
     pic_repair::repair_pic_thunk(tramp_addr, callee_addr, &prologue);
@@ -207,14 +149,4 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     }
     info!(hook = name, "detour INSTALLED");
     true
-}
-
-fn remember_trampoline(trampoline: usize) {
-    let Ok(mut trampolines) = TRAMPOLINES.lock() else {
-        warn!("trampoline list is poisoned, trampoline protection not tracked");
-        return;
-    };
-    if !trampolines.contains(&trampoline) {
-        trampolines.push(trampoline);
-    }
 }

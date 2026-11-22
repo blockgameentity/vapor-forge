@@ -1431,6 +1431,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tracing",
+ "vapor-forge-hook-engine",
  "vapor-forge-patterns",
  "vapor-forge-pe",
 ]

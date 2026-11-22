@@ -18,8 +18,19 @@ const STEAM_SPECIFIC: &[&str] = &[
 const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("detour.rs", include_str!("../src/detour.rs")),
+    (
+        "detour/trampolines.rs",
+        include_str!("../src/detour/trampolines.rs"),
+    ),
+    ("detour/unix.rs", include_str!("../src/detour/unix.rs")),
+    ("detour/windows.rs", include_str!("../src/detour/windows.rs")),
+    ("exec.rs", include_str!("../src/exec.rs")),
     ("original.rs", include_str!("../src/original.rs")),
     ("patch.rs", include_str!("../src/patch.rs")),
+    (
+        "patch/planner.rs",
+        include_str!("../src/patch/planner.rs"),
+    ),
     ("pic_repair.rs", include_str!("../src/pic_repair.rs")),
     ("pic_thunk.rs", include_str!("../src/pic_thunk.rs")),
     (
@@ -35,6 +46,11 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../src/protect/windows.rs"),
     ),
     ("vmt.rs", include_str!("../src/vmt.rs")),
+    ("win_api.rs", include_str!("../src/win_api.rs")),
+    ("writer.rs", include_str!("../src/writer.rs")),
+    ("writer/fake.rs", include_str!("../src/writer/fake.rs")),
+    ("writer/tests.rs", include_str!("../src/writer/tests.rs")),
+    ("writer/win32.rs", include_str!("../src/writer/win32.rs")),
 ];
 
 const MANIFEST: &str = include_str!("../Cargo.toml");

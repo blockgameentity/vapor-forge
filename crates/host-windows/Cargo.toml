@@ -10,6 +10,11 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vapor-forge-pe = { path = "../pe" }
+# The Windows detour writer lives in the engine so the host and the engine cannot
+# plan two different entry patches: `writer::WindowsDetour` owns the
+# instruction-boundary plan, the trampoline, the `VirtualProtect` window, the
+# instruction-cache flush, and the restore on drop.
+vapor-forge-hook-engine = { path = "../hook-engine" }
 iced-x86.workspace = true
 vapor-forge-patterns = { path = "../patterns", default-features = false }
 sha2.workspace = true

@@ -4,16 +4,16 @@
 //! whole resolve/install/report flow on Linux with a fake installer. The real
 //! Win32 implementation only exists when compiling for Windows.
 //!
-//! `vapor-forge-hook-engine` now builds for Windows (its page protection has a
-//! `VirtualProtect` backend), but its writer still targets the ELF layouts the
-//! Linux host needs. This trait stays the seam: the planner and the report do
-//! not care who writes the bytes.
-//!
-//! The Win32 writer patching the entry delegates the two decisions that must
-//! never be improvised to [`super::patch`]: how many bytes are safe to overwrite
-//! (whole instructions only) and what the displaced instructions become
-//! (a trampoline in freshly allocated executable memory, so a replacement can
-//! still call the original).
+//! The Win32 writer itself lives in `vapor-forge-hook-engine`, not here: the
+//! engine grew its own Windows detour writer
+//! (`vapor_forge_hook_engine::writer::WindowsDetour`) for the same reason this
+//! crate needs one, and two writers would answer "how many instructions may this
+//! patch displace" twice. The engine's writer plans the instruction-boundary
+//! patch, allocates the trampoline, writes through `VirtualProtect`, flushes the
+//! instruction cache, and — because the installer keeps ownership of the value —
+//! restores the original bytes when the hook is dropped. This module only
+//! decides which replacement belongs to which resolved symbol and reports what
+//! happened.
 
 use thiserror::Error;
 
@@ -49,24 +49,36 @@ pub enum InstallError {
 mod win32 {
     use std::collections::BTreeMap;
 
-    use super::super::patch;
+    use vapor_forge_hook_engine::writer::WindowsDetour;
+
     use super::{DetourInstaller, InstallError, Installed};
-    use crate::inject;
 
     /// Writes an absolute jump to a registered replacement function.
     ///
-    /// Replacement functions are supplied by the caller: this layer resolves
-    /// and patches an address, it does not invent hook bodies. A symbol without
-    /// a replacement is a failed install, which disables only that capability.
+    /// Replacement functions are supplied by the caller: this layer resolves and
+    /// patches an address, it does not invent hook bodies. A symbol without a
+    /// replacement is a failed install, which disables only that capability; an
+    /// entry the planner refuses is a failed install for the same reason, and
+    /// leaves the module untouched.
+    ///
+    /// The installer owns every detour it installed, so dropping it restores the
+    /// original entry bytes and releases each trampoline.
     pub struct Win32DetourInstaller {
         replacements: BTreeMap<String, usize>,
+        installed: BTreeMap<String, WindowsDetour>,
     }
 
     impl Win32DetourInstaller {
         pub fn new(replacements: impl IntoIterator<Item = (String, usize)>) -> Self {
             Self {
                 replacements: replacements.into_iter().collect(),
+                installed: BTreeMap::new(),
             }
+        }
+
+        /// Number of detours this installer currently owns.
+        pub fn installed_len(&self) -> usize {
+            self.installed.len()
         }
     }
 
@@ -78,15 +90,11 @@ mod win32 {
                 }
             })?;
 
-            // Read enough of the entry to reach the 12-byte patch boundary; the
-            // planner picks the shortest whole-instruction run and refuses
-            // anything it cannot relocate by copying.
-            let window = inject::read_bytes(address, 32).map_err(|error| InstallError::Patch {
-                symbol: symbol.to_owned(),
-                address,
-                message: error.to_string(),
-            })?;
-            let plan = patch::plan(&window, address as u64).map_err(|error| {
+            // SAFETY: the caller resolved `address` as `symbol`'s entry inside a
+            // loaded module and registered `replacement` for that symbol. Install
+            // happens during startup, before the hooked entry can be reached from
+            // another thread.
+            let detour = unsafe { WindowsDetour::new(address, replacement) }.map_err(|error| {
                 InstallError::Patch {
                     symbol: symbol.to_owned(),
                     address,
@@ -94,70 +102,21 @@ mod win32 {
                 }
             })?;
 
-            let trampoline = inject::allocate_executable(plan.trampoline.len()).map_err(
-                |error| InstallError::Patch {
-                    symbol: symbol.to_owned(),
-                    address,
-                    message: error.to_string(),
-                },
-            )?;
-            // SAFETY: `trampoline` is a fresh allocation of exactly this size.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    plan.trampoline.as_ptr(),
-                    trampoline as *mut u8,
-                    plan.trampoline.len(),
-                );
+            let trampoline = detour.trampoline();
+            let patch_len = detour.patch_len();
+            // Replacing a symbol this installer already hooked drops the previous
+            // detour, which restores the bytes it wrote before the new jump lands.
+            let previous = self.installed.insert(symbol.to_owned(), detour);
+            if previous.is_some() {
+                tracing::warn!(symbol, "re-installed a symbol that was already hooked");
             }
-            inject::flush_instruction_cache(trampoline, plan.trampoline.len()).map_err(|error| {
-                InstallError::Patch {
-                    symbol: symbol.to_owned(),
-                    address,
-                    message: error.to_string(),
-                }
-            })?;
-
-            let bytes = plan.patch_bytes(replacement as u64);
-            let protection = inject::make_writable(address, plan.patch_len).map_err(|error| {
-                InstallError::Patch {
-                    symbol: symbol.to_owned(),
-                    address,
-                    message: error.to_string(),
-                }
-            })?;
-
-            // SAFETY: the caller resolved `address` as a function entry inside
-            // the loaded module, the plan covers whole instructions only, and
-            // `make_writable` accepted the same range.
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, plan.patch_len);
-            }
-
-            if let Err(error) = inject::restore(address, plan.patch_len, protection) {
-                // Leaving the page writable is worse than a dead hook: release
-                // the trampoline and report the failure so the capability is
-                // disabled rather than silently half-installed.
-                let _ = inject::free_executable(trampoline);
-                return Err(InstallError::Patch {
-                    symbol: symbol.to_owned(),
-                    address,
-                    message: error.to_string(),
-                });
-            }
-            inject::flush_instruction_cache(address, plan.patch_len).map_err(|error| {
-                InstallError::Patch {
-                    symbol: symbol.to_owned(),
-                    address,
-                    message: error.to_string(),
-                }
-            })?;
 
             tracing::info!(
                 symbol,
                 address = format_args!("{address:#x}"),
                 replacement = format_args!("{replacement:#x}"),
                 trampoline = format_args!("{trampoline:#x}"),
-                patch_len = plan.patch_len,
+                patch_len,
                 "windows detour installed"
             );
             Ok(Installed {
@@ -174,13 +133,24 @@ pub use win32::Win32DetourInstaller;
 
 #[cfg(test)]
 mod tests {
+    use super::{DetourInstaller, InstallError, Installed};
+
+    /// What a caller sees when a symbol has no replacement: a failed capability,
+    /// not a panic and not a half-written entry.
+    struct Empty;
+    impl DetourInstaller for Empty {
+        fn install(&mut self, symbol: &str, address: usize) -> Result<Installed, InstallError> {
+            Err(InstallError::NoReplacement {
+                symbol: symbol.to_owned(),
+            })
+            .inspect_err(|_| assert_ne!(address, 0, "a resolved entry is never null"))
+        }
+    }
 
     #[test]
-    fn absolute_jump_encoding_is_a_full_register_move_then_jump() {
-        let patch = super::super::patch::absolute_jump(0x1_4000_1234);
-        assert_eq!(
-            patch,
-            [0x48, 0xB8, 0x34, 0x12, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE0]
-        );
+    fn a_symbol_without_a_replacement_fails_closed() {
+        let error = Empty.install("CSteamEngine::RunFrame", 0x1800_0000).unwrap_err();
+        assert!(matches!(error, InstallError::NoReplacement { .. }));
+        assert!(error.to_string().contains("CSteamEngine::RunFrame"));
     }
 }

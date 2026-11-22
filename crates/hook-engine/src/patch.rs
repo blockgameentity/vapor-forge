@@ -1,18 +1,22 @@
-//! Architecture-sized entry-patch byte layouts and their guarded writer.
+//! Architecture-sized entry-patch byte layouts, their planner, and their
+//! guarded writer.
 //!
 //! Byte layouts are pure functions so they can be unit-tested on any host,
-//! including the Windows layout from a Linux CI machine. Only
-//! [`write_code_patch`] touches memory, and it goes through
+//! including the Windows layout from a Linux CI machine. [`planner`] decides how
+//! many whole instructions a patch may displace and what the trampoline holds.
+//! Only [`write_code_patch`] touches memory, and it goes through
 //! [`crate::protect::with_writable`] so the previous page protection is
-//! restored whether the write path succeeds or bails out.
-//!
-//! The Windows host installs its own absolute jump today; this module is the
-//! reusable primitive for it, and it is the piece that flushes the instruction
-//! cache (`FlushInstructionCache` on Windows) after the write.
+//! restored whether the write path succeeds or bails out; it is also the piece
+//! that flushes the instruction cache (`FlushInstructionCache` on Windows) after
+//! the write.
+
+pub mod planner;
 
 use thiserror::Error;
 
 use crate::protect::{self, ProtectError};
+
+pub use planner::{PatchPlan, PlanError, PATCH_LEN, plan};
 
 /// Length of the absolute x86-64 jump: `mov rax, imm64; jmp rax`.
 pub const ABSOLUTE_JUMP_LEN: usize = 12;
