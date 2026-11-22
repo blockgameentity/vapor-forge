@@ -21,6 +21,7 @@ members = [
     "crates/steam-protocol",
     "crates/tool-support",
     "crates/hook-engine",
+    "crates/host-windows",
     "crates/proton-inject",
 ]
 default-members = [
@@ -45,6 +46,7 @@ default-members = [
     "crates/steam-protocol",
     "crates/tool-support",
     "crates/hook-engine",
+    "crates/host-windows",
     "crates/proton-inject",
 ]
 resolver = "2"

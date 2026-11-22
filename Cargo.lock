@@ -1424,6 +1424,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vapor-forge-host-windows"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+ "tracing",
+ "vapor-forge-pe",
+]
+
+[[package]]
 name = "vapor-forge-memory"
 version = "0.1.0"
 dependencies = [

@@ -103,6 +103,71 @@ pub fn find_export_rva(pe_bytes: &[u8], name: &str) -> Option<u32> {
     None
 }
 
+/// Every named export of a PE image, in export-table order.
+///
+/// Used to generate a proxy DLL that forwards the whole export surface of the
+/// module it replaces: a hand-maintained list would silently drop functions
+/// whenever Steam adds one.
+pub fn export_names(pe_bytes: &[u8]) -> Vec<String> {
+    let Some(dos_e_lfanew) = read_u32(pe_bytes, 0x3C) else {
+        return Vec::new();
+    };
+    if read_u32(pe_bytes, dos_e_lfanew as usize) != Some(PE_SIGNATURE) {
+        return Vec::new();
+    }
+    let coff_start = dos_e_lfanew as usize + 4;
+    let Some(optional_hdr_size) = read_u16(pe_bytes, coff_start + 16) else {
+        return Vec::new();
+    };
+    let opt_start = coff_start + 20;
+    let dd_offset = match read_u16(pe_bytes, opt_start) {
+        Some(0x10B) => opt_start + 96,
+        Some(0x20B) => opt_start + 112,
+        _ => return Vec::new(),
+    };
+    let Some(export_rva) = read_u32(pe_bytes, dd_offset + EXPORT_DIR_INDEX * 8) else {
+        return Vec::new();
+    };
+    if export_rva == 0 {
+        return Vec::new();
+    }
+    let Some(num_sections) = read_u16(pe_bytes, coff_start + 2) else {
+        return Vec::new();
+    };
+    let sections_start = opt_start + optional_hdr_size as usize;
+    let Some(dir) = rva_to_offset(pe_bytes, sections_start, num_sections as usize, export_rva) else {
+        return Vec::new();
+    };
+    let dir = dir as usize;
+    let Some(num_names) = read_u32(pe_bytes, dir + 24) else {
+        return Vec::new();
+    };
+    let Some(names_rva) = read_u32(pe_bytes, dir + 32) else {
+        return Vec::new();
+    };
+    let Some(names_off) =
+        rva_to_offset(pe_bytes, sections_start, num_sections as usize, names_rva)
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::with_capacity(num_names as usize);
+    for index in 0..num_names as usize {
+        let Some(name_rva) = read_u32(pe_bytes, names_off as usize + index * 4) else {
+            break;
+        };
+        let Some(name_off) =
+            rva_to_offset(pe_bytes, sections_start, num_sections as usize, name_rva)
+        else {
+            break;
+        };
+        let name = read_cstring(pe_bytes, name_off as usize);
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Extract all section names from a PE file on disk.
 pub fn section_names(pe_bytes: &[u8]) -> Vec<String> {
     let Some(dos_e_lfanew) = read_u32(pe_bytes, 0x3C) else {

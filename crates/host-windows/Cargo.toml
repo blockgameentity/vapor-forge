@@ -1,0 +1,15 @@
+[package]
+name = "vapor-forge-host-windows"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vapor-forge-pe = { path = "../pe" }
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
