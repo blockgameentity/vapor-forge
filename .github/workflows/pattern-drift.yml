@@ -1,0 +1,63 @@
+name: pattern-drift
+
+# Steam ships a client update roughly monthly. The Windows corpus is keyed by
+# module sha256, so a new build that has no corpus file is drift: hooks would
+# silently stop resolving. This job says so every day instead of waiting for a
+# user report, and it never needs a Windows machine - the client modules are
+# public CDN packages and the scanner runs on Linux.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-corpus:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [public, publicbeta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Windows client (${{ matrix.channel }})
+        run: scripts/fetch-windows-client.sh "${{ matrix.channel }}" "$RUNNER_TEMP/win"
+      - name: Build corpus tools
+        run: cargo build --release -p vapor-forge-patterns --features tools --bin vapor-forge-pattern-mine
+      - name: Verify every module against the shipped corpus
+        run: |
+          set -uo pipefail
+          failed=0
+          for pair in "steamclient64.dll steamclient" "SteamUI.dll steamui"; do
+            set -- $pair
+            dll="$RUNNER_TEMP/win/$1"
+            component="$2"
+            sha=$(sha256sum "$dll" | cut -d' ' -f1)
+            toml="res/patterns/win64/$component/$sha.toml"
+            echo "::group::$component $sha"
+            if [ -f "$toml" ]; then
+              ./target/release/vapor-forge-pattern-mine --dll "$dll" --module "$component" --arch x86_64 --verify "$toml"
+            else
+              echo "::error::drift: no corpus for $component $sha ${{ matrix.channel }} - re-mine with vapor-forge-pattern-mine"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pattern-drift-${{ matrix.channel }}
+          path: ${{ runner.temp }}/win/fetch.json
+
+  egress-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for prohibited destinations
+        run: scripts/check-egress.sh

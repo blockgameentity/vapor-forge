@@ -5,6 +5,7 @@ pub mod app_avatar;
 pub mod apps;
 pub mod cloud;
 pub mod depot_key;
+pub mod depotcache;
 pub mod dlc;
 pub mod identity;
 pub mod inject_wake;

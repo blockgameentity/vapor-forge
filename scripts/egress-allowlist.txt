@@ -1,0 +1,21 @@
+# Hosts Vapor Forge is allowed to contact. One prefix per line.
+# Anything not matched here fails `scripts/check-egress.sh` in CI.
+#
+# Steam's own infrastructure (client builds, CDN, store assets).
+https://client-update.akamai.steamstatic.com/
+https://steamcdn-a.akamaihd.net/
+https://api.steampowered.com/
+https://partner.steamgames.com/        # documentation links
+# Pattern corpus sources, fetched at runtime and validated against the live module.
+https://raw.githubusercontent.com/Hintay/vapor-forge/
+https://github.com/Hintay/vapor-forge/
+# Third-party manifest-request-code providers, only ever queried by gid.
+https://20770407.xyz/
+http://gmrc.wudrm.com/
+https://manifest.steam.run/
+# Documentation / licence references.
+https://github.com/rust-lang/
+https://www.gnu.org/licenses/
+https://www.lua.org/
+# Local endpoints used by default (game-bridge loopback, Syncthing-style local sync).
+http://127.0.0.1
