@@ -54,3 +54,10 @@ No hint was ever published for `CUser::GetSubscribedApps`, the stats path, the
 `CNetPacket` dispatch site or a `SetEnvString` equivalent, so those symbols are
 absent rather than missed. They need derivation from the binary itself (phase 0
 follow-up), not from the hint corpus.
+
+Derivation is attempted in [`PROBE-REPORT.md`](./PROBE-REPORT.md), which records
+what `vapor-forge-pe-probe` measured on both builds. As of that report none of
+the four is shortlisted: every top candidate was read and refuted, and the report
+states per symbol what evidence would confirm or refute it. Re-run the report
+after adding a corpus anchor that a candidate can be checked against (a caller,
+or an `IClientUserStats` method) rather than after adding a looser profile.
