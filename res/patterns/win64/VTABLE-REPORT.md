@@ -1850,3 +1850,115 @@ publicbeta CUser::GetSteamID OK  1  0x0000a31200  unmapped
 (neither address is covered by a `RUNTIME_FUNCTION`). The same two runs report a
 pre-existing failure in the shipped corpus, unrelated to this pass:
 `GetPipeClient` at `0x8c50b0` public / `0x8e6f70` beta is also `unmapped`.
+
+# Seventh pass: the work-item post, and why this host does not use it
+
+`NativeResponseDelivery` on the Linux host is a **queue**: a fabricated response is
+posted to Steam's own network thread with `CWorkThreadPool::AddWorkItem`, and the
+posted `CWorkItem`'s `execute` re-enters Steam's `RecvPkt` with a packet built by
+`CNetPacket::Alloc`/`Init` from a dispatch context (receiver + connection id)
+captured off a real inbound packet. The Linux corpus anchors the post site
+(`CWebSocketConnection::PostDelayedCloseWorkItem`, `res/patterns/x86_64.toml:100`)
+and derives the pool slot, item size and vtable from its body
+(`crates/patterns/src/work_item_site.rs`).
+
+The question for Windows was whether the same post can be anchored. **It can be
+described, but not verified end to end, and this host does not need it** — the
+answer is delivered synchronously inside Steam's own dispatch. This section
+records the measurement so the next pass does not repeat it.
+
+## What was measured
+
+Tools, on both live builds:
+
+```
+vapor-forge-vtable-pe --dll <steamclient64.dll> --module steamclient --class CWorkItem
+vapor-forge-vtable-pe --dll <steamclient64.dll> --module steamclient --class CWorkThreadPool
+vapor-forge-vtable-pe --dll <steamclient64.dll> --module steamclient --class Work   # substring
+strings -a -n 6 steamclient64.dll | grep -i workitem
+```
+
+The mechanism exists, with stable RTTI tables:
+
+| class | public | publicbeta | slots | `.pdata` |
+| --- | --- | --- | --- | --- |
+| `CWorkItem` | `0x11f5448` | `0x1225578` | 8 | 5/8 |
+| `CWorkThreadPool` | `0x1459290` | `0x148eee0` | 3 | 3/3 |
+| `CInternalLambdaWorkItem` | `0x11f5c18` | `0x13ce5d0` | 8 | 3/8, 2/8 |
+| `CWebSocketConnectionDelayedCloseConnectionWorkItem` | `0x14353b8` | `0x146afb8` | 8 | 2/8, 2/8 |
+
+`--class Work` matches 220 tables; **98** of their class names contain `WorkItem`,
+including the Windows counterpart of the Linux anchor's item class. `CWorkThreadPool` has three
+virtual slots (destructor pair and one 218-byte method), so `AddWorkItem` is not
+virtual, exactly as on Linux.
+
+**`AddWorkItem` is a header method.** Its assertion string
+(`CWorkItem::SetOrderingKey must be called before AddWorkItem`, from
+`common\workthreadpool.h`, public RVA `0x11f54d8`) is referenced **99 times in 87
+distinct `.pdata` functions** (public) and **106 times in 93** (publicbeta). It is
+inlined into every caller, so no function has it as its own body start. What the
+inlined form always ends in is one of two out-of-line routines:
+
+| routine | public | publicbeta | evidence |
+| --- | --- | --- | --- |
+| job-attached queue add | `0xd39b00` | `0xd657e0` | first call after the assert in 81/87 (87/93 beta) sites; asserts `this == g_pJobCur` (`common\job.cpp`, public RVA `0x142c438`), takes the job in `rcx` and the item in `rdx` |
+| plain pool queue add | `0xdbac60` | `0xde9830` | `common\workthreadpool.cpp` method (`0x1459300`); 10 inlined sites call it; asserts `CWorkThreadPool can't support item auto resubmission when ensuring output ordering` and `pWorkThread != NULL`, and reaches the `CWorkThreadPool - Signal Thread Event` path |
+
+Both are stable across builds: the 19 public / 18 beta functions that reference
+`workthreadpool.cpp` line up in the same order, and ten of them sit at exactly
+a `0x2ebd0` displacement (public `0xdbac60` = beta `0xde9830`); the rest drift by
+`0x30`–`0x25a` bytes where code changed, and one is a template instantiation that
+moved elsewhere in the image.
+
+The item ABI is *partly* derivable from the tables. In
+`CWebSocketConnectionDelayedCloseConnectionWorkItem`, slots 2 and 3 return the
+static strings `CWebSocketConnectionDelayedCloseConnectionWorkItem` and
+`…::ThreadProcess` (public `0xd6a950`/`0xd6a940`, `lea rax,[rip+…]; ret`), i.e.
+the name and thread-process-name getters. The Linux table has 9 slots and MSVC
+merges the destructor pair, so Linux slot *n* is Windows slot *n−1* for *n* ≥ 2;
+the two getters confirm that mapping (Linux 3/4 → Windows 2/3) and put `execute`
+(Linux slot 6) at **Windows slot 5**, which is the item class's only large work
+function (251 B, 9 calls, `CTCPConnection` callees). Slots 1/4/7 are one
+`return true` stub, 6 is a shared three-store base method, and the base table's
+2/3/4 are a shared 26-byte throw stub (pure virtuals).
+
+## What was searched and found nothing
+
+* Neither win64 corpus names a work, job or pool symbol:
+  `grep -inE "work|threadpool|job" res/patterns/win64/steamclient/*.toml
+  res/patterns/win64/steamui/*.toml` returns only the stats `CAPIJob…` pair.
+* `--class ThreadPool` matches exactly one table, `CWorkThreadPool`
+  (`CWorkThreadPoolSignal` has no vtable); there is no `CNetThreadPool` or
+  per-subsystem pool class, so "the pool Steam's network work runs on" is not
+  identifiable by RTTI.
+* No string names the post method itself: `strings` finds `AddWorkItem` only
+  inside the assertion message, and the Windows binary does not export the
+  mangled symbol (unlike the Linux `.so`, where the corpus pattern resolves a
+  body).
+
+## What a queue would still need — and why the capability was retired
+
+`CWorkItem`'s `execute` slot is an **inference** from two getters and the Itanium
+mapping, never an observation of the pool calling slot 5. A hand-built item that
+Steam's network thread dequeues must get that slot right or it crashes the thread
+that delivers every inbound packet. On top of that, this host has no anchor for
+the pool object (Linux derives `pool_slot` from the post site's own load), no
+captured dispatch context (`recv_pkt` has the receiver but never publishes it, and
+`Layout` exposes only the decoded `data`/`size` slots, not `conn_id`), and no
+published `Alloc`/`Init`/`Release` addresses.
+
+So a Windows queue today would be exactly what a gate is supposed to prevent:
+unverified code running on Steam's networking thread. The capability is retired
+with that evidence instead. On Windows the response is fabricated and swapped
+**inside `CCMInterface::RecvPkt`** — Steam's own call — so there is no cross-thread
+hand-off to make and a response that is not ready is not fabricated at all.
+`crates/host-windows/src/install/deps.rs` maps `native-response-delivery` onto
+`CCMInterface::RecvPkt`, the symbol that serves, and
+`crates/host-windows/src/hooks/netpacket/mod.rs` lists what would have to change
+for async delivery to be worth building: an after-the-fact producer, a published
+dispatch context, published packet constructors, and a post site with the pool
+object and the `execute` slot **confirmed by observation** rather than inferred.
+
+**Verdict: no corpus entry. The post machinery is real and the item class is
+stable across builds, but the half the host would execute is unverified, and the
+synchronous serve path already delivers every response the host can fabricate.**

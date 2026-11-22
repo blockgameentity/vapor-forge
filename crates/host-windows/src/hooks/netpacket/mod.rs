@@ -52,12 +52,66 @@
 //! [`availability`] disables `request-codes` when no layout could be decoded, with
 //! the corpus gap as the reason: a capability that cannot be honoured must say so.
 //!
+//! A third capability, `native-response-delivery`, is not consulted here at all:
+//! it is mapped onto this body by [`crate::install::deps`] because on Windows
+//! serving *is* delivering, with no queue in between (see below).
+//!
 //! # What this body never does
 //!
 //! * It never allocates while the swap is installed, never dials, and never holds
 //!   a lock across the original call.
 //! * It writes exactly two slots of Steam's packet, and only when a code is
 //!   served; both are restored by the swap guard before the body returns.
+//!
+//! # `native-response-delivery` is this dispatch, not a queue (Windows)
+//!
+//! On the Linux host the capability gates a *queue*: a fabricated response is
+//! posted to Steam's own network thread with
+//! `CWorkThreadPool::AddWorkItem`, and the posted work item's `execute` re-enters
+//! Steam's `RecvPkt` with a `CNetPacket` built by `CNetPacket::Alloc`/`Init` from
+//! a dispatch context (receiver and connection id) captured off a real inbound
+//! packet. That exists because the worker thread must not touch Steam's
+//! networking objects directly.
+//!
+//! This host has no such worker and no such hand-off: the answer is fabricated
+//! and swapped in **inside Steam's own call**, so there is nothing to hand to
+//! another thread and nothing to queue. A response that is not ready when the
+//! dispatch runs is not fabricated at all — Steam's own request-code round trip
+//! happens, which is the pre-existing behaviour. The capability is therefore
+//! retired rather than emulated: [`crate::install::deps`] maps
+//! `native-response-delivery` onto [`SYMBOL`], the body that serves, so a build
+//! where this body cannot install disables the capability with that reason and a
+//! build where it does install reports it as covered by the synchronous path.
+//!
+//! The post machinery does exist in `steamclient64.dll` — the seventh pass of
+//! `res/patterns/win64/VTABLE-REPORT.md` measures `CWorkItem` (8 slots) and
+//! `CWorkThreadPool` (3 slots) as stable RTTI tables in both live builds, and
+//! finds `AddWorkItem` inlined into 87/93 functions. It is not used here, and
+//! nothing in the corpus names it, because the delivery half would still be
+//! unverified: the pool object, the work item's `execute` slot (inferred as slot 5
+//! from the item tables, never observed being called), and a captured dispatch
+//! context (this body has the receiver but never publishes it, and [`Layout`] does
+//! not expose the decoded `conn_id`) are all missing. A queue built on inferences
+//! would run unverified code on Steam's network thread, which is worse than the
+//! synchronous answer this host already gives.
+//!
+//! ## What would have to change for async delivery to be worth building
+//!
+//! 1. A producer that can answer **after** a dispatch returns. Today nothing fills
+//!    the code cache (see [`ServeBlocker::NoCachedCode`]); caching ahead of the
+//!    request keeps the synchronous body sufficient.
+//! 2. A captured dispatch context: the receiver (`recv_pkt`'s `this`) and the
+//!    `conn_id` [`Layout`] already decodes, published somewhere a worker can read.
+//! 3. Callable `CNetPacket::Alloc`/`Init`/`Release` addresses, not just their field
+//!    offsets: the install batch resolves all three, so this is plumbing.
+//! 4. A posted work item that runs on the CNet thread: the corpus would need a
+//!    `CWorkThreadPool::AddWorkItem` anchor, the pool object's address, and the
+//!    item's `execute` slot confirmed by observing the pool call it — the seventh
+//!    pass records what is missing.
+//! 5. Only then a queue (Linux `client/network.rs` is the reference) and this
+//!    capability would gate the queue instead of the dispatch.
+//!
+//! [`Layout`]: crate::abi::netpacket::Layout
 
 pub mod availability;
 pub mod cache;
