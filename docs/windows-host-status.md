@@ -7,7 +7,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 
 | area | state | where |
 | --- | --- | --- |
-| `.pdata` — one definition, anchor body gate | done | `crates/patterns/src/pdata*`, `--strict` anchor check in the miner |
+| `.pdata` — one definition, anchor body gate | done — canonical extents: 52,946 / 53,430 (steamclient public/beta), 40,826 / 41,159 (steamui) | `crates/patterns/src/pdata*`, `--strict` anchor check in the miner |
 | `hook-engine` builds for Windows (VirtualProtect backend) | done | `crates/hook-engine/src/protect*` |
 | trampoline patch writer (instruction-boundary, relocatable-only) | done | `crates/host-windows/src/install/patch.rs` + `installer.rs` |
 | provider failover opt-in, dependency-aware depot closure | done | `crates/features/src/{request_code,manifest}*`, `crates/config` |
@@ -27,7 +27,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 ## Verification (all run on Linux, no Windows box)
 
 ```sh
-cargo test --workspace                                  # 1017 passed, 0 failed
+cargo test --workspace                                  # 1016 passed, 0 failed
 cargo clippy --workspace --all-targets -- -D warnings    # clean
 cargo check --workspace --all-targets                    # clean
 cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok
