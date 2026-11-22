@@ -89,7 +89,17 @@ The **stats path turned out to be a job chain, not a per-stat writer**:
 can install. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
-**C. The achievements rebuild has no independent source yet.** On *both* hosts the
+**C. The achievements rebuild has no independent source yet — and cheesetool is not
+it.** CT owns manifests, depot keys, Lua, Hubcap and LuaTools auth; it holds no
+achievement schema and fetches none (checked: no `GetSchemaForGame`, no schema
+store, nothing under `src/` or `cheesetool-sourcer`). Making it the source would
+mean either handing it the same `appcache/stats/UserGameStatsSchema_*.bin` files VF
+already parses — circular — or pointing it at a schema service / a WebAPI key,
+which is precisely the third-party-egress category this project excludes. So the
+flag stays off and nothing is fabricated. The one in-policy path: if CT's sourcer
+ever archives schemas the way it archives manifests, CT would hold an *independent*
+copy and writing definitions becomes both possible and honest.
+ On *both* hosts the
 "local" definition set is derived from the same schema cache the rebuild stands in
 for (`hooks::achievement_local::definitions` and the Windows `reply::definitions`
 both parse the cached schema). So `[achievements] local_rebuild` is off by default
