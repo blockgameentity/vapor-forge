@@ -41,6 +41,11 @@ name = "vapor-forge-pe-probe"
 path = "src/bin/vapor-forge-pe-probe.rs"
 required-features = ["tools"]
 
+[[bin]]
+name = "vapor-forge-vtable-pe"
+path = "src/bin/vapor-forge-vtable-pe/main.rs"
+required-features = ["tools"]
+
 [dependencies]
 iced-x86 = { workspace = true, optional = true }
 keyvalues-parser = { workspace = true, optional = true }
