@@ -24,8 +24,10 @@
 use crate::pe_image::PeImage;
 
 pub mod cross_build;
+pub mod msflow;
 pub mod rtti;
 pub mod scan;
+pub mod shape;
 pub mod structure;
 
 pub use scan::enumerate;

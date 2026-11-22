@@ -108,6 +108,40 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Which tables hold a given function: the inverse of an anchor, used to
+    // check whether a body reached by a call site is a virtual method at all.
+    // An interior address is resolved to its `.pdata` entry first, because that
+    // is what a cross-reference from a disassembly gives you.
+    for rva in &args.holds {
+        let mut probe = *rva;
+        let mut interior = None;
+        if vtable_pe::containing(&enumeration.tables, probe).is_empty() {
+            if let Some(entry) = functions.containing(*rva) {
+                if entry.begin < *rva {
+                    interior = Some(*rva - entry.begin);
+                    probe = entry.begin;
+                }
+            }
+        }
+        let holders = vtable_pe::containing(&enumeration.tables, probe);
+        let prefix = match interior {
+            Some(delta) => format!("holds {rva:#010x} -> entry {probe:#010x} (+{delta:#x})"),
+            None => format!("holds {rva:#010x}"),
+        };
+        if holders.is_empty() {
+            println!("{prefix}: not a slot of any enumerated table");
+        }
+        for table in holders {
+            println!(
+                "{prefix}: table {:#010x} slot {}/{}{}",
+                table.base_rva,
+                table.slot_of(probe).unwrap_or(0),
+                table.len(),
+                describe(table)
+            );
+        }
+    }
+
     for table in dedupe(pending) {
         report_table(&image, &functions, table, &anchors, &labels, &args);
     }

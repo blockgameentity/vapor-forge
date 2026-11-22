@@ -175,6 +175,7 @@ mod tests {
             corpus_against: None,
             against: None,
             class: None,
+            holds: Vec::new(),
             all_slots: false,
             top: 4,
         }

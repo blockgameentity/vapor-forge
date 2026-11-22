@@ -21,6 +21,8 @@ use crate::pe_image::PeImage;
 use crate::probe_facts::{self, Facts};
 
 use crate::pdata::Pdata;
+use crate::vtable_pe::msflow::{self, Flow};
+pub use crate::vtable_pe::shape::shape_of;
 
 /// Used for slots that are inside `.text` but not a `.pdata` entry (import
 /// thunks, `_purecall` stubs): enough bytes to see the shape of the stub.
@@ -63,6 +65,9 @@ pub struct SlotReport {
     /// `index * 0x50` licence stride the Linux body uses.
     pub shift4: u32,
     pub shape: Option<u64>,
+    /// Where each argument goes: stores through it, calls handed it, whether it
+    /// is read as a 32-bit or 64-bit value, and what `al` held at a `ret`.
+    pub flow: Flow,
     /// Direct callees that carry a label: a corpus anchor name, or
     /// `Class#slot` for a known vtable method.
     pub anchored_callees: Vec<String>,
@@ -83,7 +88,7 @@ impl SlotReport {
         };
         format!(
             "slot {:>3} {:#010x} size {size} insns {:<5} | {} | stores {} | loops {} calls {} mul {} \
-| u32@arg {} eq {} stride9 {} stride5 {} shl4 {} bytearg {} | chain {}/{}{} | callees {anchored}",
+| u32@arg {} eq {} stride9 {} stride5 {} shl4 {} bytearg {} | chain {}/{}{} | flow {} | callees {anchored}",
             self.slot,
             self.rva,
             self.facts.insns,
@@ -101,6 +106,7 @@ impl SlotReport {
             self.facts.chain_len,
             self.facts.chain_max_imm,
             if self.facts.computed_branch() { " table" } else { "" },
+            self.flow.summary(),
         )
     }
 }
@@ -146,6 +152,12 @@ pub fn summarise(
         stride5_leas: shapes.stride5_leas,
         shift4: shapes.shift4,
         shape: shape_of(image, begin, end),
+        flow: msflow::analyse(
+            image
+                .bytes_at_rva(u64::from(begin), end.saturating_sub(begin) as usize)
+                .unwrap_or(&[]),
+            begin,
+        ),
         anchored_callees,
     }
 }
@@ -222,53 +234,6 @@ pub fn store_widths(image: &PeImage<'_>, begin: u32, end: u32) -> StoreWidths {
     slot_shapes(image, begin, end).stores
 }
 
-/// Build-shape fingerprint: instruction codes and operand kinds, but not the
-/// operands a rebuild perturbs (branch targets, displacements, immediates).
-///
-/// Duplicated from `bin/vapor-forge-pe-functions.rs::shape_of`, which cannot be
-/// imported from a library module; keep the two in step.
-pub fn shape_of(image: &PeImage<'_>, begin: u32, end: u32) -> Option<u64> {
-    let len = end.saturating_sub(begin) as usize;
-    let code = image.bytes_at_rva(u64::from(begin), len)?;
-    if code.is_empty() {
-        return None;
-    }
-    let mut decoder = Decoder::with_ip(64, code, u64::from(begin), DecoderOptions::NONE);
-    let mut instruction = Instruction::default();
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut decoded = 0usize;
-    while decoder.can_decode() && decoded < 24 {
-        decoder.decode_out(&mut instruction);
-        if instruction.is_invalid() {
-            break;
-        }
-        decoded += 1;
-        mix(&mut hash, u64::from(instruction.code() as u32));
-        mix(&mut hash, u64::from(instruction.op_count()));
-        for index in 0..instruction.op_count() {
-            let value = match instruction.op_kind(index) {
-                OpKind::Register => u64::from(instruction.op_register(index) as u32),
-                OpKind::Memory => {
-                    let base = instruction.memory_base();
-                    if base == iced_x86::Register::None {
-                        0xFFFF
-                    } else {
-                        u64::from(base as u32) + 1
-                    }
-                }
-                other => u64::from(other as u32) + 0x1_0000,
-            };
-            mix(&mut hash, value);
-        }
-    }
-    Some(hash)
-}
-
-fn mix(hash: &mut u64, value: u64) {
-    *hash ^= value;
-    *hash = hash.wrapping_mul(0x100_0000_01b3);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +260,25 @@ mod tests {
         assert_eq!(widths.b1, 1);
         assert_eq!(widths.b8, 1);
         assert_eq!(widths.b2, 0);
+    }
+
+    #[test]
+    fn a_slot_line_carries_the_argument_flow() {
+        // mov [r8], eax / mov eax, 1 / ret -- a store through argument 3 and a
+        // constant return, which is the shape the ticket ranking asks about.
+        let code = [
+            0x41, 0x89, 0x00, // mov [r8], eax
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xC3, // ret
+        ];
+        let end = 0x1000 + code.len() as u32;
+        let bytes = crate::vtable_pe::tests::synthetic_pe(&code, &[], &[(0x1000, end)]);
+        let image = crate::pe_image::PeImage::parse(&bytes).expect("parse");
+        let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
+        let report = summarise(&image, &functions, 3, 0x1000, &BTreeMap::new());
+        assert_eq!(report.flow.stores_through[2], 1);
+        assert_eq!(report.flow.stores_u32_through[2], 1);
+        assert_eq!(report.flow.bool_rets, 1);
+        assert!(report.line().contains("flow thru 2:1 u32thru 2:1"));
     }
 }
