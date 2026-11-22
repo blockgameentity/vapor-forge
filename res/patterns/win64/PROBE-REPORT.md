@@ -26,6 +26,16 @@ extents are upper bounds, and 653 merged extents begin at a non-16-aligned RVA
 (e.g. the userstats candidate `0xa2c0d`), which means the extent is a merge chain
 rather than one clean function.
 
+> **Superseded 2026-11-23.** The rule and the counts above are replaced by the
+> single documented `.pdata` definition in
+> [`README.md`](./README.md#function-identity-the-pdata-rule): the same table now
+> merges to 52,946 functions for this binary (aligned splits of one function are
+> joined, aligned flush entries after a terminating extent are not), and 49,087
+> is the probe's own `< 0x18` sweep filter, not a function count. A non-16-aligned
+> extent is a byte-packed thunk, not evidence of a merge chain. The probe's
+> behaviour measurements are unaffected; only the function identity behind them
+> changed.
+
 ## What is measured
 
 Per function, from one linear decode of the `.pdata` extent:

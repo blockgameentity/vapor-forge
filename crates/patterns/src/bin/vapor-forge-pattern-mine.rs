@@ -17,6 +17,7 @@ use std::process::exit;
 
 use memchr::memchr;
 use sha2::{Digest, Sha256};
+use vapor_forge_patterns::pdata::{self, verify, Pdata};
 use vapor_forge_patterns::pe_image::PeImage;
 use vapor_forge_patterns::registry::parse_toml_patterns;
 use vapor_forge_patterns::scan::{
@@ -46,6 +47,8 @@ struct Args {
     out: Option<PathBuf>,
     max_len: usize,
     verify: Option<PathBuf>,
+    /// Skip the anchor gate (`--allow-unverified-anchors`).
+    allow_unverified: bool,
 }
 
 fn run() -> Result<(), String> {
@@ -53,9 +56,10 @@ fn run() -> Result<(), String> {
     let data = std::fs::read(&args.dll)
         .map_err(|error| format!("read {}: {error}", args.dll.display()))?;
     let image = PeImage::parse(&data)?;
+    let table = pdata::parse(&image, &data).map_err(|error| error.to_string())?;
     let segment = image.code_segment()?;
     if let Some(toml) = args.verify.as_deref() {
-        return verify_file(toml, &segment, &args.module, &args.dll);
+        return verify_file(toml, &image, &table, &segment, &args.module, &args.dll);
     }
     let digest = hex(&Sha256::digest(&data));
 
@@ -80,8 +84,14 @@ fn run() -> Result<(), String> {
         data.len(),
         digest
     ));
-    out.push_str("# Signatures are wildcard-free and uniqueness-checked against this image only;\n");
+    out.push_str(
+        "# Signatures are wildcard-free and uniqueness-checked against this image only;\n",
+    );
     out.push_str("# re-mine per Steam build and record variants when a build stops resolving.\n");
+    out.push_str(
+        "# Each pattern resolves to a .pdata function entry whose body returns or tail-jumps\n\
+         # (the anchor gate, see res/patterns/win64/README.md); anything else is not written.\n",
+    );
     out.push_str("[hotfix]\nformat = 1\n");
     out.push_str(&format!("architecture = \"{}\"\n\n", args.arch));
 
@@ -89,6 +99,8 @@ fn run() -> Result<(), String> {
     let mut ambiguous = 0usize;
     let mut missing = 0usize;
     let mut collided = 0usize;
+    let mut rejected = 0usize;
+    let mut rejected_names = Vec::new();
     let mined = targets
         .into_iter()
         .map(|(target, signatures)| (target, mine(&segment, &signatures, args.max_len)))
@@ -102,23 +114,51 @@ fn run() -> Result<(), String> {
         }
     }
 
-    println!("{:<44} {:<8} {:>8}  {:<12} length", "symbol", "status", "matches", "rva");
+    println!(
+        "{:<44} {:<9} {:>8}  {:<12} {:<6} length",
+        "symbol", "status", "matches", "rva", "gate"
+    );
     for (target, outcome) in mined {
         let outcome = match outcome {
-            MineOutcome::Resolved { pattern: _, rva } if rva_claims.get(&rva).copied().unwrap_or(0) > 1 => {
+            MineOutcome::Resolved { pattern: _, rva }
+                if rva_claims.get(&rva).copied().unwrap_or(0) > 1 =>
+            {
                 MineOutcome::Collide { rva }
             }
             other => other,
         };
         match outcome {
             MineOutcome::Resolved { pattern, rva } => {
+                let rva = u32::try_from(rva)
+                    .map_err(|_| format!("{target}: resolved rva exceeds u32"))?;
+                let verdict = verify(&image, &table, rva);
+                if !verdict.is_verified() && !args.allow_unverified {
+                    rejected += 1;
+                    rejected_names.push(format!("{target} @ {rva:#x}: {}", verdict.label()));
+                    println!(
+                        "{:<44} {:<9} {:>8}  {:#012x} {:<6} anchor gate rejected ({})",
+                        target,
+                        "REJECT",
+                        1,
+                        rva,
+                        verdict.label(),
+                        pattern.iter().flatten().count()
+                    );
+                    continue;
+                }
                 resolved += 1;
+                let status = if verdict.is_verified() {
+                    "OK"
+                } else {
+                    "UNVERIFIED"
+                };
                 println!(
-                    "{:<44} {:<8} {:>8}  {:#012x} {}",
+                    "{:<44} {:<9} {:>8}  {:#012x} {:<6} {}",
                     target,
-                    "OK",
+                    status,
                     1,
                     rva,
+                    verdict.label(),
                     pattern.iter().flatten().count()
                 );
                 out.push_str(&format!(
@@ -130,23 +170,49 @@ fn run() -> Result<(), String> {
             }
             MineOutcome::Ambiguous { matches } => {
                 ambiguous += 1;
-                println!("{:<44} {:<8} {:>8}  -            -", target, "AMB", matches);
+                println!(
+                    "{:<44} {:<9} {:>8}  {:12} {:6} -",
+                    target, "AMB", matches, "-", "-"
+                );
             }
             MineOutcome::Missing => {
                 missing += 1;
-                println!("{:<44} {:<8} {:>8}  -            -", target, "MISS", 0);
+                println!(
+                    "{:<44} {:<9} {:>8}  {:12} {:6} -",
+                    target, "MISS", 0, "-", "-"
+                );
             }
             MineOutcome::Collide { rva } => {
                 collided += 1;
-                println!("{:<44} {:<8} {:>8}  {:#012x} -", target, "COLLIDE", 0, rva);
+                println!(
+                    "{:<44} {:<9} {:>8}  {:#012x} {:6} -",
+                    target, "COLLIDE", 0, rva, "-"
+                );
             }
         }
     }
 
-    let total = resolved + ambiguous + missing + collided;
+    let total = resolved + ambiguous + missing + collided + rejected;
     println!(
-        "\nmined {resolved}/{total} symbols (ambiguous {ambiguous}, collided {collided}, missing {missing})"
+        "\nmined {resolved}/{total} symbols (ambiguous {ambiguous}, collided {collided}, \
+         missing {missing}, rejected by the anchor gate {rejected})"
     );
+    if !rejected_names.is_empty() {
+        eprintln!(
+            "WARNING: the anchor gate rejected {} symbol(s); they are NOT in the output.",
+            rejected_names.len()
+        );
+        eprintln!(
+            "A pattern is corpus-worthy only when it resolves to a function entry whose body"
+        );
+        eprintln!(
+            "returns or tail-jumps. Fix the hint, or pass --allow-unverified-anchors to include"
+        );
+        eprintln!("them anyway:");
+        for name in &rejected_names {
+            eprintln!("  {name}");
+        }
+    }
 
     verify_round_trip(&out, &segment, &args.module)?;
 
@@ -232,9 +298,11 @@ fn find_all(haystack: &[u8], pattern: &[Token]) -> Vec<usize> {
     if pattern.is_empty() || pattern.len() > haystack.len() {
         return sites;
     }
-    let Some((anchor_idx, anchor)) = pattern.iter().enumerate().find_map(|(idx, token)| {
-        token.map(|byte| (idx, byte))
-    }) else {
+    let Some((anchor_idx, anchor)) = pattern
+        .iter()
+        .enumerate()
+        .find_map(|(idx, token)| token.map(|byte| (idx, byte)))
+    else {
         return sites;
     };
     let last_start = haystack.len() - pattern.len();
@@ -262,9 +330,14 @@ fn matches_at(haystack: &[u8], pattern: &[Token], start: usize) -> bool {
         .all(|(idx, token)| token.is_none_or(|byte| haystack[start + idx] == byte))
 }
 
-/// `--verify <toml>`: resolve a shipped corpus against one image and report.
+/// `--verify <toml>`: resolve a shipped corpus against one image, apply the
+/// anchor gate, and report per symbol. Unresolved or gate-rejected patterns
+/// fail the run: a shipped corpus that no longer lands on a real function is a
+/// defect to look at, never something to silently re-mine.
 fn verify_file(
     path: &Path,
+    image: &PeImage<'_>,
+    table: &Pdata,
     segment: &CodeSegment<'_>,
     module: &str,
     dll: &Path,
@@ -285,13 +358,48 @@ fn verify_file(
         report.text_vaddr,
         report.text_size
     );
+    println!(
+        "{:<44} {:<9} {:>8}  {:<12} gate",
+        "symbol", "status", "matches", "rva"
+    );
+    let mut gated = 0usize;
+    let mut bad_gate = Vec::new();
     for entry in &report.entries {
-        println!("{:<44} {:<8} {:>8}", entry.name, entry.status.label(), entry.match_count);
+        let rva = entry
+            .target_offset
+            .and_then(|offset| u32::try_from(report.text_vaddr + offset as u64).ok());
+        let (verdict, shown) = match rva {
+            Some(rva) if entry.status == PatternScanStatus::Ok => {
+                let verdict = verify(image, table, rva);
+                if verdict.is_verified() {
+                    gated += 1;
+                } else {
+                    bad_gate.push(format!("{} @ {rva:#x}: {}", entry.name, verdict.label()));
+                }
+                (verdict.label(), format!("{rva:#012x}"))
+            }
+            _ => ("-", "-".to_owned()),
+        };
+        println!(
+            "{:<44} {:<9} {:>8}  {:<12} {verdict}",
+            entry.name,
+            entry.status.label(),
+            entry.match_count,
+            shown
+        );
     }
     if report.failure_count() != 0 {
         return Err(format!("{} pattern(s) unresolved", report.failure_count()));
     }
-    println!("all {} patterns resolve", report.ok_count());
+    if !bad_gate.is_empty() {
+        return Err(format!(
+            "anchor gate rejected {} of {} resolved pattern(s): {}",
+            bad_gate.len(),
+            report.ok_count(),
+            bad_gate.join(", ")
+        ));
+    }
+    println!("all {} patterns resolve and pass the body gate", gated);
     Ok(())
 }
 
@@ -404,6 +512,7 @@ impl Args {
         let mut out = None;
         let mut max_len = DEFAULT_MAX_LEN;
         let mut verify = None;
+        let mut allow_unverified = false;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -425,6 +534,7 @@ impl Args {
                 "--hints" => hints.push(PathBuf::from(next(&mut args, "--hints")?)),
                 "--out" => out = Some(PathBuf::from(next(&mut args, "--out")?)),
                 "--verify" => verify = Some(PathBuf::from(next(&mut args, "--verify")?)),
+                "--allow-unverified-anchors" => allow_unverified = true,
                 "--max-len" => {
                     let value = next(&mut args, "--max-len")?;
                     max_len = value
@@ -446,6 +556,7 @@ impl Args {
             out,
             max_len,
             verify,
+            allow_unverified,
         })
     }
 }
@@ -457,7 +568,8 @@ fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, S
 
 fn usage() -> String {
     "usage: vapor-forge-pattern-mine --dll <pe> --module steamclient|steamui --arch x86_64|x86 \
-     --hints <toml> [--hints <toml> ..] [--out <toml>] [--max-len 48]"
+     --hints <toml> [--hints <toml> ..] [--out <toml>] [--max-len 48] \
+     [--allow-unverified-anchors]"
         .to_owned()
 }
 

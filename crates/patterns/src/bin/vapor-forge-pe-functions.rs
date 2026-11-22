@@ -17,14 +17,12 @@ use std::path::Path;
 use std::process::exit;
 
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
+use vapor_forge_patterns::pdata::{self, Function, Pdata};
 use vapor_forge_patterns::pe_image::PeImage;
 use vapor_forge_patterns::registry::parse_toml_patterns;
 use vapor_forge_patterns::scan::{
     group_variants, resolve_entry_group_with, select_variants_for_library_path, PatternRef,
 };
-
-const EXCEPTION_DIRECTORY: usize = 3;
-const RUNTIME_FUNCTION_SIZE: usize = 12;
 
 fn main() {
     if let Err(error) = run() {
@@ -38,7 +36,7 @@ fn run() -> Result<(), String> {
     let bytes = std::fs::read(&args.dll)
         .map_err(|error| format!("read {}: {error}", args.dll.display()))?;
     let image = PeImage::parse(&bytes)?;
-    let table = function_table(&image, &bytes)?;
+    let table = pdata::parse(&image, &bytes).map_err(|error| error.to_string())?;
     let anchors = args
         .toml
         .as_deref()
@@ -50,9 +48,12 @@ fn run() -> Result<(), String> {
         "{}: {} functions, text {:#x}..{:#x}",
         args.dll.display(),
         table.len(),
-        table.first().map(|f| f.begin).unwrap_or(0),
-        table.last().map(|f| f.end).unwrap_or(0)
+        table.functions().first().map(|f| f.begin).unwrap_or(0),
+        table.functions().last().map(|f| f.end).unwrap_or(0)
     );
+    if args.metrics {
+        print_metrics(&image, &table);
+    }
 
     if let Some(against) = args.against.as_deref() {
         report_shape_match(&table, &image, against, &anchors)?;
@@ -61,7 +62,7 @@ fn run() -> Result<(), String> {
         report_near(&table, &image, rva, args.window, &anchors);
     }
     if !anchors.is_empty() {
-        report_anchors(&table, &anchors);
+        report_anchors(&image, &table, &anchors);
     }
     if let Some(rva) = args.callees {
         report_callees(&table, &image, rva, &anchors);
@@ -70,46 +71,6 @@ fn run() -> Result<(), String> {
         dump_function(&table, &image, rva);
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Function {
-    begin: u32,
-    end: u32,
-}
-
-fn function_table(image: &PeImage<'_>, bytes: &[u8]) -> Result<Vec<Function>, String> {
-    let (rva, size) = image
-        .data_directory(EXCEPTION_DIRECTORY)
-        .filter(|(_, size)| *size > 0)
-        .ok_or_else(|| "image has no exception directory (.pdata)".to_owned())?;
-    let offset = image
-        .rva_to_offset(u64::from(rva))
-        .ok_or_else(|| "exception directory RVA is not mapped".to_owned())?;
-    let count = size as usize / RUNTIME_FUNCTION_SIZE;
-    let mut functions = Vec::with_capacity(count);
-    for index in 0..count {
-        let at = offset + index * RUNTIME_FUNCTION_SIZE;
-        let entry = bytes
-            .get(at..at + RUNTIME_FUNCTION_SIZE)
-            .ok_or_else(|| "exception directory entry past EOF".to_owned())?;
-        let begin = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-        let end = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        if end > begin {
-            functions.push(Function { begin, end });
-        }
-    }
-    functions.sort_by_key(|f| f.begin);
-    // `.pdata` may split one function into contiguous regions (prolog fragment +
-    // body). Merge them, otherwise a body looks like a 23-byte stub.
-    let mut merged: Vec<Function> = Vec::with_capacity(functions.len());
-    for function in functions {
-        match merged.last_mut() {
-            Some(last) if last.end == function.begin => last.end = function.end,
-            _ => merged.push(function),
-        }
-    }
-    Ok(merged)
 }
 
 /// Resolve a mined corpus against the image and keep `name -> function begin`.
@@ -148,40 +109,65 @@ fn anchors_of(
     Ok(anchors)
 }
 
-fn report_anchors(table: &[Function], anchors: &BTreeMap<String, u32>) {
-    let index: BTreeMap<u32, &Function> = table.iter().map(|f| (f.begin, f)).collect();
+fn report_anchors(image: &PeImage<'_>, table: &Pdata, anchors: &BTreeMap<String, u32>) {
     let mut on_entry = 0usize;
+    let mut gated = 0usize;
     for (name, rva) in anchors {
-        match index.get(rva) {
-            Some(function) => {
-                on_entry += 1;
+        let verdict = pdata::verify(image, table, *rva);
+        // `Unmapped` and `MidFunction` are both off-entry; `MidFunction` names
+        // the extent the hit fell inside.
+        if matches!(
+            verdict,
+            pdata::AnchorVerdict::Verified { .. } | pdata::AnchorVerdict::NoTerminator { .. }
+        ) {
+            on_entry += 1;
+        }
+        match verdict {
+            pdata::AnchorVerdict::Verified { function, body } => {
+                gated += 1;
                 println!(
-                    "  {name:<44} {rva:#010x} entry ok  size {}",
-                    function.end - function.begin
+                    "  {name:<44} {rva:#010x} entry ok  size {:<6} body: {}",
+                    function.len(),
+                    body.label()
                 );
             }
-            None => {
-                let containing = table
-                    .iter()
-                    .find(|f| *rva > f.begin && *rva < f.end)
-                    .map(|f| f.begin);
-                println!("  {name:<44} {rva:#010x} NOT an entry (inside {containing:x?})");
+            pdata::AnchorVerdict::MidFunction { function } => println!(
+                "  {name:<44} {rva:#010x} NOT an entry (inside {:#x}, +{:#x})",
+                function.begin,
+                *rva - function.begin
+            ),
+            pdata::AnchorVerdict::NoTerminator { function, body } => println!(
+                "  {name:<44} {rva:#010x} entry ok  size {:<6} body: {} (gate rejects)",
+                function.len(),
+                body.label()
+            ),
+            pdata::AnchorVerdict::Unmapped => {
+                println!("  {name:<44} {rva:#010x} NOT an entry (not in .pdata)")
             }
         }
     }
     println!(
-        "anchors on a function entry: {on_entry}/{}",
+        "anchors on a function entry: {on_entry}/{}; passing the body gate: {gated}/{}",
+        anchors.len(),
         anchors.len()
     );
 }
 
-fn report_callees(
-    table: &[Function],
-    image: &PeImage<'_>,
-    rva: u32,
-    anchors: &BTreeMap<String, u32>,
-) {
-    let Some(function) = table.iter().find(|f| f.begin == rva) else {
+/// Dump the table metrics the merge rule is defined against, plus what a linear
+/// decode of every extent says about it. This is the evidence `README.md` quotes.
+fn print_metrics(image: &PeImage<'_>, table: &Pdata) {
+    let metrics = table.metrics();
+    println!(".pdata: {metrics}");
+    let (terminating, thunks, unbacked) = pdata::body_summary(image, table);
+    println!(
+        "  bodies: {terminating} terminate (ret or tail jump), {thunks} are tail-jump thunks \
+         (<= {:#x} B), {unbacked} extents are not file-backed",
+        pdata::THUNK_MAX_BYTES
+    );
+}
+
+fn report_callees(table: &Pdata, image: &PeImage<'_>, rva: u32, anchors: &BTreeMap<String, u32>) {
+    let Some(function) = table.functions().iter().find(|f| f.begin == rva) else {
         println!("rva {rva:#x} is not a function entry");
         return;
     };
@@ -203,7 +189,7 @@ fn report_callees(
         callers.values().sum::<usize>()
     );
     for (target, count) in callers {
-        let entry = table.iter().find(|f| f.begin == target);
+        let entry = table.functions().iter().find(|f| f.begin == target);
         let label = by_target.get(&target).copied().unwrap_or("-");
         match entry {
             Some(f) => println!(
@@ -246,7 +232,8 @@ fn disassemble(image: &PeImage<'_>, function: Function) -> Vec<Decoded> {
             None
         };
         let is_load = instruction.op0_kind() != OpKind::Memory
-            && (0..instruction.op_count()).any(|index| instruction.op_kind(index) == OpKind::Memory);
+            && (0..instruction.op_count())
+                .any(|index| instruction.op_kind(index) == OpKind::Memory);
         out.push(Decoded {
             flow: instruction.flow_control(),
             branch_target,
@@ -294,24 +281,24 @@ fn shape_hash(instruction: &Instruction) -> u64 {
 }
 
 fn report_shape_match(
-    table: &[Function],
+    table: &Pdata,
     image: &PeImage<'_>,
     against: &Path,
     anchors: &BTreeMap<String, u32>,
 ) -> Result<(), String> {
-    let other_bytes = std::fs::read(against)
-        .map_err(|error| format!("read {}: {error}", against.display()))?;
+    let other_bytes =
+        std::fs::read(against).map_err(|error| format!("read {}: {error}", against.display()))?;
     let other = PeImage::parse(&other_bytes)?;
-    let other_table = function_table(&other, &other_bytes)?;
+    let other_table = pdata::parse(&other, &other_bytes).map_err(|error| error.to_string())?;
     let mut other_shapes: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    for function in &other_table {
+    for function in other_table.functions() {
         other_shapes
             .entry(shape_of(&other, *function))
             .or_default()
             .push(function.begin);
     }
     let mut matched = 0usize;
-    for function in table {
+    for function in table.functions() {
         if other_shapes.contains_key(&shape_of(image, *function)) {
             matched += 1;
         }
@@ -328,7 +315,7 @@ fn report_shape_match(
     if !anchors.is_empty() {
         let (mut unique, mut none, mut multi) = (0, 0, 0);
         for (name, rva) in anchors {
-            let Some(function) = table.iter().find(|f| f.begin == *rva) else {
+            let Some(function) = table.functions().iter().find(|f| f.begin == *rva) else {
                 continue;
             };
             match other_shapes
@@ -356,8 +343,8 @@ fn report_shape_match(
 }
 
 /// Print the instructions of one function (verification aid for a mined anchor).
-fn dump_function(table: &[Function], image: &PeImage<'_>, rva: u32) {
-    let Some(function) = table.iter().find(|f| f.begin == rva) else {
+fn dump_function(table: &Pdata, image: &PeImage<'_>, rva: u32) {
+    let Some(function) = table.functions().iter().find(|f| f.begin == rva) else {
         println!("rva {rva:#x} is not a function entry");
         return;
     };
@@ -370,7 +357,11 @@ fn dump_function(table: &[Function], image: &PeImage<'_>, rva: u32) {
         "dump {rva:#x}..{:#x} ({} bytes){}",
         function.end,
         len,
-        if is_thunk(image, *function) { " [thunk: tail jmp]" } else { "" }
+        if pdata::is_thunk(image, *function) {
+            " [thunk: tail jmp]"
+        } else {
+            ""
+        }
     );
     let mut decoder = Decoder::with_ip(64, code, u64::from(function.begin), DecoderOptions::NONE);
     let mut instruction = Instruction::default();
@@ -389,21 +380,11 @@ fn dump_function(table: &[Function], image: &PeImage<'_>, rva: u32) {
     }
 }
 
-/// A short function that ends in an unconditional jump is a tail-call stub; the
-/// real body lives at the branch target.
-fn is_thunk(image: &PeImage<'_>, function: Function) -> bool {
-    let decoded = disassemble(image, function);
-    function.end - function.begin <= 32
-        && decoded
-            .last()
-            .is_some_and(|d| d.flow == FlowControl::UnconditionalBranch)
-}
-
 /// Describe the functions around an anchor: size, shape of the body, and which
 /// anchored functions it calls. Used to derive symbols that were never published
 /// as hints, by structural comparison with their class siblings.
 fn report_near(
-    table: &[Function],
+    table: &Pdata,
     image: &PeImage<'_>,
     rva: u32,
     window: u32,
@@ -413,12 +394,13 @@ fn report_near(
     let low = rva.saturating_sub(window);
     let high = rva.saturating_add(window);
     println!("functions near {rva:#x} (+-{window:#x}):");
-    for function in table.iter().filter(|f| f.begin >= low && f.begin <= high) {
+    for function in table
+        .functions()
+        .iter()
+        .filter(|f| f.begin >= low && f.begin <= high)
+    {
         let decoded = disassemble(image, *function);
-        let stores = decoded
-            .iter()
-            .filter(|d| d.store_bits == Some(32))
-            .count();
+        let stores = decoded.iter().filter(|d| d.store_bits == Some(32)).count();
         let loads = decoded.iter().filter(|d| d.is_load).count();
         let callees = decoded
             .iter()
@@ -457,6 +439,7 @@ struct Args {
     near: Option<u32>,
     window: u32,
     dump: Option<u32>,
+    metrics: bool,
 }
 
 impl Args {
@@ -467,6 +450,7 @@ impl Args {
         let mut against = None;
         let mut near = None;
         let mut dump = None;
+        let mut metrics = false;
         let mut window = 0x400;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -492,6 +476,7 @@ impl Args {
                     let value = next(&mut args, "--window")?;
                     window = parse_rva(&value)?;
                 }
+                "--metrics" => metrics = true,
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unexpected argument {other:?}\n{}", usage())),
             }
@@ -504,6 +489,7 @@ impl Args {
             near,
             window,
             dump,
+            metrics,
         })
     }
 }
@@ -520,7 +506,7 @@ fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, S
 
 fn usage() -> String {
     "usage: vapor-forge-pe-functions --dll <pe> [--toml <corpus.toml>] [--callees <rva>] \
-     [--against <other-pe>] [--near <rva>] [--window <hex>] [--dump <rva>]"
+     [--against <other-pe>] [--near <rva>] [--window <hex>] [--dump <rva>] [--metrics]"
         .to_owned()
 }
 

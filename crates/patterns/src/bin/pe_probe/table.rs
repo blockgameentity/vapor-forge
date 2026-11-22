@@ -1,52 +1,23 @@
 //! The `.pdata` function table, and a disassembly dump for confirming a
 //! candidate by reading it.
 //!
-//! `RUNTIME_FUNCTION` entries are read the same way `vapor-forge-pe-functions`
-//! reads them: contiguous regions of one function (prolog fragment, body,
-//! funclets) are merged, because a 20-byte fragment on its own is not a function
-//! and would make every behavioural count meaningless.
+//! The table comes from [`vapor_forge_patterns::pdata`], which owns the single
+//! definition of a function extent (contiguous funclet/cold-fragment merge, see
+//! the module docs there). The probe previously carried its own copy of that
+//! parser; keeping two made a `.pdata` fragment look like a function to one tool
+//! and not the other.
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
+use vapor_forge_patterns::pdata;
 use vapor_forge_patterns::pe_image::PeImage;
 
-const EXCEPTION_DIRECTORY: usize = 3;
-const RUNTIME_FUNCTION_SIZE: usize = 12;
+pub use vapor_forge_patterns::pdata::Function;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Function {
-    pub begin: u32,
-    pub end: u32,
-}
-
+/// The merged function extents of `image`, per the shared `.pdata` rule.
 pub fn function_table(image: &PeImage<'_>, bytes: &[u8]) -> Result<Vec<Function>, String> {
-    let (rva, size) = image
-        .data_directory(EXCEPTION_DIRECTORY)
-        .filter(|(_, size)| *size > 0)
-        .ok_or_else(|| "image has no exception directory (.pdata)".to_owned())?;
-    let offset = image
-        .rva_to_offset(u64::from(rva))
-        .ok_or_else(|| "exception directory RVA is not mapped".to_owned())?;
-    let mut functions = Vec::with_capacity(size as usize / RUNTIME_FUNCTION_SIZE);
-    for index in 0..size as usize / RUNTIME_FUNCTION_SIZE {
-        let at = offset + index * RUNTIME_FUNCTION_SIZE;
-        let Some(entry) = bytes.get(at..at + RUNTIME_FUNCTION_SIZE) else {
-            return Err("exception directory entry past EOF".to_owned());
-        };
-        let begin = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-        let end = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        if end > begin {
-            functions.push(Function { begin, end });
-        }
-    }
-    functions.sort_by_key(|function| function.begin);
-    let mut merged: Vec<Function> = Vec::with_capacity(functions.len());
-    for function in functions {
-        match merged.last_mut() {
-            Some(last) if last.end == function.begin => last.end = function.end,
-            _ => merged.push(function),
-        }
-    }
-    Ok(merged)
+    pdata::parse(image, bytes)
+        .map(|table| table.functions().to_vec())
+        .map_err(|error| error.to_string())
 }
 
 pub fn dump(image: &PeImage<'_>, table: &[Function], rva: u32) -> Result<(), String> {
