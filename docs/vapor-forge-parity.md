@@ -52,13 +52,14 @@ signature that resolves on the current public build.
 | Achievements | `client/{achievement,user_stats}.rs` (now calls the local rebuild) | ❌ body absent | ❌ stats path refuted: no slot writes N u32s through a pointer |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 9 of 21 capabilities have a body, all 9 installable**; 7 more
-have a tested decision with no anchor. Linux implements ~19 and now consults the
-shared family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
+Counts: **Windows 16 of 21 capabilities have a body, all 16 installable**; 3 more
+have a tested decision with no anchor (`SteamIdOverride`, `ConflictUiBridge`,
+`Achievements`). Linux implements ~19 and now consults the shared
+family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
-Corpus coverage: Linux ships **34** symbols, Windows **32** (public 25 + 7, beta
-24 + 5). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
+Corpus coverage: Linux ships **34** symbols, Windows **34** (public 26 + 8, beta
+25 + 6). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
 x64 licence stride), `CUser::BuildSpawnEnvBlock` (candidate, found by its 63 env-key
 strings and its caller), and the real dispatch site — `CCMInterface::RecvPkt`,
 a two-level MSVC jump table over EMsg `0x2f3..0x370` (the `CNetPacket::*` tables
@@ -66,11 +67,10 @@ were refuted: no slot holds an indirect jump).
 
 ## 3. Gap classes, and what each one costs
 
-**A. No body (wiring).** The capability is named, the anchor exists, nothing
-implements it: `ShaderCacheControl`, `DlcOverrides`, `CallbackEvents`,
-`CloudHttp`, `LegacyCdKeyControl`, `SteamIdOverride`, `ConflictUiBridge`,
-`LaunchEnvironment`. Linux has a working reference for each. This is mechanical
-work — one body plus its decide function and tests per capability.
+**A. No body (wiring) — closed.** Every capability with an anchor now has a body
+(`ShaderCacheControl`, `DlcOverrides`, `CallbackEvents`, `CloudHttp`,
+`LegacyCdKeyControl`, `LaunchEnvironment`, `OverviewMetadata`, `LibrarySnapshot`,
+plus the original eight).
 
 **B. No anchor (corpus).** Two symbols remain without one: `CUser::GetSteamID`
 (blocks `SteamIdOverride`) and `RegisterJsMethod` (blocks `ConflictUiBridge`).
