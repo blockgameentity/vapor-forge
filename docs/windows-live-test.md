@@ -110,16 +110,18 @@ These are known, not bugs to chase:
 - **`ticket-overrides` installs** as of the vtable mining pass
   (`CUser::GetAppTicket`, both live builds). If it still disables itself, the
   report's reason is the evidence to send back.
-- **`achievements` disables itself.** The stats path has no anchor: the direct
-  method was refuted, and the remaining lead (`CAPIJobRequestUserStats`) has a
-  different call shape than the hooks assume.
+- **`achievements` disables itself.** The stats path is a job chain
+  (`CAPIJobRequestUserStats::{BInit,YieldingMergeStats}` are anchored) and has no
+  read-side counterpart of the Linux hook, so the rebuild stays a decision until a
+  merge-site hook shape exists.
 - **No request-code skip yet.** The dispatch site is now anchored
   (`CCMInterface::RecvPkt`, a two-level jump table over EMsg `0x2f3..0x370`) but no
   body consumes it, so Steam's own request-code round trip still happens; the
   depotcache pre-seed is consulted at `GetDecryptionKey` instead.
-- **Corpus coverage is partial:** 19 of 26 hint symbols in `steamclient64.dll`
-  (public; 18 on beta) and 8 of 10 in `SteamUI.dll`. Unresolved symbols disable
-  only their own capability.
+- **Corpus coverage:** 28 symbols in `steamclient64.dll` public (27 beta) and 7 in
+  `SteamUI.dll` (5 beta), including the `CNetPacket` layout family, so the
+  request-code body can decode packet fields. Unresolved symbols disable only their
+  own capability.
 - `CUser::GetSubscribedApps` is anchored at CUser slot 183 (confirmed by the x64
   licence stride) but has **no body**, so it stays uninstalled.
 

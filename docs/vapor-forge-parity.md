@@ -58,8 +58,9 @@ have a tested decision with no anchor (`SteamIdOverride`, `ConflictUiBridge`,
 family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
-Corpus coverage: Linux ships **34** symbols, Windows **34** (public 26 + 8, beta
-25 + 6). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
+Corpus coverage: Linux ships **34** symbols, Windows **35** (public 28 + 7, beta
+27 + 5). The `CNetPacket` layout family (`Init`/`Alloc`/`Release`) is now anchored
+too, with the packet field offsets decoded identically in both builds. Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
 x64 licence stride), `CUser::BuildSpawnEnvBlock` (candidate, found by its 63 env-key
 strings and its caller), and the real dispatch site — `CCMInterface::RecvPkt`,
 a two-level MSVC jump table over EMsg `0x2f3..0x370` (the `CNetPacket::*` tables
@@ -72,8 +73,9 @@ were refuted: no slot holds an indirect jump).
 `LegacyCdKeyControl`, `LaunchEnvironment`, `OverviewMetadata`, `LibrarySnapshot`,
 plus the original eight).
 
-**B. No anchor (corpus).** Two symbols remain without one: `CUser::GetSteamID`
-(blocks `SteamIdOverride`) and `RegisterJsMethod` (blocks `ConflictUiBridge`).
+**B. No anchor (corpus).** Two symbols remain without one, both negative after a
+full pass: `CUser::GetSteamID` (blocks `SteamIdOverride`) and `RegisterJsMethod`
+(blocks `ConflictUiBridge`).
 The **stats path turned out to be a job chain, not a per-stat writer**:
 `CUserStats` slot 6 constructs a `CAPIJobRequestUserStats`, whose `BInit` and
 `YieldingMergeStats` are now anchored (public `0xa8fd20`/`0xaa0420`, beta
