@@ -106,13 +106,13 @@ denuvo_detection = false
 # be skipped.
 [manifest]
 providers = []
-# Try the next provider when one fails. Off by default: with failover off only
-# the first entry of `providers` is ever contacted, so the gid lookups of a
-# controlled app cannot silently travel to a host you did not choose. A failed
-# lookup is then reported against that one provider and Steam gets no code.
-# Turning this on (failover = true) walks the list in the order written, logs
-# every attempt at info level with the provider name and its outcome, and
-# reports which provider served each code.
+# Try the next provider when one fails. The host tool that writes `providers`
+# (cheesetool) owns this flag and normally sets it true, so a depot one host
+# cannot serve falls through to the next enabled host; only hosts the user left
+# enabled are ever contacted, every attempt is logged at info level with the
+# provider name and outcome, and the provider that served each code is reported
+# back. A standalone install with no host keeps the conservative value: false
+# means only the first entry is contacted and a failure is final.
 failover = false
 timeout_connect_ms = 5000
 timeout_ms = 15000
