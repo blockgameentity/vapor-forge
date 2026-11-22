@@ -89,7 +89,14 @@ The **stats path turned out to be a job chain, not a per-stat writer**:
 can install. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
-**C. Unverified ABI.** Everything below the planner assumes MS-x64 argument
+**C. Platform shape differences.** The family lock is the clearest example: Linux
+queries `CFamilySharing::GetLockingAccount`, Windows has no such class and instead
+keeps a `m_mapFamilyRunningApps` map updated by `CUser::UpdateFamilyRunningApps`,
+queried through `CUser::GetFamilySharedLockAccount`. Same capability, different
+carrier — the port had to find the Windows function rather than translate the
+Linux one.
+
+**D. Unverified ABI.** Everything below the planner assumes MS-x64 argument
 shapes taken from the Linux host. See `docs/windows-live-test.md` §4 for the list
 and the observable that confirms or refutes each.
 
