@@ -35,6 +35,8 @@ pub mod install;
 pub mod lifecycle;
 pub mod module;
 pub mod proxy;
+#[cfg(test)]
+mod test_lock;
 pub mod thread;
 
 use thiserror::Error;

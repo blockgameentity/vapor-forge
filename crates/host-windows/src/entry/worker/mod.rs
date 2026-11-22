@@ -162,7 +162,13 @@ pub fn run(
             env.ticket_dir(),
             DepotPlan::new(env.depotcache_dir(), Vec::new()),
         )
-        .with_lua_tickets(lua_tickets),
+        .with_lua_tickets(lua_tickets)
+        // The three inputs the hook bodies cannot derive themselves: the cloud plan
+        // (one decision, made once), the Lua depot keys the shader decision needs,
+        // and the per-game ids the SteamID decision presents.
+        .with_cloud_plan(crate::features::plan_cloud(&settings.cloud))
+        .with_depot_keys(script.depot_keys.clone())
+        .with_identity_settings(settings.identity.clone()),
     );
     // Published before any entry is patched: a body reached during the batch
     // sees the real configuration, and the gate is tightened as soon as the

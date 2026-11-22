@@ -33,6 +33,7 @@ use crate::abi::ownership::CAppOwnershipInfo;
 use crate::abi::ownership::CheckAppOwnershipFn;
 use crate::abi::ret;
 use crate::capability::Capability;
+use crate::hooks::family_play;
 use crate::hooks::original;
 use crate::hooks::state::{self, HostState};
 
@@ -115,6 +116,13 @@ pub fn decide(
     let real = apps::provenance(caller, injected_by_us, self_account, settings);
     let label = reported(real, config, caller);
 
+    // Concurrent play: the record is what says a lender holds the app, and
+    // `features::family::concurrent` is the one owner of the answer. The share bit
+    // is still Steam's at this point - the policy below is what clears it - so the
+    // consult sees exactly what Steam reported. The decision logs its own reason.
+    let lock = family_play::lock(record.is_family_shared(), apps::family_owner(caller));
+    let concurrent = family_play::consult(state, caller, lock);
+
     // A lender we can name is the only thing that may stamp a borrower marker;
     // an unverifiable family claim is decided by `provenance`, not by this body.
     if let Some(lender) = lender_account(apps::family_owner(caller), self_account) {
@@ -137,6 +145,7 @@ pub fn decide(
         reason = label.reason,
         lock_unlocked = label.lock_unlocked,
         granted = decision.grant_spoofed_ownership,
+        concurrent = concurrent.map_or("-", |concurrent| concurrent.reason.label()),
         "ownership decision applied"
     );
     Some(decision.result)
