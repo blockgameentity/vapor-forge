@@ -7,6 +7,7 @@ pub mod cloud;
 pub mod depot_key;
 pub mod depotcache;
 pub mod dlc;
+pub mod family;
 pub mod identity;
 pub mod inject_wake;
 pub(crate) mod launch_options;
