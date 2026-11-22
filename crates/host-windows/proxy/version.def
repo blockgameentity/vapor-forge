@@ -1,0 +1,44 @@
+; Static export surface of the `version.dll` proxy.
+;
+; This is the documented Win32 `version.dll` surface: 16 named exports, no
+; ordinal-only exports. Every line is a PE export forwarder, so the proxy emits
+; no forwarding code of its own - the Windows loader resolves each name straight
+; into the real system module.
+;
+; The target is written as the System32 path, not as the bare module name. A
+; bare `version.dll` forwarder resolves through the default search order, which
+; finds the proxy itself in Steam's directory first and recurses forever; the
+; qualified path can only mean the real module. In a 32-bit (WoW64) process the
+; loader's file-system redirection turns the same string into
+; `C:\Windows\SysWOW64\version.dll`, which is the right module there.
+;
+; A missing export is not a build error: the client keeps running, and the first
+; Steam call into the missing name fails inside the loader. So the list has to
+; be complete, and a client update that adds an export must be noticed. That is
+; what `crates/host-windows/src/proxy.rs::plan()` is for: it reads the export
+; directory of a real module and can regenerate this list on any machine, from
+; the example `cargo run -p vapor-forge-host-windows --example proxy_plan --
+; <module.dll> version.dll --emit-def`. Re-run it against the shipped
+; `version.dll` if a build turns out to need one more export, then diff.
+;
+; GNU ld cannot express a path containing `\` in a forwarder (it splits the line
+; on the backslash), so the path uses forward slashes. The Windows loader
+; accepts them.
+LIBRARY version.dll
+EXPORTS
+  GetFileVersionInfoA=C:/Windows/System32/version.dll.GetFileVersionInfoA
+  GetFileVersionInfoW=C:/Windows/System32/version.dll.GetFileVersionInfoW
+  GetFileVersionInfoExA=C:/Windows/System32/version.dll.GetFileVersionInfoExA
+  GetFileVersionInfoExW=C:/Windows/System32/version.dll.GetFileVersionInfoExW
+  GetFileVersionInfoSizeA=C:/Windows/System32/version.dll.GetFileVersionInfoSizeA
+  GetFileVersionInfoSizeW=C:/Windows/System32/version.dll.GetFileVersionInfoSizeW
+  GetFileVersionInfoSizeExA=C:/Windows/System32/version.dll.GetFileVersionInfoSizeExA
+  GetFileVersionInfoSizeExW=C:/Windows/System32/version.dll.GetFileVersionInfoSizeExW
+  VerFindFileA=C:/Windows/System32/version.dll.VerFindFileA
+  VerFindFileW=C:/Windows/System32/version.dll.VerFindFileW
+  VerInstallFileA=C:/Windows/System32/version.dll.VerInstallFileA
+  VerInstallFileW=C:/Windows/System32/version.dll.VerInstallFileW
+  VerLanguageNameA=C:/Windows/System32/version.dll.VerLanguageNameA
+  VerLanguageNameW=C:/Windows/System32/version.dll.VerLanguageNameW
+  VerQueryValueA=C:/Windows/System32/version.dll.VerQueryValueA
+  VerQueryValueW=C:/Windows/System32/version.dll.VerQueryValueW
