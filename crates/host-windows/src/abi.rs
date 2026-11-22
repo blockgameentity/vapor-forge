@@ -26,7 +26,16 @@
 //!    `bool` in `al`; constructing a `bool` from a byte we did not produce would
 //!    be undefined behaviour, so the trampoline types return `u8` and every body
 //!    produces its own `0`/`1`.
+//!
+//! One module here documents a shape with no body behind it:
+//! [`achievements`] records the two anchored `CAPIJobRequestUserStats` sites, the
+//! per-build job-object offsets they would have to read, and the measurement that
+//! currently rules a replacement body out. It is the one place where a
+//! *Verified* fact is derived from the whole anchored function rather than from
+//! the pattern's store widths, because the pattern alone cannot express "this
+//! method only reads `rcx`".
 
+pub mod achievements;
 pub mod callbacks;
 pub mod cloud;
 pub mod depot;

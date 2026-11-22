@@ -12,9 +12,12 @@
 //! `achievements` capability is enabled.
 //!
 //! [`rebuild`] is the other half: the decision that would answer a stats reply with
-//! a locally rebuilt payload. It is decision-only — the win64 corpus anchors no
-//! stats symbol, so there is nothing to install a body at — and it calls the
-//! feature's own `rebuild_local_achievements_if_enabled` rather than a copy of it.
+//! a locally rebuilt payload. Both of the win64 stats-job sites it would sit at are
+//! anchored now (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`), and
+//! `crate::abi::achievements` measures why neither can carry the body yet — so the
+//! decision stays decision-only, calls the feature's own
+//! `rebuild_local_achievements_if_enabled` rather than a copy of it, and is not
+//! registered in [`crate::hooks::REPLACEMENTS`].
 
 use crate::features::report::FeatureState;
 use vapor_forge_features::achievements::{local_rebuild_enabled, set_local_rebuild};

@@ -47,6 +47,17 @@
 //! anchor never installs, and registering one would make the install report claim a
 //! hook it does not have.
 //!
+//! `achievements` is the third, and a different case: its decision lives in
+//! [`crate::features::achievements`], its two candidate sites are **anchored**
+//! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`, both live builds),
+//! and there is still no body — the reply the rebuild would answer has already been
+//! parsed by the time either site runs, and the stats block it would replace is
+//! written by inlined dictionary code that no pattern can resolve to a function.
+//! `crate::abi::achievements` records the disassembly, the per-build job-object
+//! offsets and what a hook would need instead; `install::deps` maps both symbols to
+//! `Capability::Achievements`, so a live install reports the capability disabled
+//! with the truthful "no replacement body" reason rather than claiming a hook.
+//!
 //! [`family_play`] is the one decision that is not a hook: it is the concurrent-play
 //! consult that [`ownership`] and [`package`] call.
 
@@ -223,6 +234,26 @@ mod tests {
                 replacement_address(symbol),
                 None,
                 "{symbol} has no anchor, so it must not carry a body"
+            );
+        }
+    }
+
+    #[test]
+    fn the_anchored_stats_job_carries_no_body_yet() {
+        // The achievements decision is the one that has anchors and no body: both
+        // job sites resolve in both live builds, and neither can carry the rebuild
+        // (see `crate::abi::achievements`). The capability's gate follows this
+        // table, so the assertion is also what keeps the install report honest:
+        // the day either body is written, this test fails and the report starts
+        // saying `achievements` is on.
+        for symbol in [
+            crate::abi::achievements::BINIT_SYMBOL,
+            crate::abi::achievements::MERGE_SYMBOL,
+        ] {
+            assert_eq!(
+                replacement_address(symbol),
+                None,
+                "{symbol} must not be claimed as installable while it has no body"
             );
         }
     }

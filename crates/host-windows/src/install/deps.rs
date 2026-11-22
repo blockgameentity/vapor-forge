@@ -6,6 +6,7 @@
 //! installed (new corpus entries should not be dropped) but carry no gate
 //! dependency yet.
 
+use crate::abi::achievements;
 use crate::capability::Capability;
 
 /// One symbol and the capabilities that stop working when it does not install.
@@ -29,7 +30,24 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         &[Capability::DepotInjection],
     ),
     ("CUser::GetAppTicket", &[Capability::TicketOverrides]),
-    ("CUser::GetUserStats", &[Capability::Achievements]),
+    // The stats path is a job chain, not a getter: `CUserStats` slot 6
+    // constructs a `CAPIJobRequestUserStats`, its run method (`BInit`) sends the
+    // request and calls the response parser and the merge, and
+    // `YieldingMergeStats` merges the parsed reply. Both are anchored in both
+    // live builds. The name this table used to carry, `CUser::GetUserStats`, is
+    // refuted by `res/patterns/win64/VTABLE-REPORT.md` §1: it appears in neither
+    // module and no slot has its shape, so it described a dependency the install
+    // pass could never satisfy.
+    //
+    // Neither job symbol has a body yet (`crate::abi::achievements` records the
+    // measurement that rules one out, and what a hook would need instead), so a
+    // live install reports `achievements` as disabled with "no replacement body
+    // for it yet" — which is the truth. Listing them here is what makes an
+    // anchor that stops resolving cost the capability instead of passing
+    // silently; the day a body is written, the same row keeps the gate honest
+    // without an edit.
+    (achievements::BINIT_SYMBOL, &[Capability::Achievements]),
+    (achievements::MERGE_SYMBOL, &[Capability::Achievements]),
     (
         "CloseAppCloud",
         &[Capability::CloudControl, Capability::CloudHttp],
@@ -116,6 +134,32 @@ mod tests {
     #[test]
     fn unknown_symbols_have_no_dependency() {
         assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
+    }
+
+    #[test]
+    fn the_stats_job_symbols_gate_achievements_and_nothing_else() {
+        // The two anchored sites of the job chain `VTABLE-REPORT.md` §1 measures.
+        // Both are the same capability's dependency: an install that resolves only
+        // one of them still has no achievements path, so a failure at either is
+        // one disabled feature, not two.
+        for symbol in [
+            crate::abi::achievements::BINIT_SYMBOL,
+            crate::abi::achievements::MERGE_SYMBOL,
+        ] {
+            assert_eq!(
+                capabilities_for_symbol(symbol),
+                &[Capability::Achievements],
+                "{symbol} must gate achievements"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refuted_getter_is_not_a_dependency_any_more() {
+        // The table used to name `CUser::GetUserStats`. Keeping it would have read
+        // as a dependency the install pass can satisfy, while the symbol exists in
+        // no live build.
+        assert!(capabilities_for_symbol("CUser::GetUserStats").is_empty());
     }
 
     #[test]

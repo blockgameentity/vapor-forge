@@ -1,29 +1,61 @@
-//! The local achievement rebuild — **decision ready, no anchor**.
+//! The local achievement rebuild — **decision ready, both job sites anchored,
+//! still no body**.
 //!
 //! `features::achievements::local` rebuilds a stats reply's achievement payload
 //! from locally known definitions when the schema path cannot describe it. The
-//! Linux host reaches it from its stats hook
-//! (`crates/hooks/src/client/achievement_local.rs::reply_for`): it keeps Steam's
-//! schema when there is one, and otherwise answers with the rebuilt page.
+//! Linux host reaches it from the reply path it owns
+//! (`crates/hooks/src/netpacket/stats_proxy.rs::inject_merged_stats_response` →
+//! `client::achievement::local_reply`): it keeps Steam's schema when there is
+//! one, and otherwise answers with the rebuilt page, encoded by
+//! `RebuiltAchievements::{service_response, legacy_response}` into the packet body
+//! about to be queued.
 //!
-//! # Why there is no body here
+//! # Both job sites, and why neither carries a body yet
 //!
-//! The win64 corpus resolves no stats symbol in either live build. Both corpus
-//! files (`res/patterns/win64/steamclient/669fa08e….toml` and `4a2d7952….toml`)
-//! name 18 steamclient symbols and **none** is on the stats or achievement path;
-//! `res/patterns/win64/VTABLE-REPORT.md` §4 measures why a vtable anchor will not
-//! supply one either — `CUserStats` and `CGameStats` have no slot that writes N
-//! 32-bit values through a pointer argument, `CUser::GetUserStats` has no string to
-//! label it, and the path is a `CAPIJobRequestUserStats` job pair rather than a
-//! virtual method. So a body would never install, and registering one would make
-//! the install report claim a hook this host does not have.
+//! `res/patterns/win64/VTABLE-REPORT.md` §1 replaced the old verdict ("no stats
+//! symbol exists") with the real shape: a job chain. `CUserStats` slot 6 constructs
+//! a `CAPIJobRequestUserStats`; the job's run method
+//! [`crate::abi::achievements::BINIT_SYMBOL`] sends the request and calls the
+//! response parser and then the merge; and
+//! [`crate::abi::achievements::MERGE_SYMBOL`] merges the parsed reply into the
+//! client's stats map. **Both are anchored in both live builds**, so this host now
+//! has two candidate sites — and the merge is the semantically right one: it is the
+//! completion point, after the reply is in hand and before it reaches the local
+//! map, and it is the site its own log strings name
+//! ("`YieldingMergeStats - beginning merge`", "`using %s stats data`").
+//!
+//! It still cannot carry the rebuild, for four measured reasons (the disassembly
+//! behind each is in [`crate::abi::achievements`]):
+//!
+//! 1. The reply *bytes* are gone by then. The Linux body substitutes an encoded
+//!    reply; at the merge the reply is already a stats block inside the job
+//!    object, and the two arguments are only `this` and an `EResult`.
+//! 2. Replacing that block means constructing Steam's own ordered dictionary: the
+//!    merge allocates a fresh block and inserts into it with **inlined** code
+//!    (0x38-byte nodes, interned keys, a comparator called at `0x138d9ef40`). There
+//!    is no writer function to anchor — so this is not a missing pattern, it is a
+//!    shape that no pattern can supply.
+//! 3. Every field of the job object is a per-build offset (`engine`, the reply
+//!    block, the `CGameID` holding the app id — public `0x170`/`0x1a8`/`0x198`,
+//!    publicbeta `0x168`/`0x1a0`/`0x190`). A body would carry a build table and
+//!    fail closed off it; the corpus carries patterns only.
+//! 4. The decision's `local` input has no producer on this host: definitions come
+//!    from a stats schema parsed by `vapor_forge_steam_protocol`, which this crate
+//!    does not depend on and which no Windows hook has ever fed.
+//!
+//! So the body that *would* work is not at the job at all: it is the reply-body
+//! site (§1 site 2, the response parser at `0xa93120` / `0xabcc20`, unanchored) or
+//! the CM receive path with the win64 packet layout
+//! (`CNetPacket::{Init, Alloc, Release}`, in neither win64 corpus file) — where
+//! `legacy_response`/`service_response` bytes can actually be substituted, exactly
+//! as Linux does — plus a schema cache for this host. Registering a body at the
+//! job today would make the install report claim a hook that serves nothing, so
+//! nothing is registered.
 //!
 //! [`decide`] is the portable half, written so the future body is a wrapper: it
 //! runs the **real** feature entry point
 //! (`rebuild_local_achievements_if_enabled`), so the flag, the schema precedence
-//! and the definitions all behave exactly as the Linux path does. What is missing
-//! is only the input — which app's reply, and its unlock state — and that is what a
-//! stats anchor would deliver.
+//! and the definitions all behave exactly as the Linux path does.
 
 use vapor_forge_config::AppId;
 use vapor_forge_features::achievements::{

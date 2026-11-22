@@ -22,6 +22,9 @@ const DEPOT: &str = "GetDecryptionKey";
 const CLOUD: &str = "CloseAppCloud";
 const KEYVALUES: &str = "KeyValues_FindOrCreateKey";
 const TICKET: &str = "CUser::GetAppTicket";
+/// The stats-job site the achievements decision would sit at. Taken from the ABI
+/// record rather than spelled here, so the flow test cannot drift from it.
+const ACHIEVEMENTS: &str = crate::abi::achievements::MERGE_SYMBOL;
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 

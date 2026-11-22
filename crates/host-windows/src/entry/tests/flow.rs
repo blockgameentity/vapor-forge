@@ -4,10 +4,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    config_text, factory, run_serialized, write_corpus, FakeEnv, RecordingSink, TempDir, CLOUD,
-    DEPOT, KEYVALUES, OWNERSHIP,
+    config_text, factory, run_serialized, write_corpus, FakeEnv, RecordingSink, TempDir,
+    ACHIEVEMENTS, CLOUD, DEPOT, KEYVALUES, OWNERSHIP,
 };
 use crate::capability::Capability;
+use crate::hooks;
 
 #[test]
 fn a_loaded_module_installs_the_bodies_the_host_implements() {
@@ -217,4 +218,75 @@ fn the_config_flags_reach_the_hook_state() {
         "an off flag must reach the hook bodies, not just the feature report"
     );
     assert!(!state.family_settings().clean_borrower_markers);
+}
+
+/// A corpus that anchors the stats job resolves it, and the capability follows the
+/// body table rather than the resolver.
+///
+/// This is the achievements flow in one place: `CAPIJobRequestUserStats::BInit` and
+/// `::YieldingMergeStats` are anchored in both live builds and listed in
+/// `install::deps`, but no replacement body exists (`crate::abi::achievements`
+/// measures why). So today the batch resolves the symbol, declines to install it,
+/// and reports `achievements` disabled with the reason naming the symbol — every
+/// other capability is untouched. The assertion is written against
+/// [`hooks::replacement_address`] on purpose: the day a body lands, this test
+/// asserts the other half (installed, capability kept) without an edit.
+#[test]
+fn the_stats_job_anchor_resolves_and_achievements_follows_its_body() {
+    let dir = TempDir::new("achievements");
+    let config = dir.write("config.toml", &config_text(&[730]));
+    let corpus_root = dir.path().join("corpus");
+    write_corpus(
+        &corpus_root,
+        &[(OWNERSHIP, "AA BB CC DD"), (ACHIEVEMENTS, "DE AD BE EF")],
+    );
+    let mut env = FakeEnv::new(Some(config), Some(corpus_root));
+    let attempts = Rc::new(RefCell::new(Vec::new()));
+    let mut installer = factory(&attempts, None);
+    let mut sink = RecordingSink::default();
+
+    let outcome = run_serialized(&mut env, &mut installer, &mut sink);
+
+    let report = outcome.modules[0].report.as_ref().expect("report");
+    assert!(
+        outcome.modules[0].error.is_none(),
+        "{:?}",
+        outcome.modules[0].error
+    );
+    let has_body = hooks::replacement_address(ACHIEVEMENTS).is_some();
+    assert_eq!(
+        report
+            .installed
+            .iter()
+            .any(|entry| entry.symbol == ACHIEVEMENTS),
+        has_body,
+        "the stats job symbol is installed exactly when it has a body"
+    );
+    assert_eq!(
+        report.gate.is_enabled(Capability::Achievements),
+        has_body,
+        "achievements is enabled exactly when the stats job has a body"
+    );
+    if !has_body {
+        let reason = report
+            .gate
+            .reason(Capability::Achievements)
+            .expect("the capability must name the symbol it lost");
+        assert!(
+            reason.contains(ACHIEVEMENTS) && reason.contains("no replacement body"),
+            "unexpected reason: {reason}"
+        );
+        assert!(
+            outcome.report().contains(ACHIEVEMENTS),
+            "the report must name the symbol it did not install"
+        );
+    }
+    // One unresolved capability never costs another: the ownership body installed
+    // from the same corpus and keeps its gate open.
+    assert!(report.gate.is_enabled(Capability::Ownership));
+    assert_eq!(report.installed.len(), usize::from(has_body) + 1);
+    assert!(
+        sink.published.is_some(),
+        "the state is published regardless"
+    );
 }
