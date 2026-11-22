@@ -758,3 +758,435 @@ to `CmInterception`. Wiring it up is a one-line `deps.rs` change plus a body.
 * Nothing here is a live confirmation. A hook on `0xa0bca0`, `0xa1c5d0` or
   `0x5d3030` in a running client is what would turn these from static evidence
   into fact.
+
+---
+
+# Fourth pass: the seven remaining capability anchors
+
+The third pass worked from *method-name strings*; this pass works from *interface
+name tables* plus the argument shapes the capabilities imply. The new ingredient
+is that the module carries, for every `.rdata` interface, a run of bare method
+names — one per method, in interface order — and each name is referenced by
+exactly one function (`lea name; log/forward`). Reading the name's containing
+slot out of `vapor-forge-vtable-pe --holds` therefore yields an **interface →
+slot → function** map with five independent confirmations on `IClientUser`, for
+free. Where that map exists, a target's slot is derived, not guessed; where it
+does not (or where the body contradicts the derived slot's ABI), the target is
+reported as a negative.
+
+| target | capability | class | slot | anchor (public / publicbeta) | verdict | corpus |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 stats | `Achievements` | `CAPIJobRequestUserStats` | 16 / 17 (own override) | `0xa8fd20` / `0xab99a0` (`BInit`) and `0xaa0420` / `0xac97d0` (`YieldingMergeStats`) | **candidate (strong)** — the path is a job chain; these are its run entry and its merge | **added** (2) |
+| 2 `GetShaderCacheDepot` | `ShaderCacheControl` | none (plain function) | — | `0x533ad0` / `0x546020` | **candidate (strong)** | **added** |
+| 3 `IsAppDlcInstalled` | `DlcOverrides` | `CUserAppManager` | 9 / 116 | `0x4f6a40` / `0x50c740` | **confirmed** (name string + interface order) | **added** |
+| 3 `BIsDlcEnabled` | `DlcOverrides` | `CUserAppManager` | 11 / 116 | `0x4eb080` / `0x500ce0` | **confirmed** (interface order + appinfo keys) | **added** |
+| 4 `RequiresLegacyCDKey` | `LegacyCdKeyControl` | `CUser` (`IClientUser`) | 87 / 260 | `0xa16f70` / `0xa3fcf0` | **confirmed** | **added** |
+| 5 `SetAPICallResult` | `CallbackEvents` | `CSteamEngine` (`IClientUtils`) | 25 / 117 | `0x9bf3d0` / `0x9e50c0` | **candidate** — it is the `…WithoutPostingCallback` half | **added** |
+| 5 `RegisterInternalCallback` | `CallbackEvents` | — | — | — | **refuted** | none |
+| 6 `GetSteamID` | `SteamIdOverride` | `CUser` (`IClientUser`) | 10 / 260 (derived) | `0xcfed0` / `0xd0470` (derived) | **candidate (weak)** — the slot is derived, the ABI contradicts the Linux contract | none |
+| 7 `RegisterJsMethod` | `ConflictUiBridge` | — (`SteamUI.dll`) | — | — | **no candidate** | none |
+
+Five of the seven targets end with a corpus entry; `RegisterInternalCallback`
+(inside target 5), `GetSteamID` and `RegisterJsMethod` end in a negative. That
+split is what the measurements below produced, not a quota.
+
+## The interface name tables, and how far they can be trusted
+
+`.rdata` holds one run of bare method names per interface version and a second
+copy for the next version (for `IClientUser`: `0x134a8xx` and `0x1358xxx`). Each
+name is referenced from exactly one `lea`, inside the *one* function that
+implements or forwards that method, so a name is a label for a function, not a
+position in a list. Position comes from the containing vtable:
+
+```
+$ vapor-forge-vtable-pe --dll …/steamclient64.dll --module steamclient --holds <ref>
+holds 0x0088f7c5 -> entry 0x0088f6d0: table 0x0135d7b0 slot 25/117 class(IClientUtilsMap)
+```
+
+That gave these maps (measured, both builds; only the public numbers are quoted):
+
+| interface | table | names resolved | register |
+| --- | --- | --- | --- |
+| `IClientUser` | `0x1357d28`, 260 slots | 1 `LogOn`, 2 `InvalidateCredentials`, 3 `LogOff`, 4 `BLoggedOn`, 5 `GetLogonState`, 6 `BConnected`, 7 `BInitiateReconnect`, 8 `EConnect`, 10 `GetSteamID`, 11 `GetClientInstanceID`, 29 `RequestLegacyCDKey`, 69 `BUpdateAppOwnershipTicket`, 87 `RequiresLegacyCDKey`, 88 `GetLegacyCDKey`, 89 `SetLegacyCDKey`, 90 `WriteLegacyCDKey`, 91 `RemoveLegacyCDKey`, 92 `RequestLegacyCDKeyFromApp`, 104-106 `GetAppOwnershipTicketLength/Data/ExtendedData`, 183 `GetSubscribedApps` | 20 |
+| `IClientAppManager` | `0x135f708`, 115 slots | 9 `IsAppDlcInstalled`, 10 `GetDlcDownloadProgress`, 11 `BIsDlcEnabled`, 12 `SetDlcEnabled`, 13 `SetDlcContext`, 14 `GetDlcSizes` | 6 |
+| `IClientUtils` | `0x135d7b0`, 117 slots | 24 `GetAPICallResult`, 25 `SetAPICallResultWithoutPostingCallback` | 2 |
+| `IClientGameServer*` | `0x135a120`, 69 slots | 12 `GetSteamID` | 1 |
+
+The map is *derived* (name → xref → slot), so its correctness is testable, and
+two tests were run:
+
+* **Index 4 and 5 are the methods their names say.** `CUser` 260-slot table slot
+  4 is `cmpl $0x4,0x178(%rcx); sete %al; ret` (i.e. `m_logonState == 4` —
+  `BLoggedOn`) and slot 5 is `mov 0x178(%rcx),%eax; ret` (`GetLogonState`). Both
+  are also shared, by linker folding, with `CGameServer` slots 12/13.
+* **The `CUser` 260-slot table is `IClientUser` order.** Slot 183 is
+  `CUser::GetSubscribedApps` (third-pass label) in `IClientUserMap` slot 183 and
+  in `CUser` slot 183; slots 87-92 land on the CD-key cluster described below.
+  This is also why 260 slots is not a coincidence: it is the interface length.
+
+Note the adjustor thunks: 110 of the 260 `CUser` slots are not `.pdata`
+entries, and many of those (sampled: slots 0, 3, 4, 5, 6, 9) are
+`sub $0x1e78,%rcx; jmp impl` thunks — the `IClientUser` subobject sits at
+`+0x1e78` in the object, so a member access written against the interface
+pointer carries a *negative* displacement such as `-0x1c6e`
+(= object `+0x20A`). This is why the members in section 6 look odd; they are
+`this_interfaces + 0x1e78 - 0x1c6e`.
+
+## 1. The user-stats path: a job chain, and the merge is the hook
+
+The proposed shape ("a slot writes N 32-bit values through a pointer") is not the
+Windows shape, and the third pass was right to refute it. What exists is a
+four-stage job, and every stage is named by its own log strings:
+
+| stage | public | publicbeta | named by |
+| --- | --- | --- | --- |
+| request entry (game → client) | `CUserStats` slot 23 `RequestUserStats` (496 B) | slot 23 | third pass |
+| job creation | `CUserStats` slot 6 = `0xa92cc0` (allocates `0x198` B, constructs the job) | `0xabc850` | `CAPIJobRequestUserStats` ctor string |
+| **job run: `BInit()` (the class's only non-shared slot)** | **`0xa8fd20`, 736 B, `CAPIJobRequestUserStats` slot 16/17** | **`0xab99a0`, 902 B** | `CAPIJobRequestUserStats - no connection to Steam` |
+| request + response parse, schema write | `0xa93120`, 2,163 B | `0xabcc20` | `… - received error '%s' (%d)`, `… - missing schema in response!`, `… - updated schema from server` |
+| **merge (server vs. local — the BST rebuild)**, `YieldingMergeStats` | **`0xaa0420`, 3,562 B, entry-aligned** | **`0xac97d0`, 3,491 B** | `CAPIJobRequestUserStats::YieldingMergeStats - beginning merge`, `server vs. local 'score'`, `using %s stats data` |
+| upload | `CAPIJobStoreUserStats::BYieldingRunAPIJob` `0xa902b0` | `0xab9f70` | `CAPIJobStoreUserStats::BInit() - …` |
+
+The call graph settles which function is the carrier: `0xa8fd20` calls
+`0xa93120` at `0xa8ff72` and `0xaa0420` at `0xa8ff7e`, and nothing else calls
+either. In publicbeta the same shape holds: `0xab99a0` calls `0xabcc20` and
+`0xac97d0`. So the job's run function validates the session
+(`call 0x1a4dc0` on `this+0x190`, the state mask at `this+0x194`, the target
+CSteamID at `this+0x198`), sends and parses the reply, and merges it — all in one
+entry.
+
+**The third pass's refusal to anchor the merge is withdrawn.** It read
+`0xaa0420` as a coroutine resume block. It is not: `0xaa0420` is its own `.pdata`
+entry, its extent is 3,562 B and ends in `ret`, and the switch it opens with is
+over the **second argument**, which the only caller supplies as an `EResult`:
+
+```
+call *0x28(%rax)            ; engine interface: wait for the service-method response
+call 0x8dad0                ; BYieldingWaitForServiceMethodResponse(…, &eresult)
+test %al,%al
+je   → call 0xa93120        ; response parse; leaves the EResult in eax
+mov  %edi,%edx              ; edx = EResult  (from 0xa93120, or the waited one)
+mov  %rbx,%rcx
+call 0xaa0420               ; YieldingMergeStats(this, EResult)
+```
+
+so `sub $0x2,%edx; je …; sub $1,%edx; je …; cmp $0xd,%edx; je …` is an
+`EResult` dispatch (2 = `k_EResultFail`, 1 = `k_EResultOK`, `0xd`, …), not a
+generator state, and the block is an ordinary anchorable function. The 66-byte
+`0xaa03d0` before it is the *other* arm the third pass looked at; it is not this
+function's epilogue (the extents are separate), and nothing calls it.
+
+**Corpus entries: two, both added.**
+
+* `CAPIJobRequestUserStats::BInit` — `0xa8fd20` / `0xab99a0`, slot 16/17. The
+  class's only non-shared slot (0-15 are `CAPIJob` base bodies), `bool`-returning (the early "no connection to Steam"
+  path is `xor %al,%al; …; ret`), and it drives both phases. Name is an
+  interpretation: the class's virtual that runs the request; the behaviour is
+  measured.
+* `CAPIJobRequestUserStats::YieldingMergeStats` — `0xaa0420` / `0xac97d0`,
+  the completion/merge point and the local-rebuild (BST) site. The name is the
+  function's own log string.
+
+### What the Windows hook would have to be (the deliverable for the body workstream)
+
+The Linux `Achievements` hook is a set of `IClientUserStats` accessors read
+through one vtable. On Windows that split does not exist:
+
+* **Read path** (`num stats`, `stat name`, `achievement name`, read a stat) is
+  available as `CUserStats` (`0x13b2330`, 56 slots) — slots 3 `GetNumAchievements`,
+  4 `GetAchievementName`, 5 `RequestCurrentStats`, 40 `GetNumAchievedAchievements`,
+  41 `GetLastAchievementUnlocked` are string-confirmed; 23/24/25/26/17 are the
+  per-user fetch/getters. These are ordinary entry-aligned functions.
+* **The local rebuild (BST)** is *not* a read accessor: it is
+  `CAPIJobRequestUserStats::YieldingMergeStats(this, EResult)`, a plain 3.5 kB
+  function that runs after the server reply has been parsed. A hook that wants to
+  substitute local values must intercept **the job**, not the stats map, and
+  there are three entry-aligned sites, in increasing precision:
+  1. `0xaa0420` (`0xac97d0`) — `YieldingMergeStats` itself, the completion
+     point. A detour here runs *after* the server values are in hand and
+     *before* they are merged into the local map; it is the only site that can
+     replace the merge outcome without reimplementing the request. The only
+     caller ignores whatever the call leaves in `eax`, so treat it as `void`: a
+     detour rewrites the merge input (the job's stats block) rather than a return
+     value.
+  2. `0xa93120` (`0xabcc20`) — the response handler: parses the schema and the
+     stats out of the reply and returns an `EResult` that is then fed to the
+     merge as `edx`. A detour here can rewrite the reply payload.
+  3. `0xa8fd20` (`0xab99a0`) — `BInit`, the job's only override: one detour sees
+     the whole request/response/merge cycle; the job object holds the app id
+     (`+0x1a0` family), the target CSteamID (`+0x198`) and the stats block.
+* `0xaa03d0` is *not* this merge's epilogue (separate `.pdata` extent, no
+  caller); anchoring there would never fire.
+* Consequence for `crates/host-windows`: `install::deps` gates `Achievements` on
+  `CUser::GetUserStats`, which is the read-side name. Both anchors added here are
+  on the write/merge side, so the dependency table should gain
+  `CAPIJobRequestUserStats::YieldingMergeStats` (and/or
+  `CAPIJobRequestUserStats::BInit`) as `Capability::Achievements` dependencies
+  rather than re-pointing the existing name.
+
+## 2. `GetShaderCacheDepot` — the key string, and a body that matches the Linux validator line for line
+
+`GetShaderCacheDepot` appears in no string. The **config key it reads** does:
+`shadercachedepot`, exactly once per module (`0x12c5598` public, `0x12f8948`
+beta), referenced from exactly one function — `0x533ad0` (177 B) / `0x546020`
+(177 B). It is *not* a virtual method (`--holds`: "not a slot of any enumerated
+table"), so the `CShaderCacheManager` RTTI class route is empty by construction:
+`CShaderManager` does have RTTI tables, but this accessor is a plain function.
+
+The body is the Linux 64-bit validator's evidence set, field for field:
+
+| Linux validator asks for | public body |
+| --- | --- |
+| shader manager readiness: `mov eax,[rax+0x7C]; test eax,eax` | `mov 0x130de5f(%rip),%rax; cmpl $0x0,0x7c(%rax); je →return 0` |
+| app-info AppID at `+0x0C` | `mov 0xc(%rdi),%edx` (passed as the app id) |
+| game type lookup, argument `2` | `mov $0x2,%r8d` into `0x4dea30(…, "game", "type", appid)` |
+| `cmp eax,1` | `call 0x4dea30` → `call 0xd8c500` (string→enum) → `cmp $0x1,%eax; jne →return 0` (app type must be *game*) |
+| shader depot lookup, `7` | `mov $0x7,%r8d; lea "shadercachedepot",%r9; call 0x4de950` → returns the depot id in `eax` |
+
+The caller is the clincher: `CGetShaderDepotManifestJob` (`0x988b80`) loads the
+appinfo for `[job+0x1a0]` (`call 0x4f5550`), skips apps whose state flags carry
+`1`/`0x40`, calls this function at `0x988c17`, and when the result is `0` logs
+`"[ AppID %u ] CGetShaderDepotManifestJob skipping because shader depot ID is invalid."`
+(`0x12e…`/`0x1388fd0`) and returns `0xb`. The return value is the shader depot id
+for the app, which is what the capability needs to answer `0`.
+
+**ABI as measured:** `u32 (CAppInfo *)` — the app id is inside the argument
+(`[arg+0xC]`), not passed separately as on Linux. A replacement body therefore
+takes one pointer, calls the original, and returns `0` when
+`features::depot_key::should_skip_shader_depot` says skip.
+
+**Verdict: candidate (strong).** It is not "confirmed" only because the C++
+symbol name is an interpretation: the behaviour, the key, the caller and the
+argument shape are all measured.
+
+## 3. DLC — `IsAppDlcInstalled` is confirmed by a name string, `BIsDlcEnabled` by interface order
+
+`CUserAppManager::IsAppDlcInstalled` is one of the few full
+`Class::Method` strings in the module (`0x12bd998`), referenced once
+(`0x4f6a8b`), and `--holds` puts that reference in
+`CUserAppManager` (`0x012bbef0`, 116 slots) **slot 9** at `+0x4b`. The class is
+`CUserAppManager`, not `CAppManager`, and it exists in both builds with the same
+length and slot indices.
+
+| | `IsAppDlcInstalled` | `BIsDlcEnabled` |
+| --- | --- | --- |
+| slot | 9 / 116 | **11** / 116 (same index as `IClientAppManager`) |
+| public / beta | `0x4f6a40` / `0x50c740` (1,011 B both) | `0x4eb080` / `0x500ce0` (693 B both) |
+| strings inside the body | `dlcappid`, `oslist`, `config/oslist`, `manifests` + its own name | `AppManagesDLC`, `DisabledDLC`, `OptionalDLC` |
+| shape | reads the app's DLC appids, then the installed manifests, so "installed" = a manifest exists for the DLC | three appinfo config reads that decide whether the DLC counts as enabled; `bytearg 3`, writes through arg 3 (`thru 3:2`) |
+| Linux ABI | `(this, u32 app, u32 dlc) -> bool` | `(this, u32 app, u32 dlc, void *) -> bool` — the fourth argument is the pointer the body writes through |
+
+The slot for `BIsDlcEnabled` is inherited, not guessed: `IClientAppManager`'s
+facade table (`IClientAppManagerMap`, `0x135f708`) places
+`IsAppDlcInstalled` 9, `GetDlcDownloadProgress` 10, `BIsDlcEnabled` 11,
+`SetDlcEnabled` 12, `SetDlcContext` 13, `GetDlcSizes` 14 — and slot 9 is
+independently pinned by the name string above, so the run is anchored at both
+ends. `CUserAppManager` implements that interface, so 11 is `BIsDlcEnabled`; the
+`AppManagesDLC`/`DisabledDLC`/`OptionalDLC` reads in the body are the
+confirmation that the slot holds a *predicate over the DLC's enabled state*, not
+a setter (a setter would write those keys and flush a config store; this body
+reads them and returns the result through the caller's byte pointer).
+
+**Verdict: confirmed** for both (identity from a name string and from a
+two-ended interface run, plus body contents; no live check).
+
+## 4. `RequiresLegacyCDKey` — the slot map from the ticket pass, reused
+
+The `IClientUser` run places the whole CD-key cluster consecutively:
+
+| slot | method | public function |
+| --- | --- | --- |
+| 29 | `RequestLegacyCDKey` | facade only (`0x886150`) |
+| **87** | **`RequiresLegacyCDKey`** | **`0xa16f70`** (238 B; beta `0xa3fcf0`, 238 B) |
+| 88 | `GetLegacyCDKey` | `0xa0a220` (489 B) |
+| 89 | `SetLegacyCDKey` | `0xa1bae0` (532 B) |
+| 90 | `WriteLegacyCDKey` | `0xa25900` (`"Invalid CDKey method"`) |
+| 91 | `RemoveLegacyCDKey` | `0xa157e0` (`"Invalid CDKey method"`) |
+| 92 | `RequestLegacyCDKeyFromApp` | `0xa16170` (`AppProofOfPurchaseKeyResponse_t` size assert) |
+
+The body at slot 87 is the Linux validator's contract exactly: the **first
+instruction after the prologue is `movb $0x0,(%r8)`** — `*pbHasKey = false` — then
+`mov %edx,%edi` (the app id is read as 32-bit), two appinfo-cache calls
+(`0x4dd100`, `0x4dda10` with the app id in `edx`), `call 0x4df490`, and finally `call 0xa0a220` (slot 88) with a `0x258`-byte
+stack buffer, whose result is reported back through `r8`. `msflow` reports
+`thru 2:2` for the slot, which is those two byte stores through argument 2.
+
+The index alignment is corroborated at four independent points (88 = the
+proof-of-purchase ticket reader, 90/91 = the two functions that switch on a CD-key
+method, 92 = the `AppProofOfPurchaseKeyResponse_t` handler), so slot 87 is not a
+lone inference.
+
+**Verdict: confirmed** (measurement: name-table slot + the out-parameter clear
+the Linux validator demands + callee identity).
+
+**Correction to the third pass, stated here because it lands in this cluster.**
+Slot **88** (`0xa0a220`), shipped in the corpus as `CUser::GetAppTicket`, is
+`IClientUser::GetLegacyCDKey`: it is at interface index 88, it is called by
+`RequiresLegacyCDKey` (slot 87) with a stack buffer, and the strings it uses
+(`LegacyKeyProofOfPurchaseTicket`, `ProofOfPurchaseTicketRevision`, `cdk_%u_%u`)
+name the ticket *fields that carry the legacy key*, which is what
+`GetLegacyCDKey(appId, char *pchKey, int cbKey)` extracts. The ownership ticket
+blob the `TicketOverrides` body wants is the neighbouring interface group
+(`GetAppOwnershipTicketLength/Data/ExtendedData`, slots 104-106). The corpus
+entry is left in place under its existing name — renaming it would drop the
+`TicketOverrides` gate for a symbol `crates/host-windows` already binds — but the
+host should treat it as the CD-key reader, not the ticket reader; a
+`TicketOverrides` hook needs interface slot 105 (`GetAppOwnershipTicketData`,
+facade `0x781400`).
+
+## 5. `CallbackEvents` — the result store is real, the registrar is not there
+
+The engine implements `IClientUtils`: `CSteamEngine` `0x1391158` has **117**
+slots (beta 118) and `IClientUtilsMap` `0x135d7b0` has 117, with
+`GetAPICallResult` 24 and `SetAPICallResultWithoutPostingCallback` 25 from the
+name strings. `CSteamEngine` slot 25 is `0x9bf3d0` (165 B; beta `0x9e50c0`,
+165 B), and its body is the store half of the Linux `SetAPICallResult` semantic:
+
+```
+mov  %rdx,0x20(%rsp)        ; key = { apiCall, 0, 0, 0 }
+lea  0xca0(%rcx),%rcx       ; m_mapAPICallResults
+call 0x9ac090               ; FindOrInsert(map, &key, 1)
+imul $0x38,%rbp,%rcx        ; record stride 0x38  (the Linux 64-bit stride)
+add  this+0xcd0             ; record array
+movl $0xffffffff,0x18(%rbx) ; eresult = k_EResultNone
+call 0x9ae380               ; memcpy(record+0x20, payload, cbPayload)
+```
+
+The Linux semantic's other two clauses are *not* here, and that is the finding:
+the `SteamAPICallCompleted_t` (703 = `0x2BF`) post is the caller's job — which is
+what the `WithoutPostingCallback` suffix means, and 703 is one of the values
+`CCMInterface::RecvPkt`'s pre-check handles specially (third pass). So on Windows
+`SetAPICallResult` is not a single function: it is this store plus a posting
+call site. **Verdict: candidate** — the added entry is the store, which is the
+choke point every API call result passes through, including results the host
+itself produces.
+
+`RegisterInternalCallback` has **no string in any of the four modules** and no
+one-argument registrar at a virtual or direct-call site: the internal callback
+path is `CInternalCallbackManager`, and the only named sites are
+`CSteamEngine::PostInternalCallback` (`0x9bac80` public; the label also resolves
+inside `CSteamClient` slot 2/83 at `0x9a7710`), `CInternalCallbackManager::ProcessPendingActions`
+(`0x8c01c0`), and the `m_InternalCallbackMap` asserts inside a manager
+*destructor* (`0x917d20`, whose tail calls `0x8c1270` with the map). No candidate.
+
+## 6. `GetSteamID` — the derived slot holds an out-parameter accessor: candidate, no entry
+
+The interface maps `GetSteamID` to `IClientUser` slot 10 and
+`GetClientInstanceID` to 11; slots 4/5 verify the alignment by body. `CUser`
+slot 10 is `0xcfed0` (public) / `0xd0470` (beta), 13 instructions in both, and
+both builds encode:
+
+```
+mov rax,[rcx-0x1c6e]   ; this + 0x1e78 - 0x1c6e = object + 0x20A
+mov [rdx],rax          ; store it through the SECOND argument
+mov rax,rdx            ; return the pointer, not the id
+ret
+```
+
+That is a getter with an out-parameter, and it contradicts the contract the
+`SteamIdOverride` body depends on (`u64 GetSteamID()` with the id in `rax`; the
+Linux validator is literally `mov rax,[rcx+disp]; ret`). Two further measurements
+close the door on calling it confirmed:
+
+* the same body is `CGameServer` slot 12 as well — linker-folded, i.e. one body
+  shared by two classes' vtables, so the member offset it uses must be valid for
+  both objects; that is a property of the layout the two interfaces share, and it
+  is worth knowing before anyone hooks it from one side only;
+* `CUser::CacheAccountNameAndSteamID` (`0x9e3060`) stores the account's
+  `CSteamID` at object `+0xA8` (`mov %r8,0xa8(%rbx)`), and **no function anywhere
+  in either module begins `mov rax,[rcx+0xA8]; ret`** (0 occurrences of
+  `48 8B 81 A8 00 00 00`, `48 8B 41 A8`, both builds). The trivial getter the
+  Linux side hooks does not exist as a separate body in this build; it is
+  inlined at every call site.
+
+Slot 11 (`0xa08cb0` / `0xa31200`, `mov rax,[rcx-0x1ce8]; ret`) *is* the shape
+`GetSteamID` should have — but the interface order says 11 is
+`GetClientInstanceID`, which is also a 64-bit id getter, and nothing static
+separates the two beyond the interface map that puts `GetSteamID` at 10.
+
+**Verdict: candidate (weak), no corpus entry.** What is *derived* is the slot
+(two interface maps, five alignments); what is *measured* is an ABI that no
+`SteamIdOverride` body written for Linux can use: the id arrives through the
+caller's pointer and `rax` is that same pointer. A detour would have to read and
+rewrite `*arg2` rather than `rax`, and the argument order would differ from
+`u64 GetSteamID(this, …)`. Before that is worth doing, one live check settles it:
+break on `0xa08cb0` and on `0xcfed0` during logon and see which returns the
+account's CSteamID (compare against the id in a logon IPC packet) — the first
+would mean the interface map is off by one here and that the trivial getter *is*
+present after all, the second means the out-parameter reading is right. No entry
+until then: the 13-instruction body leaves nothing but a displacement to key a
+pattern on, and overriding an instance id instead of an account id is worse than
+having no `SteamIdOverride` anchor.
+
+## 7. `RegisterJsMethod` — no candidate in `SteamUI.dll`
+
+Neither build contains `RegisterJsMethod` or `RegisterJSMethod` as a string. The
+only related string is the log line `CreateSharedJSContext:RegisterJSMethods`
+(`0xdea140` public), used at `0x687322` inside a JS-context builder whose
+subsequent calls (`0x65c680`, `0x65e1c0`, `0x62a850`, `0x561550`) are context
+setup — none of them is a four-argument `(name, fn, flags)` registrar. The map a
+registrar would insert into is `m_mapJSRegisteredMethods`, and it is referenced
+from exactly two functions, both serialisers: the window-state writer at
+`0x20ebc0` (which writes `m_strURLToLoad`, `m_strMostRecentURL`,
+`m_strPreventNavigateExceptURL`, …) and `CHTMLWindowController` slot 11
+(`0x210800`), which writes members through a writer vtable with string keys.
+
+**Verdict: no candidate.** `SteamUI`'s corpus stays at 7 public / 5 publicbeta
+patterns; the reverse bridge has no Windows anchor and the capability stays
+blocked.
+
+## Corpus entries added and verified
+
+Seven entries, one pattern each; five patterns are **the same bytes in both
+builds** (the prologues were not rebuilt); the stats job's two functions needed a
+variant each. All
+were mined with `vapor-forge-pattern-mine` (1 match, unique, anchor gate
+`verified`) and the mined output was re-parsed by the shipped scanner
+(`round-trip verified`).
+
+| symbol | public | publicbeta |
+| --- | --- | --- |
+| `IClientAppManager::IsAppDlcInstalled` | `0x4f6a40` verified | `0x50c740` verified |
+| `IClientAppManager::BIsDlcEnabled` | `0x4eb080` verified | `0x500ce0` verified |
+| `IClientUser::RequiresLegacyCDKey` | `0xa16f70` verified | `0xa3fcf0` verified |
+| `CShaderCacheManager::GetShaderCacheDepot` | `0x533ad0` verified | `0x546020` verified |
+| `CSteamEngine::SetAPICallResult` | `0x9bf3d0` verified | `0x9e50c0` verified |
+| `CAPIJobRequestUserStats::BInit` | `0xa8fd20` verified | `0xab99a0` verified |
+| `CAPIJobRequestUserStats::YieldingMergeStats` | `0xaa0420` verified | `0xac97d0` verified |
+
+Counts after the change: public `steamclient` 25 patterns (24 resolve and pass the
+body gate), publicbeta 24 (23), `SteamUI` 7 and 5 (unchanged, all verified). The
+only rejection in every run is the pre-existing `GetPipeClient: unmapped` in both
+builds — the `GetPipeClient` anchor lands mid-function and is unchanged from the
+previous passes.
+
+## Naming notes for the host
+
+* `CAPIJobRequestUserStats::BInit`,
+  `CAPIJobRequestUserStats::YieldingMergeStats` and
+  `CSteamEngine::SetAPICallResult` are new corpus symbol names; all need
+  `crates/host-windows` work (a body and/or a `deps.rs` gate) before they can
+  carry a capability. They install as unresolved-and-skipped until then, like
+  `CCMInterface::RecvPkt` did.
+* `CShaderCacheManager::GetShaderCacheDepot` and
+  `IClientAppManager::{IsAppDlcInstalled,BIsDlcEnabled}` are the exact names
+  `crates/host-windows/src/hooks/{shader,dlc}.rs` already test for, so their
+  `decide` halves become installable without a rename.
+* `CUser::GetAppTicket` (slot 88) is `IClientUser::GetLegacyCDKey`; see the
+  correction in section 4.
+
+## Limits of this fourth pass
+
+* The interface→slot maps are derived from name xrefs, so a name that names an
+  inlined copy labels the surviving function. Five independent agreements on
+  `IClientUser` (4, 5, 87-92, 183) and two on `IClientUtils`/`IClientAppManager`
+  bound the risk; a single point is never treated as a slot.
+* Slot indices are per build. `CSteamEngine` grew a slot (117 → 118) and `CUser`
+  already grew one (260 → 261) between these builds, so each slot quoted above
+  was re-read in the beta build rather than assumed; the ones quoted for beta in
+  the table (`0x9e50c0`, `0xab99a0`, `0x500ce0`, `0x50c740`, `0xa3fcf0`,
+  `0x546020`) are beta measurements.
+* Nothing here is a live confirmation. `0xa8fd20`, `0xaa0420`, `0x533ad0`,
+  `0x4f6a40`, `0x4eb080`, `0xa16f70` and `0x9bf3d0` are all static identifications with the
+  strings, slots, callees and argument shapes quoted; the "what would confirm"
+  question for each is in its section.
