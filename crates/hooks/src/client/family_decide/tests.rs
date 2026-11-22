@@ -150,6 +150,9 @@ fn a_stamped_marker_records_the_lender_and_accepts_no_sentinel() {
 /// The settings seam reads the value `config_apply` published, not a copy.
 #[test]
 fn settings_are_the_config_applied_value() {
+    // `apply` publishes both the family settings and the achievement flag, so this
+    // test shares the crate's feature-state lock with the achievement tests.
+    let _guard = crate::test_lock::lock();
     let mut config = RuntimeConfig::default();
     config.apps.shared.validate_lender = false;
     config.apps.shared.clean_borrower_markers = false;

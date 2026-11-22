@@ -7,6 +7,8 @@ pub(crate) mod account_downlink_worker;
 pub(crate) mod achievement_worker;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod capability;
+#[cfg(test)]
+pub(crate) mod test_lock;
 #[cfg(target_os = "linux")]
 pub(crate) mod client;
 #[cfg(target_os = "linux")]

@@ -300,8 +300,11 @@ pub struct AchievementsSection {
     /// Rebuild achievement replies from the local definition set when the schema
     /// cache is absent or unreadable.
     ///
-    /// Off by default: with the flag off the stats path behaves exactly as it
-    /// did before the rebuild existed (no stealth behaviour change).
+    /// Off by default. The rebuild is only meaningful when the host has an
+    /// independent local definition set; today both hosts derive their definitions
+    /// from the same schema cache the rebuild is meant to stand in for, so turning
+    /// this on changes nothing except re-deriving the schema. See
+    /// `features::achievements::local::LocalRebuildSettings`.
     #[serde(default)]
     pub local_rebuild: bool,
 }

@@ -51,10 +51,11 @@ fn unlocked(key: &str) -> AchievementUnlockState {
 
 /// Serialises every test in this module: the rebuild switch and both caches are
 /// process-wide, so one test at a time keeps them honest.
-static SWITCH: Mutex<()> = Mutex::new(());
-
 fn guard() -> std::sync::MutexGuard<'static, ()> {
-    SWITCH.lock().unwrap_or_else(|error| error.into_inner())
+    // Shared with the tests that call `config_apply::apply`, which republishes the
+    // achievement flag: without one lock the two race and this module's assertions
+    // fail about one run in three.
+    crate::test_lock::lock()
 }
 
 fn with_flag_on<T>(body: impl FnOnce() -> T) -> T {

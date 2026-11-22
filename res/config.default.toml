@@ -131,8 +131,9 @@ min_interval_ms = 1000
 # Offline achievement schema support.
 [achievements]
 # Rebuild achievement replies from local definitions when the schema cache is
-# missing or unreadable. Off by default: with it off the stats path behaves as
-# it always has.
+# missing or unreadable. Off by default: both hosts currently derive their "local"
+# definitions from that same schema cache, so enabling this re-derives what it was
+# given. It is the switch for a host that supplies an independent definition set.
 local_rebuild = false
 offline_schema = false
 

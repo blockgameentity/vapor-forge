@@ -49,9 +49,14 @@ use super::model::{AchievementDisplay, AchievementUnlockState, LocalAchievementS
 /// without it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LocalRebuildSettings {
-    /// Off by default. With the flag off no caller ever reaches the rebuild, so
-    /// the stats response path behaves exactly as it did before this module
-    /// existed: no stealth behaviour change.
+    /// Off by default.
+    ///
+    /// Not because the rebuild is dangerous, but because today the only source of
+    /// "local" definitions is the schema cache itself (`hooks::achievement_local`
+    /// derives them from it), so with the flag on and a schema present the host
+    /// re-derives the same definitions it was given, and with no schema there is
+    /// nothing to derive. The flag exists for a host that supplies an independent
+    /// local definition set; until one does, leaving it off changes nothing.
     pub local_rebuild: bool,
 }
 
@@ -211,6 +216,16 @@ pub fn rebuild_local_achievements_if_enabled(
         debug!(
             app_id,
             "achievements: local rebuild disabled, leaving the request on the schema path"
+        );
+        return None;
+    }
+    // Nothing to rebuild from: an app with no local definition set has no
+    // opinion, and rewriting its reply would only replace Steam's answer with an
+    // empty one.
+    if local.achievements.is_empty() {
+        debug!(
+            app_id,
+            "achievements: no local definitions, leaving the request on the schema path"
         );
         return None;
     }
