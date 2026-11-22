@@ -21,6 +21,18 @@ pattern = "83 EA 02 0F 84 ?? ?? ?? ?? 48 8B C4 48 89 48 08 41 55 48 81 EC 90 00 
 follow = "none"
 pattern = "48 8B C4 55 48 8D A8 E8 FB FF FF 48 81 EC 10 05 00 00 48 89 58 08 48 8B DA 48 89 70 F0 48 8B F1 4C 89 68 D8 45 33 ED 48"
 
+[steamclient."CNetPacket::Alloc"]
+follow = "none"
+pattern = "40 53 55 56 57 41 56 48 83 EC 30 48 63 F2 4C 8B F1 F0"
+
+[steamclient."CNetPacket::Init"]
+follow = "none"
+pattern = "40 53 55 56 57 48 83 EC 38 41 8B F9 49 8B F0 8B EA 48 8B D9 4D 85 C0 75 28"
+
+[steamclient."CNetPacket::Release"]
+follow = "none"
+pattern = "40 56 48 83 EC 20 83 69 1C 01 48 8B F1 0F 85 ED"
+
 [steamclient."CShaderCacheManager::GetShaderCacheDepot"]
 follow = "none"
 pattern = "48 89 5C 24 08 57 48 83 EC 30 48 8B 05 ?? ?? ?? ?? 48 8B F9 83 78 7C 00 0F 84 86"
