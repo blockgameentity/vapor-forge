@@ -24,6 +24,7 @@ use prost::Message;
 use vapor_forge_steam_protocol::{GetManifestRequestCodeRequest, GetManifestRequestCodeResponse};
 
 use super::decision::RequestTarget;
+use super::fetch::Request;
 
 /// A sanity bound on the body a request may carry.
 ///
@@ -63,17 +64,26 @@ impl PayloadBlocker {
     }
 }
 
-/// The `(depot, gid)` one request body is about.
+/// The `(depot, gid)` one request body is about, with the app it names.
 ///
 /// `depot_id` and `manifest_id` are both required; `app_id` is carried on the
 /// wire but a code is keyed by the depot and manifest pair, which is what Steam
-/// asks with and what a provider answers with.
-pub fn target(body: &[u8]) -> Result<RequestTarget, PayloadBlocker> {
-    let request = parse(body)?;
-    match (request.depot_id, request.manifest_id) {
-        (Some(depot), Some(gid)) if depot != 0 && gid != 0 => Ok(RequestTarget { depot, gid }),
+/// asks with and what a provider answers with. The app is kept because a provider
+/// url may name it (`{appId}`), so the fetch worker needs all three numbers.
+pub fn request(body: &[u8]) -> Result<Request, PayloadBlocker> {
+    let parsed = parse(body)?;
+    match (parsed.depot_id, parsed.manifest_id) {
+        (Some(depot), Some(gid)) if depot != 0 && gid != 0 => Ok(Request {
+            app: parsed.app_id.unwrap_or(0),
+            target: RequestTarget { depot, gid },
+        }),
         _ => Err(PayloadBlocker::NoTarget),
     }
+}
+
+/// The `(depot, gid)` one request body is about.
+pub fn target(body: &[u8]) -> Result<RequestTarget, PayloadBlocker> {
+    request(body).map(|request| request.target)
 }
 
 /// Parse one request body.
@@ -102,7 +112,7 @@ pub fn response_body(code: u64) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn request(depot: u32, gid: u64) -> Vec<u8> {
+    fn encoded(depot: u32, gid: u64) -> Vec<u8> {
         GetManifestRequestCodeRequest {
             app_id: Some(480),
             depot_id: Some(depot),
@@ -115,7 +125,7 @@ mod tests {
 
     #[test]
     fn a_request_body_becomes_the_target_it_names() {
-        let body = request(731, 0x0bad_cafe_dead_beef);
+        let body = encoded(731, 0x0bad_cafe_dead_beef);
         assert_eq!(
             target(&body),
             Ok(RequestTarget {
@@ -123,6 +133,29 @@ mod tests {
                 gid: 0x0bad_cafe_dead_beef
             })
         );
+    }
+
+    #[test]
+    fn a_request_body_also_names_the_app_its_provider_url_may_use() {
+        // `{appId}` is a real placeholder in a provider url, so the app id has to
+        // survive the parse and reach the fetch worker.
+        let body = encoded(731, 7);
+        assert_eq!(
+            request(&body),
+            Ok(Request {
+                app: 480,
+                target: RequestTarget { depot: 731, gid: 7 }
+            })
+        );
+        // A request that omits the app keeps the target and reports app 0 rather
+        // than refusing a lookup it could still answer.
+        let no_app = GetManifestRequestCodeRequest {
+            depot_id: Some(731),
+            manifest_id: Some(7),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(request(&no_app).map(|parsed| parsed.app), Ok(0));
     }
 
     #[test]
@@ -144,8 +177,8 @@ mod tests {
         assert_eq!(target(&no_manifest), Err(PayloadBlocker::NoTarget));
 
         // A zero is "absent" for a code lookup, not a depot id.
-        assert_eq!(target(&request(0, 7)), Err(PayloadBlocker::NoTarget));
-        assert_eq!(target(&request(731, 0)), Err(PayloadBlocker::NoTarget));
+        assert_eq!(target(&encoded(0, 7)), Err(PayloadBlocker::NoTarget));
+        assert_eq!(target(&encoded(731, 0)), Err(PayloadBlocker::NoTarget));
     }
 
     #[test]
@@ -161,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_body_past_the_bound_is_refused_before_prost_sees_it() {
-        let mut body = request(731, 7);
+        let mut body = encoded(731, 7);
         body.resize(MAX_REQUEST_BODY + 1, 0);
         assert_eq!(
             target(&body),

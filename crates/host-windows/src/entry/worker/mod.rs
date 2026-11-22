@@ -33,6 +33,7 @@ use crate::capability::{Capability, Gate};
 use crate::entry::report;
 use crate::features::{self, FeatureReport, HostSettings};
 use crate::hooks::depot_store::DepotPlan;
+use crate::hooks::netpacket::fetch;
 use crate::hooks::state::HostState;
 use crate::install::{DetourInstaller, RunReport};
 
@@ -239,6 +240,9 @@ pub fn run(
     // same reason.
     let feature_report = features::run(&settings, &merged, None);
     state.set_gate(merged.clone());
+
+    // The request-code cache's producer, one worker for every module; idle says why.
+    notes.extend(fetch::start(&state).report());
 
     let outcome = HostOutcome {
         modules: outcomes,
