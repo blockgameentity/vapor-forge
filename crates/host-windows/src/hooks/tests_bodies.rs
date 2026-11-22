@@ -29,7 +29,13 @@ const LAUNCH_ENV: &str = "CUser::BuildSpawnEnvBlock";
 /// body installs at its entry through the real registry and
 /// [`Capability::Achievements`] stays enabled because it did.
 const MERGE: &str = crate::abi::achievements::MERGE_SYMBOL;
-const NO_BODY: &str = "CUser::GetSteamID";
+/// The identity accessor. Its body presents a per-app SteamID through the
+/// caller's out-parameter; this row is the flow proof that the registry, not the
+/// fake installer, is what installs it.
+const STEAM_ID: &str = "CUser::GetSteamID";
+/// Anchored in the corpus, no body on this host: the batch resolves it and fails
+/// cleanly, which is the case this file tests below.
+const NO_BODY: &str = crate::abi::achievements::BINIT_SYMBOL;
 
 /// Every symbol the corpus gained a body for in this pass, with the unique
 /// four-byte pattern the synthetic image carries for it and the RVA that gives.
@@ -42,6 +48,7 @@ const ANCHORED: &[(&str, &str, usize)] = &[
     (LAUNCH_ENV, "0A 0B 0C 0D", 0x1040),
     (SUBSCRIBED, "0F 1E 2D 3C", 0x1060),
     (MERGE, "5A 5B 5C 5D", 0x1080),
+    (STEAM_ID, "9A 9B 9C 9D", 0x1090),
 ];
 
 static NEXT_CORPUS: AtomicU64 = AtomicU64::new(0);
@@ -145,6 +152,7 @@ fn synthetic_steamclient_pe64() -> Vec<u8> {
     data[0x260..0x264].copy_from_slice(&[0x0F, 0x1E, 0x2D, 0x3C]);
     data[0x270..0x274].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
     data[0x280..0x284].copy_from_slice(&[0x5A, 0x5B, 0x5C, 0x5D]);
+    data[0x290..0x294].copy_from_slice(&[0x9A, 0x9B, 0x9C, 0x9D]);
     data
 }
 
@@ -197,6 +205,7 @@ fn every_anchored_body_installs_and_keeps_its_capability() {
         Capability::LaunchEnvironment,
         Capability::Ownership,
         Capability::Achievements,
+        Capability::SteamIdOverride,
     ] {
         assert!(
             report.gate.is_enabled(capability),
@@ -235,6 +244,7 @@ fn one_missing_anchor_costs_only_its_own_capability() {
         Capability::LaunchEnvironment,
         Capability::Ownership,
         Capability::Achievements,
+        Capability::SteamIdOverride,
     ] {
         assert!(
             report.gate.is_enabled(capability),
@@ -265,7 +275,8 @@ fn an_anchored_symbol_without_a_body_still_fails_cleanly() {
         failure.reason
     );
     // It maps to no capability either, so a bodyless symbol costs no feature: the
-    // decision-only `steam_id` module keeps its own capability untouched.
+    // identity capability belongs to `CUser::GetSteamID`, which this corpus never
+    // mentions, and to nothing else.
     assert!(report.gate.is_enabled(Capability::SteamIdOverride));
     assert!(report.gate.is_enabled(Capability::Ownership));
 }

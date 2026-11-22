@@ -108,6 +108,12 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         "CUser::BuildSpawnEnvBlock",
         &[Capability::LaunchEnvironment],
     ),
+    // The out-parameter accessor the identity body replaces. The symbol is not in
+    // the shipped corpus yet (a `.pdata`-less leaf; see
+    // `res/patterns/win64/VTABLE-REPORT.md` §9), and a symbol a batch never
+    // resolves cannot fail in it - so `SteamIdOverride` stays enabled until the
+    // corpus carries the entry, and costs itself alone once it does.
+    ("CUser::GetSteamID", &[Capability::SteamIdOverride]),
 ];
 
 /// Capabilities that depend on `symbol`; empty for an unknown symbol.
@@ -184,6 +190,7 @@ mod tests {
             ),
             ("CUser::BuildSpawnEnvBlock", Capability::LaunchEnvironment),
             ("CUser::GetSubscribedApps", Capability::Ownership),
+            ("CUser::GetSteamID", Capability::SteamIdOverride),
         ] {
             assert_eq!(
                 capabilities_for_symbol(symbol),
@@ -191,6 +198,16 @@ mod tests {
                 "{symbol} must gate {capability} and nothing else"
             );
         }
+    }
+
+    #[test]
+    fn the_identity_accessor_gates_the_identity_capability_alone() {
+        // The body presents a per-app SteamID and nothing else, so a corpus that
+        // stops resolving it must cost exactly that feature.
+        assert_eq!(
+            capabilities_for_symbol("CUser::GetSteamID"),
+            &[Capability::SteamIdOverride]
+        );
     }
 
     #[test]

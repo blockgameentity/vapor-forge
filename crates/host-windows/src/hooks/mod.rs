@@ -25,6 +25,7 @@
 //! | [`launch_env`] | `CUser::BuildSpawnEnvBlock` | yes / yes |
 //! | [`achievements`] (rewrites the reply) | `CAPIJobRequestUserStats::YieldingMergeStats` | yes / yes |
 //! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
+//! | [`steam_id`] | `CUser::GetSteamID` | **no / no** — body written, cannot install until the corpus carries the symbol |
 //!
 //! The rows that carry an anchor gap are listed rather than hidden: `install::deps`
 //! maps each of them to the capability it serves, so an absent anchor reports that
@@ -38,15 +39,21 @@
 //!
 //! # Decision-only modules
 //!
-//! Two capabilities have a portable decision and **no** body, because the win64
-//! corpus resolves no symbol to anchor one at (checked with
-//! `vapor-forge-pattern-mine --verify` against both live builds): [`steam_id`]
-//! (`CUser::GetSteamID` is a weak candidate with no corpus entry) and
-//! [`conflict_ui`] (`RegisterJsMethod` has no candidate in either SteamUI build).
-//! Each module names the Linux symbol that is missing, and each `decide` function is
-//! unit-tested. Neither is listed in [`REPLACEMENTS`]: a body whose symbol has no
+//! One capability has a portable decision and **no** body: [`conflict_ui`]
+//! (`RegisterJsMethod` has no candidate in either SteamUI build). The module names
+//! the Linux symbol that is missing, and each `decide` function is
+//! unit-tested. It is not listed in [`REPLACEMENTS`]: a body whose symbol has no
 //! anchor never installs, and registering one would make the install report claim a
 //! hook it does not have.
+//!
+//! `steam_id` used to be on that list. It is not any more: the corpus work that
+//! relaxed the anchor gate for a `.pdata`-less leaf made `CUser::GetSteamID`
+//! controllable under that name, and [`steam_id::registration`] is the body. Until
+//! the corpus entry reaches the shipped pattern files the symbol resolves in no
+//! build, so the body registers and installs nowhere — `install::deps` maps it to
+//! [`crate::capability::Capability::SteamIdOverride`], which therefore stays enabled
+//! (a symbol absent from a batch is not a failed dependency) and simply has no
+//! carrier on a live install yet.
 //!
 //! `achievements` is no longer in that list. Its decision lives in
 //! [`crate::features::achievements`], its two candidate sites are **anchored**
@@ -133,6 +140,7 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (ui::snapshot::SYMBOL, ui::snapshot::address),
     (ui::change::SYMBOL, ui::change::address),
     (netpacket::SYMBOL, netpacket::address),
+    (steam_id::registration::SYMBOL, steam_id::registration::address),
 ];
 
 /// The resolved symbol → body table, as the installer and the plan filter need it.
@@ -157,14 +165,25 @@ mod tests {
 
     #[test]
     fn an_unimplemented_symbol_has_no_replacement() {
-        // `CUser::GetSteamID` is still without an anchor: its Windows accessor
-        // takes an out-parameter (see `res/patterns/win64/VTABLE-REPORT.md`) and the
-        // candidate addresses are not `.pdata` entries.
-        assert!(replacement_address("CUser::GetSteamID").is_none());
+        // `IClientUser::GetSteamID` — the IPC-facing proxy — is still without a
+        // body: the Windows accessor the corpus measures is `CUser::GetSteamID`
+        // (out-parameter shape, see `res/patterns/win64/VTABLE-REPORT.md` §9), and
+        // the interface entry is reached through it.
         assert!(replacement_address("IClientUser::GetSteamID").is_none());
         assert_eq!(
             replacement_address(ownership::SYMBOL),
             Some(ownership::address())
+        );
+    }
+
+    #[test]
+    fn the_identity_body_is_registered_under_the_measured_symbol() {
+        // The body replaces the out-parameter accessor, not the Linux `u64`
+        // getter, so it is registered under the name the corpus will carry.
+        assert_eq!(steam_id::registration::SYMBOL, "CUser::GetSteamID");
+        assert_eq!(
+            replacement_address("CUser::GetSteamID"),
+            Some(steam_id::registration::address())
         );
     }
 
@@ -229,11 +248,7 @@ mod tests {
         // pattern files resolve none of them in either live build. Registering a
         // body would make the install report claim a hook the host does not have,
         // so the absence is asserted rather than assumed.
-        for symbol in [
-            "RegisterInternalCallback",
-            "IClientUser::GetSteamID",
-            "CUser::GetSteamID",
-        ] {
+        for symbol in ["RegisterInternalCallback", "IClientUser::GetSteamID"] {
             assert_eq!(
                 replacement_address(symbol),
                 None,

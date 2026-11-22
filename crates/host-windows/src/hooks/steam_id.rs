@@ -1,4 +1,4 @@
-//! SteamID override — **decision ready, no anchor**.
+//! SteamID override — the decision, and the body it now has a carrier for.
 //!
 //! The Linux host hooks `IClientUser::GetSteamID` and `CUser::GetSteamID`
 //! (`crates/hooks/src/client/user.rs`). The first publishes the *real* account for
@@ -15,16 +15,35 @@
 //! * a configured value that is not an individual SteamID64 is refused, never
 //!   replaced by a guessed one, and the refusal leaves Steam's answer in place.
 //!
-//! # Why there is no body here
+//! # The carrier
 //!
-//! Neither `IClientUser::GetSteamID` nor `CUser::GetSteamID` is in the win64
-//! corpus: verified with the miner against both live builds. The function returns a
-//! `uint64` in `rax`, and replacing it without a measured signature would mean
-//! inventing the return convention for a call that every game in the process
-//! makes — the single most dangerous place to guess.
+//! [`decide`] is the portable half; [`registration`] is the FFI body. The Windows
+//! accessor takes an **out-parameter** —
 //!
-//! [`decide`] is the portable half and mirrors the Linux precedence exactly, so a
-//! body would be a two-line wrapper the day a `GetSteamID` anchor is mined.
+//! ```text
+//! mov 0x20a(%rcx),%rax ; mov %rax,(%rdx) ; mov %rdx,%rax ; ret
+//! ```
+//!
+//! — so it is `CSteamID* GetSteamID(this, CSteamID* out)`, not the `u64
+//! GetSteamID(this)` shape the Linux validator assumes. The body therefore calls
+//! Steam's own accessor first (through the published trampoline), and only then
+//! writes the override through the caller's pointer and returns that pointer. The
+//! shape and what is measured about it live in [`crate::abi::steam_id`].
+//!
+//! # Which app a call belongs to
+//!
+//! The Windows accessor carries no app id: it reads one member of `this` and
+//! stores it through a pointer. The Linux host reads the caller's AppID from its
+//! IPC dispatcher (`client::current_app`), and this host has no equivalent — so it
+//! must not guess. [`served::served_app`] is the guard: an override is applied only
+//! when the config names exactly one app and the effective controlled set names
+//! nothing else, i.e. when there is only one app a call *can* be about. A
+//! configuration that names several forwards Steam's answer instead, because
+//! presenting one app's borrowed identity to another is the one failure this hook
+//! must not cause.
+
+pub mod registration;
+pub mod served;
 
 use vapor_forge_config::AppId;
 use vapor_forge_features::identity;

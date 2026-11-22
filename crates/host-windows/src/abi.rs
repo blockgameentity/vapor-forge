@@ -46,6 +46,7 @@ pub mod netpacket;
 pub mod ownership;
 pub mod package;
 pub mod shader;
+pub mod steam_id;
 pub mod subscribed;
 pub mod ticket;
 pub mod ui;
