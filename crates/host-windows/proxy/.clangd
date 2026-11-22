@@ -1,0 +1,6 @@
+# loader.c is built by the MinGW-w64 cross compiler, never by the host compiler,
+# so clangd needs to be told where <windows.h> lives or it reports every Win32
+# identifier as undefined.
+CompileFlags:
+  Compiler: x86_64-w64-mingw32-gcc
+  Add: [-D_WIN32, -DUNICODE]

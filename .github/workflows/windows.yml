@@ -1,0 +1,122 @@
+name: windows
+# The Windows host and its `version.dll` proxy only compile for
+# x86_64-pc-windows-gnu, so the Linux `CI` workflow has never touched them: the
+# proxy could rot for months and no pull request would notice. This job builds
+# both on a Linux runner with MinGW-w64 and asserts the proxy's export surface,
+# which is the one contract a Steam update can break invisibly.
+#
+# The Rust build is cross-compilation only. Getting a real Steam client to load
+# the proxy is a manual, Windows-only check; this workflow guards the artifact,
+# not the injection.
+on:
+  push:
+    branches: [master, main]
+    # Only the paths that can change the Windows artifact, so this job does not
+    # become a second copy of `CI`.
+    paths:
+      - "crates/host-windows/**"
+      - "crates/pe/**"
+      - "crates/hook-engine/**"
+      - "crates/patterns/**"
+      - "crates/config/**"
+      - "crates/features/**"
+      - "crates/runtime-core/**"
+      - "scripts/build-proxy.sh"
+      - ".github/workflows/windows.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  pull_request:
+    # Same list, spelled out: the repository's other workflows avoid YAML
+    # anchors, and duplicating a dozen lines is cheaper to review than an alias
+    # whose expansion must be checked with a YAML parser.
+    paths:
+      - "crates/host-windows/**"
+      - "crates/pe/**"
+      - "crates/hook-engine/**"
+      - "crates/patterns/**"
+      - "crates/config/**"
+      - "crates/features/**"
+      - "crates/runtime-core/**"
+      - "scripts/build-proxy.sh"
+      - ".github/workflows/windows.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
+env:
+  CARGO_TERM_COLOR: always
+  MINGW_TARGET: x86_64-pc-windows-gnu
+  # Documented Win32 `version.dll` surface; scripts/build-proxy.sh asserts it
+  # against the linked export table, and the job asserts it again below so the
+  # expected number is visible in the log rather than buried in the script.
+  PROXY_EXPORT_COUNT: "16"
+jobs:
+  windows-gnu:
+    name: Windows (x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install MinGW-w64
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 binutils
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-objdump --version | head -1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-gnu
+      - name: Cache cargo registry + build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-${{ runner.os }}-
+      # The regression guard: this is the only job that compiles the Windows
+      # host at all, so a broken Win32 path fails here and nowhere else.
+      - name: Build host DLL (Windows target)
+        run: cargo build -p vapor-forge-host-windows --target "$MINGW_TARGET" --locked
+      # build.rs builds the proxy during the build above when MinGW is present.
+      # Running the script explicitly keeps the artifact independent of that
+      # heuristic, and its own assertions run either way.
+      - name: Build proxy DLL
+        run: scripts/build-proxy.sh "$MINGW_TARGET"
+      - name: Assert proxy exports
+        run: |
+          set -eux
+          artifact="target/proxy/${MINGW_TARGET}/version.dll"
+          test -f "$artifact"
+          count="$(x86_64-w64-mingw32-objdump -p "$artifact" | grep -c 'Forwarder RVA')"
+          test "$count" -eq "$PROXY_EXPORT_COUNT"
+          # Every forwarder must point at the real system module, not at the
+          # proxy itself: a bare module name would recurse into this DLL.
+          x86_64-w64-mingw32-objdump -p "$artifact" | grep 'Forwarder RVA' \
+            | grep -c 'C:/Windows/System32/version.dll\.' | grep -qx "$PROXY_EXPORT_COUNT"
+          ls -l "$artifact"
+      # The host crate and its logic are plain Rust, so the whole workspace test
+      # suite still runs on the Linux host; nothing here needs a Windows runner.
+      - name: Tests
+        run: cargo test --workspace --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vapor-forge-windows-${{ github.sha }}
+          path: |
+            target/${{ env.MINGW_TARGET }}/debug/vapor_forge_host_windows.dll
+            target/proxy/${{ env.MINGW_TARGET }}/version.dll
+          if-no-files-found: error
