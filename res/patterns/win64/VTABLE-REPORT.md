@@ -251,3 +251,240 @@ it is refuted, not pending.
 * RTTI names come from the mangled type descriptor; template instantiations and
   function-local types are shortened to their first component, so `--class`
   matching is by (case-insensitive) exact-or-substring name.
+
+---
+
+# Second pass: argument flow, and the two ticket/stats targets
+
+The first pass measured slot *shape* (sizes, store widths, loops, probe scores).
+This pass measures the axis the shape could not see — **where each argument
+goes** — and adds a second evidence class: MSVC leaves assert and log strings
+that name the enclosing method, so a string xref plus "which table holds this
+function" gives ground-truth slot names. Both are reported apart from each
+other, and neither is a live confirmation.
+
+## What was measured
+
+Tool changes (this branch, `gate0/ticket-stats-anchors`):
+
+* `vtable_pe/msflow/` — a linear **MS-x64** argument walk (`rcx, rdx, r8, r9`).
+  `crate::arg_flow` already does this for the System V order, and the existing
+  `u32_stores_via_arg` collapses at the first branch, which is why the first
+  pass could only *infer* that a store lands in the caller's array. Per slot the
+  walk now reports:
+  * `thru N:k` — k stores whose address derives from argument N, including
+    `mov rax,[r8]` followed by `mov [rax],ecx` (a write into what the argument
+    points at). `u32thru` counts the 4-byte ones.
+  * `fwd N:k` — k call sites that were handed argument N.
+  * `deref N:k` — memory operands reached through argument N, reads included.
+  * `arg32 N:k` — reads of argument N as a 32-bit register (`edx`, not `rdx`).
+  * `ret R+kb` — returns reached by the walk, and how many of them left `al` a
+    0/1 constant or a `setcc` result, i.e. a `bool`.
+* `vtable_pe/shape.rs` — the build-shape fingerprint moved out of
+  `structure.rs` (file-length rule; behaviour unchanged).
+* `vapor-forge-vtable-pe --holds <rva>` — the inverse of an anchor: which
+  enumerated tables hold a function, resolving an interior `.pdata` address to
+  its entry first (that is what a disassembly cross-reference gives you).
+
+Limits, stated because they bound every claim below: the walk is linear from the
+entry and stops at the first `ret` or unconditional jump, so it describes the
+straight-line prefix; stack-argument *pointers* are not tracked, so a 5th/6th
+argument's out-parameter writes are invisible; caller-saved registers are
+dropped at calls, callee-saved ones are kept (an out-parameter is often written
+only in the epilogue).
+
+## Method-level labels: string xrefs as ground truth
+
+`objdump -d` over the whole `.text`, grep for the resolved address of a named
+string, then `--holds` on the containing function. Public build:
+
+| string | function | holds |
+| --- | --- | --- |
+| `CUser::GetSubscribedApps` | `0xa0bca0` | **CUser 260-slot 183** |
+| `CUser::GetAppLastPlayedTime` | `0xa07360` | CUser 260-slot 158 |
+| `CUser::BGetAppMinutesPlayed` | `0x9faf70` | CUser 260-slot 157 |
+| `CUser::CheckAppOwnership` | `0xa03a70` | not a slot (unchanged) |
+| `CUserStats::GetNumAchievements` | `0xa97010` | CUserStats 56-slot 3 |
+| `CUserStats::GetAchievementName` | `0xa95140` | slot 4 |
+| `CUserStats::RequestCurrentStats` | `0xa9bde0` | slot 5 |
+| `CUserStats::GetNumAchievedAchievements` | `0xa96f10` | slot 40 |
+| `CUserStats::GetLastAchievementUnlocked` | `0xa96160` | slot 41 |
+
+Two consequences.
+
+1. **The first pass's `CUser::GetSubscribedApps` candidate is corroborated
+   independently.** Slot 183 was picked from the 0x50 licence stride and the
+   anchored `CPackageInfo::GetPackageInfo` callee; the function at that slot
+   also logs `CUser::GetSubscribedApps`. Two unrelated measurements agreeing on
+   that slot is the strongest statement static analysis can make about a *slot*;
+   it does not show that the body behaves correctly under a running client (the
+   first pass's "What would confirm" for that symbol is unchanged and open).
+2. **The `.rdata` method-name tables are usable, but only locally.** The
+   `IClientUserStats` name list is in exact vtable order — five independent
+   labels above agree with `index - 1051 = slot`, so all 55 `CUserStats`
+   methods (0 `GetNumStats` … 54 `BAchievementIconLoaded`) can be named. The
+   `IClientUser` list is **not**: its local offset is 30 up to
+   `GetAppLastPlayedTime` (index 188 → slot 158) and 28 at
+   `GetSubscribedApps` (211 → 183), so two names between them have no slot of
+   their own. A name list is therefore evidence per region, never a global map,
+   and nothing in this section is a substitute for a live check.
+
+## Target 1 — `CUser::GetAppTicket`
+
+Candidate pool: the four `CUser` tables (356 public slots; 41 / 260 / 48 / 7,
+beta 41 / 261 / 49 / 7). Only **7** of the 356 store through argument 3 (the
+host ABI's `out`) — six of them in the 260-slot table, one in the 48-slot one —
+and the ranking below is over that pool, plus the one `CUtlBuffer` writer for
+contrast.
+
+| # | slot | public / beta | size | args (first use) | writes | callees | cross-build |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **1** | **88** | `0xa0a220` / `0xa32810` | 489 / 489 B | `rdx` read as 32-bit, `r8` ptr, `r9` copied then `movsxd` (a size) | `thru 2:1` — `mov byte [r8],0` then `memcpy(dst=r8, src, cbMax)`; `bool` ret (`al` 0/1) | `CBaseUser#33` (`0x518fe0`, the section reader), `CUser#182` (`0x9fcf90`, which calls the anchored `CUser::CheckAppOwnership`), 13 calls | **identical** flow and size |
+| 2 | 87 | `0xa16f70` / `0xa3fcf0` | 238 / 238 B | `rdx` 32-bit, `r8` ptr, `r9` unused | `thru 2:2` — zeroes `*r8`, then `*r8 = result` | `CUser#88` (candidate 1 is its only labelled callee), 5 calls | identical |
+| 3 | 108 | `0xa0aae0` / `0xa330d0` | 177 / 177 B | `rdx` 32-bit, `r8` ptr written, `r9` ptr, stack arg = size | `thru 2:1` (an 8-byte store) + `memcpy` into `r9`; `bool` ret | none labelled | identical |
+| 4 | 258 | `0x9fb930` / `0xa23950` | 576 / 564 B | `r8`, `r9` ptr | `thru 2:1,3:1 u32thru 2:1,3:1` | none labelled | **differs** (`thru 3:1` gone in beta) |
+
+Candidate 1 is the one this branch would defend, and the reason is a string
+fact, not a shape fact: `LegacyKeyProofOfPurchaseTicket`, `ProofOfPurchaseTicketRevision`
+and `cdk_%u_%u` are each referenced **exactly once in the whole module**, all
+three inside `0xa0a220` (`0xa0a323`, `0xa0a3ae`, `0xa0a476`; beta `0xa32810`).
+No other function touches the proof-of-purchase (CD-key based ownership) ticket.
+The body is exactly "look up this app's ownership ticket, validate its revision
+against the engine counter, `memcpy` it into the caller's buffer bounded by the
+caller's size, report success".
+
+Candidate 2 is the same path one level up: it probes the ticket into a 0x200-byte
+stack buffer through candidate 1 and reports the outcome as `*out = bool`,
+returning `1` when the probe ran at all. Candidate 3 reads a per-app 24-byte
+entry array at `this+0x3ed8` and writes an 8-byte value plus a copy into two
+different caller pointers, with five parameters after `this` — no ticket
+strings, so it is a lookup helper in the same neighbourhood rather than the
+ticket getter. Candidate
+4 fails the cross-build check and carries no ticket strings.
+
+**Rejected, and why — including the obvious-looking one.**
+
+* **slot 20** (`0x597b20` / `0x5b4660`, 170 B, identical in both builds) is the
+  only `CUser` slot besides the protobuf serialiser 69 that calls the anchored
+  `CUtlBufferEnsureCapacity` (`0xd1b3f0`), and it really does fill a
+  caller-supplied `CUtlBuffer`: init, length probe, `EnsureCapacity`,
+  fill `buf->m_pMemory`, set the put position, `bool`. Its call looks like
+  `(this, app id, const char *, CUtlBuffer *)`. It was the leading candidate
+  until its callee chain was read: `CBaseUser#33` (`0x518fe0`) passes its second
+  argument to `CBaseUser#34` (`0x519100`), which calls **`CBaseUser` 41-slot slot
+  26** (`0x519210`) — a 15-case switch over that argument returning strings
+  `news`, `friends`, `apptickets`, `depots_beta`, `depots_dev`, `cache`,
+  `streaming_v2`, `Broadcast`, `bigpictureweb`, `nettickets`, … — and builds the
+  path `"%s\\%s"` from it. The second argument is a **config section id**, and
+  the fourth is a `CUtlBuffer`. That is `GetConfigBinaryBlob`-shaped, not a
+  per-app ticket getter. The presence of `"apptickets"` in that switch is a
+  namespace, not a ticket body: the string is referenced exactly once in the
+  module, at `0x519264`, inside that switch.
+* **slot 77**, **181**, **253** — `thru 2:1` but no ticket string, no callee
+  into the ticket path, and (181) no `.pdata` entry at all.
+* **slot 69** (`0x9fe360`, 734 B) calls `CUtlBufferEnsureCapacity` too, and logs
+  `CProtoBufMsg::CProtoBufMsg( EMsg )`: a message serialiser.
+
+**Corpus entry: added.** Both builds share the same 24-byte prologue, so one
+pattern serves both; mined with `vapor-forge-pattern-mine` (1 match, unique,
+`verified` on the anchor gate):
+
+```
+[steamclient."CUser::GetAppTicket"]
+follow = "none"
+pattern = "48 89 5C 24 10 55 56 57 48 81 EC A0 04 00 00 49 63 E9 49 8B F8 8B F2 41"
+```
+
+`--verify` resolves it to `0xa0a220` (public) / `0xa32810` (beta), one match
+each, gate verified; the rest of both corpora still resolve (the one
+pre-existing `GetPipeClient: unmapped` rejection is unchanged).
+
+**What this entry does *not* prove, and the ABI it implies.** The name is the
+host's symbol; the binary does not contain the string `CUser::GetAppTicket`, so
+the C++ name is an interpretation of the behaviour. The behaviour itself is
+established (unique proof-of-purchase ticket reader, caller-supplied buffer,
+size bound, `bool`). The window's argument order is `(this, AppId_t app_id, void
+*pTicket, int cbMax) -> bool` — **arg 2 is the raw buffer and arg 3 is a size**,
+not a `CUtlBuffer *` and not a `bool`; `crates/host-windows/src/abi/ticket.rs`
+assumes the opposite and should be revised with this slot.
+
+**What would confirm it on a live client:** hook `0xa0a220` and log the call
+sites — every call should arrive with a small `AppId_t` (the id of a game the
+account owns), a buffer, and the buffer coming back with the ticket blob. Its
+direct callers are `CUser` slots 87 (the bool-out probe), 90 and 160, plus
+`CUser::YieldingRunAllCDKeysFromApp` (`0xa161d0`, named by its own log string) —
+which is what a proof-of-purchase reader should be called from. **What would
+refute it:** the calls carrying app ids the account does *not* own, or the
+buffer being filled with the `cdk_%u` CD-key text instead of a ticket blob, or
+`IClientUser::GetAppOwnershipTicketData` being demonstrably this same body — in
+which case the entry is misnamed and the host's ticket ABI has to be rebuilt
+around slots 108/109 too.
+
+## Target 2 — user stats: class fully named, target shape absent
+
+`CUserStats` RTTI tables: public `0x13b2330` / 56 slots and `0x13b24f8` / 11;
+beta 57 and 11. Using the validated name list, every one of the 55
+`IClientUserStats` methods is now placed; the slots that hand data back to a
+caller are:
+
+| slot | method | size | args | what it does |
+| --- | --- | --- | --- | --- |
+| 23 | `RequestUserStats` | 496 B | `rdx` CSteamID (8 bytes), `r8` ptr | async request, no caller buffer |
+| 24 / 25 | `GetUserStat` ×2 | 493 / 499 B | `rdx` CSteamID, `r8` name ptr, `r9` out ptr | **one** 4-byte store through arg 3, `void` return |
+| 26 | `GetUserAchievement` | 87 B | `rdx` CSteamID, `r8` name | three 32-bit stores into three **stack-argument** pointers, `bool` return |
+| 17 | `GetUserAchievementProgress` | 792 B | CSteamID, name, two stack out ptrs | same pattern, longer body |
+| 42 / 46 | `GetMostRecentAchievementUnlocked` / `GetAchievementAchievedPercent` | 621 / 556 B | | one store through arg 2 |
+
+**No `CUserStats` slot matches the shape the task proposes** ("multiple 32-bit
+stores through a pointer, count return"). The closest are 24/25 (a single 4-byte
+store, `void`) and 26/17/42 (three separate out-pointers taken on the stack, all
+of them written by a callee, `bool` returns). There is no slot that returns a
+*count* of stats it wrote into one buffer.
+
+That negative is worth stating precisely, because the selector is not
+discriminative even inside `CUser`: slot **257** (`0xa09330`, 430 B, public and
+beta identical) has `thru 1:5 u32thru 1:5` — five consecutive 32-bit stores
+through argument 2, no calls at all — and it is a **hash-bucket teardown**:
+`for (i = count-1; i >= 0; --i) { bucket = base + i*24; bucket[1] = -1;
+bucket[0] = i; }` followed by a free-list walk with a 0x58 stride. Five 32-bit
+stores through one pointer is what a container destructor looks like.
+
+**No corpus entry.** What evidence is missing, exactly:
+
+* The host's symbol `CUser::GetUserStats` has no counterpart string anywhere in
+  either module — unlike `CUser::GetSubscribedApps`, `CUserStats::*` and the
+  `IClientUser` name table. There is nothing to anchor a name to.
+* `IClientUserStats` has no "all stats for a user into one buffer" method: stats
+  are fetched one name at a time (slots 24/25, 26, 17) or asynchronously (23).
+  A `GetUserStats` that returns a count of stats written, as the task describes,
+  is therefore either a *non-virtual* helper (invisible to the class route, the
+  same situation as `CUser::CheckAppOwnership`) or a name for slot 24/25 with a
+  looser description than the shape implies.
+* The per-user stats block is owned by the callee of 24/25 and 26, which is not
+  a `CUserStats` vtable entry (the store through the out pointer happens there,
+  not in the slot).
+
+**What would confirm a stats anchor on a live client:** break on the *callee* of
+slot 24/25 (`0xa98040` / `0xa97d40` call a shared helper at a fixed RVA) while a
+game calls `ISteamUserStats::RequestUserStats` + `GetUserStat`, and check that
+the helper walks the per-user stats map and writes 4 bytes per stat; if the
+helper is in `.pdata` and has a stable prologue, *that* is the body the
+`Achievements` capability should replace, not a `CUserStats` slot. **What would
+refute it:** the helper turning out to be the generic `UtlHash` lookup shared
+with leaderboards (slots 28-39), which would leave no single interception point
+for "all stats of a user".
+
+## Limits of this second pass
+
+* Everything above is static. A string that names a method names the *function
+  that logs it*, which is the method in every case checked here, but MSVC inlines
+  and merges: the label can belong to an inlined copy.
+* The `IClientUser` name table drifts by two entries against the 260-slot vtable
+  between index 188 and 211, so it cannot be used to name arbitrary slots; only
+  the `CUserStats` list is in exact order.
+* `CUser` 260-slot indices are *not* portable between builds on their own (the
+  beta table has one extra slot); each slot quoted here was re-measured in the
+  beta build and keeps its structure and size.
+* Store-through-argument counts are upper bounds on the *prefix*: a body that
+  writes its out-parameter only in a late error path is under-counted, and stack
+  argument pointers are not tracked at all.
