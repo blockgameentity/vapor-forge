@@ -27,11 +27,17 @@
 //!    be undefined behaviour, so the trampoline types return `u8` and every body
 //!    produces its own `0`/`1`.
 
+pub mod callbacks;
 pub mod cloud;
 pub mod depot;
+pub mod dlc;
+pub mod launch_env;
+pub mod legacy_cdkey;
 pub mod netpacket;
 pub mod ownership;
 pub mod package;
+pub mod shader;
+pub mod subscribed;
 pub mod ticket;
 pub mod ui;
 

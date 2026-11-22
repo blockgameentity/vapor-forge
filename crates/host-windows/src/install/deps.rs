@@ -56,7 +56,37 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         "CSteamUIAppController::BuildCompleteAppOverviewChange",
         &[Capability::LibrarySnapshot],
     ),
-    ("CUpdateManager::MarkAppChange", &[Capability::LibrarySnapshot]),
+    (
+        "CUpdateManager::MarkAppChange",
+        &[Capability::LibrarySnapshot],
+    ),
+    // The six bodies added once the corpus anchored them. Each names the one
+    // capability it serves, so a corpus that stops resolving one symbol costs one
+    // feature instead of the batch.
+    (
+        "CShaderCacheManager::GetShaderCacheDepot",
+        &[Capability::ShaderCacheControl],
+    ),
+    (
+        "IClientAppManager::IsAppDlcInstalled",
+        &[Capability::DlcOverrides],
+    ),
+    (
+        "IClientAppManager::BIsDlcEnabled",
+        &[Capability::DlcOverrides],
+    ),
+    (
+        "CSteamEngine::SetAPICallResult",
+        &[Capability::CallbackEvents],
+    ),
+    (
+        "IClientUser::RequiresLegacyCDKey",
+        &[Capability::LegacyCdKeyControl],
+    ),
+    (
+        "CUser::BuildSpawnEnvBlock",
+        &[Capability::LaunchEnvironment],
+    ),
 ];
 
 /// Capabilities that depend on `symbol`; empty for an unknown symbol.
@@ -86,6 +116,49 @@ mod tests {
     #[test]
     fn unknown_symbols_have_no_dependency() {
         assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
+    }
+
+    #[test]
+    fn each_anchored_body_names_the_capability_it_serves() {
+        // The six bodies the corpus gained in this pass, plus the subscription body
+        // that shares `ownership` with `CheckAppOwnership`.
+        for (symbol, capability) in [
+            (
+                "CShaderCacheManager::GetShaderCacheDepot",
+                Capability::ShaderCacheControl,
+            ),
+            (
+                "IClientAppManager::IsAppDlcInstalled",
+                Capability::DlcOverrides,
+            ),
+            ("IClientAppManager::BIsDlcEnabled", Capability::DlcOverrides),
+            ("CSteamEngine::SetAPICallResult", Capability::CallbackEvents),
+            (
+                "IClientUser::RequiresLegacyCDKey",
+                Capability::LegacyCdKeyControl,
+            ),
+            ("CUser::BuildSpawnEnvBlock", Capability::LaunchEnvironment),
+            ("CUser::GetSubscribedApps", Capability::Ownership),
+        ] {
+            assert_eq!(
+                capabilities_for_symbol(symbol),
+                &[capability],
+                "{symbol} must gate {capability} and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn both_dlc_entry_points_gate_the_same_capability() {
+        // Steam asks two questions and the host answers both: a corpus that anchors
+        // only one of them still needs the same capability, so a failure there is one
+        // disabled feature, not two.
+        for symbol in [
+            "IClientAppManager::IsAppDlcInstalled",
+            "IClientAppManager::BIsDlcEnabled",
+        ] {
+            assert_eq!(capabilities_for_symbol(symbol), &[Capability::DlcOverrides]);
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Callback events — **decision ready, no anchor**.
+//! Callback events — the decision behind the `SetAPICallResult` body.
 //!
 //! The Linux host registers Steam's internal callbacks
 //! (`RegisterInternalCallback`) and reads API-call results (`SetAPICallResult`)
@@ -14,17 +14,20 @@
 //!    read past its end;
 //! 3. nothing larger than [`MAX_INTERNAL_CALLBACK_PAYLOAD`] is accepted at all.
 //!
-//! # Why there is no body here
+//! # The body lives next door
 //!
-//! Neither `RegisterInternalCallback` nor `SetAPICallResult` is in the win64
-//! corpus: verified with the miner against both live builds. The symbols the
-//! corpus does resolve look adjacent but are different functions —
-//! `IPCProcessMessage` and `PchMsgNameFromEMsg` are the CM message path
-//! (`Capability::CmInterception`), and a body there could only observe, not
-//! deliver a callback.
+//! `CSteamEngine::SetAPICallResult` is anchored in both live builds, so a body does
+//! ship: [`crate::hooks::callback_result`] is the FFI half, split off so this table
+//! stays readable. It calls the original first, then applies [`decide`] to the
+//! result's id and size.
 //!
-//! [`decide`] is the portable half: it is what a registration or delivery body
-//! would call, and it is fully unit-tested here.
+//! What is still missing is the *consumer*: the Windows host has no delivery sink
+//! wired (the Linux host's `callback_dispatch` has no counterpart here yet), so the
+//! body reports the decision and returns. That is deliberate — a body that claimed
+//! delivery without a sink would be a lie in the log.
+//!
+//! `RegisterInternalCallback` is **not** anchored in either build (refuted in the
+//! mining verdict), so the registration half stays decision-only.
 
 use crate::capability::Capability;
 use crate::hooks::state::HostState;
@@ -203,7 +206,7 @@ mod tests {
     fn a_disabled_capability_drops_every_callback() {
         let state = state();
         let mut gate = state.gate();
-        gate.disable(Capability::CallbackEvents, "no anchor in the corpus");
+        gate.disable(Capability::CallbackEvents, "the symbol did not resolve");
         state.set_gate(gate);
         assert_eq!(
             decide(&state, 1101, 20),
