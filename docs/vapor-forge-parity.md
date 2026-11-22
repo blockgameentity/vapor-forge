@@ -52,12 +52,12 @@ signature that resolves on the current public build.
 | Achievements | `client/{achievement,user_stats}.rs` | ❌ body absent | ❌ stats path unanchored (class fully named, target shape absent) |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 8 of 21 capabilities have a body, 7 of them installable**;
-Linux implements ~19. Ticket moved from "written but unanchored" to installable
+Counts: **Windows 8 of 21 capabilities have a body, all 8 installable** (every
+body's symbol is anchored in both live builds). Linux implements ~19. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
-Corpus coverage: Linux ships **34** symbols, Windows **23** (union of public +
-publicbeta). Windows bodies exist for 8, of which 7 resolve.
+Corpus coverage: Linux ships **34** symbols, Windows **24** (union of public +
+publicbeta; public 15 + 7, beta 14 + 7). All 8 Windows bodies resolve.
 
 ## 3. Gap classes, and what each one costs
 

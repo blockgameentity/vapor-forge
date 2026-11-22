@@ -31,7 +31,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 | module identity, capability gate, proxy plan, Win32 FFI | done | `crates/host-windows/src/{module,capability,proxy,inject}.rs` |
 | install layer (corpus → BatchPlan → DetourInstaller) | done, no live client | `crates/host-windows/src/install*` |
 | loadable DLL: `DllMain` + worker thread + report bundle | done, compiled for `x86_64-pc-windows-gnu`, **never loaded by Steam** | `crates/host-windows/src/entry*`, `src/thread.rs` |
-| hook bodies: ownership, package/marker pass, depot pre-seed consult, ticket decision | done; 3 of 4 have a corpus anchor, the ticket body has none | `crates/host-windows/src/hooks/*`, `src/abi/*` |
+| hook bodies: ownership, package/marker, depot pre-seed, ticket, and four SteamUI library bodies | done; **all 8 are anchored in both live builds** | `crates/host-windows/src/hooks/*`, `src/abi/*` |
 | behavioural probes (msabi + 4 profiles) | done, **all four targets still open** | `crates/patterns/src/{msabi,probe_facts,probe_rank}.rs`, `res/patterns/win64/PROBE-REPORT.md` |
 | depotcache pre-seed logic | done (traits only, no host wiring) | `crates/features/src/depotcache.rs` |
 | egress policy check | done | `scripts/check-egress.sh` |
@@ -104,6 +104,6 @@ out-buffer layouts those would need are not measured on any Windows build.
 - `features::depotcache`'s pre-seed is consulted at `GetDecryptionKey`, because no
   request-code site (`CUser::BuildSpawnEnvBlock`) is anchored. Nothing skips
   Steam's request-code round trip yet.
-- Windows corpus covers 14/26 (steamclient) and 7/10 (steamui) symbols on public.
+- Windows corpus covers 15/26 (steamclient) and 7/10 (steamui) symbols on public.
   The remainder were never published as hints; behavioural probing did not
   identify them (`PROBE-REPORT.md`), and vtable anchoring found one candidate.
