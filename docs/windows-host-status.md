@@ -31,14 +31,18 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 | depotcache pre-seed logic | done (traits only, no host wiring) | `crates/features/src/depotcache.rs` |
 | egress policy check | done | `scripts/check-egress.sh` |
 | corpus drift CI | done | `.github/workflows/pattern-drift.yml` |
+| proxy DLL build (`version.dll` forwarding to System32, loads the host DLL) | done, built and inspected; never loaded by Steam | `crates/host-windows/{build.rs,proxy/}`, `scripts/build-proxy.sh` |
+| Windows CI job (cross-build + proxy export assertion + artifacts) | done | `.github/workflows/windows.yml` |
+| config → feature flags bridge | done | `crates/features/src/config_apply.rs`, called from `ensure_runtime_services_for_config` |
 
 ## Verification (all run on Linux, no Windows box)
 
 ```sh
-cargo test --workspace                                  # 1134 passed, 0 failed
+cargo test --workspace                                  # 1185 passed, 0 failed
 cargo clippy --workspace --all-targets -- -D warnings    # clean
 cargo check --workspace --all-targets                    # clean
-cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok
+cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok, emits the host DLL
+objdump -p target/proxy/x86_64-pc-windows-gnu/version.dll                 # forwards to System32\version.dll.<name>
 scripts/check-egress.sh                                  # ok
 cargo test -p vapor-forge-host-windows                   # 104 passed
 cargo clippy -p vapor-forge-host-windows --all-targets -- -D warnings   # clean
