@@ -869,6 +869,10 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
     let this = CPKG_INFO_PTR.load(Ordering::Acquire) as *mut c_void;
     let mut owned: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut family: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // The account each family licence names, per app. A licence is the only
+    // sample that can name a lender, so this is the map the borrower marker and
+    // `features::family::provenance` are fed from.
+    let mut family_owner: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut missing = 0usize;
     for license in &packages {
         // SAFETY: the receiver was captured from Steam's own GetPackageInfo
@@ -891,7 +895,13 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             // SAFETY: Steam's vector header describes `count` live u32 elements.
             let apps = unsafe { std::slice::from_raw_parts(base as *const u32, count) };
             if self_account_id != 0 && license.is_held_by_other_account(self_account_id) {
-                family.extend(apps);
+                for &app in apps {
+                    family.insert(app);
+                    // One lender per app: a second licence naming the same app
+                    // keeps the owner already recorded, which is what the
+                    // marker holds anyway.
+                    family_owner.entry(app).or_insert(license.owner_id);
+                }
             } else {
                 owned.extend(apps);
             }
@@ -948,6 +958,46 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             changed_apps = ?changed.iter().take(16).collect::<Vec<_>>(),
             family_changed_apps = ?family_changed.iter().take(16).collect::<Vec<_>>(),
             "package: ownership refreshed from license list"
+        );
+    }
+    // Family housekeeping from the same walk: the owner id and the borrower
+    // marker are written here, and `features::family` decides whether the claim
+    // names a lender we may trust and whether a marker has to go. Both passes are
+    // idempotent, so re-running them on every refresh is safe.
+    let settings = super::family_decide::settings();
+    let package = crate::client::install::package_state();
+    let mut stamped: Vec<(u32, u32)> = Vec::new();
+    let mut markers_removed: Vec<u32> = Vec::new();
+    for &app_id in &controlled {
+        match family_owner.get(&app_id.0).copied() {
+            Some(owner) => {
+                if let Some(lender) =
+                    super::family_decide::note_lender(package, app_id, owner, self_account_id)
+                {
+                    stamped.push((app_id.0, lender));
+                }
+            }
+            // Downgrades wait for a complete picture, exactly like the
+            // ownership record above: an app may live in a package whose info
+            // has not arrived yet.
+            None if complete => {
+                let injected = package.is_injected_into_pkg0(app_id);
+                if super::family_decide::note_unborrowed(package, app_id, injected, settings)
+                    .changed()
+                {
+                    markers_removed.push(app_id.0);
+                }
+            }
+            None => {}
+        }
+    }
+    if !stamped.is_empty() || !markers_removed.is_empty() {
+        info!(
+            stamped = ?stamped.iter().take(16).collect::<Vec<_>>(),
+            removed = ?markers_removed.iter().take(16).collect::<Vec<_>>(),
+            validate_lender = settings.validate_lender,
+            clean_borrower_markers = settings.clean_borrower_markers,
+            "package: family markers reconciled from the license list"
         );
     }
     // Family-shared apps stay out of pkg0, so a change in that set changes

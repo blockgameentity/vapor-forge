@@ -2,6 +2,7 @@ pub mod install;
 pub mod package;
 
 pub(crate) mod achievement;
+pub(crate) mod achievement_local;
 pub(crate) mod callback_dispatch;
 pub(crate) mod callback_notify;
 pub(crate) mod client_id;
@@ -10,9 +11,11 @@ pub(crate) mod cloud_http;
 pub(crate) mod current_app;
 pub(crate) mod cxx_rtti;
 pub(crate) mod depot;
+pub(crate) mod depot_preseed;
 pub(crate) mod dlc;
 pub(crate) mod env;
 pub(crate) mod eticket;
+pub(crate) mod family_decide;
 pub(crate) mod family_lock;
 pub(crate) mod internal_callbacks;
 pub(crate) mod legacy_cdkey;
@@ -39,6 +42,9 @@ pub(crate) fn reset_account_state() {
     install::reset_account_state();
     crate::ui::install::reset_account_state();
     vapor_forge_features::apps::reset_account_state();
+    // The local definition set and unlock state belong to the account that just
+    // went away, so nothing about them may outlive it.
+    achievement_local::forget_account_state();
     playtime_downlink::reset_account_state();
     vapor_forge_features::rich_presence::reset_account_state();
     crate::achievement_worker::notify_context_changed();

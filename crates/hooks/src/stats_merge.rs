@@ -7,6 +7,7 @@ use vapor_forge_cloud_core::{
     AchievementSyncState, AppStatsResult, OfficialAchievementState, OfficialStatState,
     StatSyncState,
 };
+use vapor_forge_features::achievements::RebuiltAchievements;
 use vapor_forge_steam_protocol::{
     app_id_from_game_id, parse_achievement_bit_mappings, parse_stat_mappings, stats_crc,
     AchievementBlock, ClientGetUserStatsRequest, ClientGetUserStatsResponse, LegacyStatsEntry,
@@ -25,6 +26,7 @@ pub(crate) fn merge_service_stats_response(
     mut donor: PlayerGetUserStatsResponse,
     full_schema: &[u8],
     backend: Option<&AppStatsResult>,
+    local: Option<&RebuiltAchievements>,
 ) -> Option<Vec<u8>> {
     let app_id = request.appid.filter(|app_id| *app_id != 0)?;
     donor.schema = (request.sha_schema != donor.sha_schema).then(|| full_schema.to_vec());
@@ -52,7 +54,17 @@ pub(crate) fn merge_service_stats_response(
                 donor.stats = entries;
             }
         }
-        Some(AppStatsResult::Uninitialized | AppStatsResult::SchemaMismatch { .. }) | None => {}
+        Some(AppStatsResult::Uninitialized | AppStatsResult::SchemaMismatch { .. }) | None => {
+            // Without a schema or a backend nothing else can describe the app's
+            // achievements, unless the host rebuilt them from local data. A
+            // usable schema keeps the schema path authoritative, so a caller that
+            // passes local state anyway cannot replace it. The token stays unset
+            // either way: a rebuilt list speaks for the unlocks, not for the
+            // app's whole stats state.
+            if let Some(local) = local.filter(|_| full_schema.is_empty()) {
+                donor.stats = local.service_response(None).stats;
+            }
+        }
     }
     Some(donor.encode_to_vec())
 }
@@ -62,6 +74,7 @@ pub(crate) fn merge_legacy_stats_response(
     mut donor: ClientGetUserStatsResponse,
     full_schema: &[u8],
     backend: Option<&AppStatsResult>,
+    local: Option<&RebuiltAchievements>,
 ) -> Option<Vec<u8>> {
     let game_id = request.game_id?;
     let app_id = app_id_from_game_id(game_id)?;
@@ -101,7 +114,14 @@ pub(crate) fn merge_legacy_stats_response(
                     legacy_stats_entries(app_id, full_schema, achievements, stats)?;
             }
         }
-        Some(AppStatsResult::Uninitialized | AppStatsResult::SchemaMismatch { .. }) | None => {}
+        Some(AppStatsResult::Uninitialized | AppStatsResult::SchemaMismatch { .. }) | None => {
+            // See merge_service_stats_response: a locally rebuilt list is the
+            // only achievement state on offer when nothing else describes the
+            // app, and never in place of a usable schema.
+            if let Some(local) = local.filter(|_| full_schema.is_empty()) {
+                donor.achievement_blocks = local.legacy_response(game_id, None).achievement_blocks;
+            }
+        }
     }
     Some(donor.encode_to_vec())
 }
@@ -509,6 +529,28 @@ mod tests {
     use super::*;
 
     const CUMULUS_STATS_CRC: u32 = 0x89ab_cdef;
+
+    /// The merge as it behaves with no locally rebuilt state: the pre-existing
+    /// four-argument shape every test below was written against. The local
+    /// rebuild is opt-in, so `None` is also what a flag-off host passes.
+    fn merge_service_stats_response(
+        request: &PlayerGetUserStatsRequest,
+        donor: PlayerGetUserStatsResponse,
+        full_schema: &[u8],
+        backend: Option<&AppStatsResult>,
+    ) -> Option<Vec<u8>> {
+        super::merge_service_stats_response(request, donor, full_schema, backend, None)
+    }
+
+    /// See [`merge_service_stats_response`].
+    fn merge_legacy_stats_response(
+        request: &ClientGetUserStatsRequest,
+        donor: ClientGetUserStatsResponse,
+        full_schema: &[u8],
+        backend: Option<&AppStatsResult>,
+    ) -> Option<Vec<u8>> {
+        super::merge_legacy_stats_response(request, donor, full_schema, backend, None)
+    }
 
     fn kv_string(out: &mut Vec<u8>, key: &str, value: &str) {
         out.push(1);
@@ -1120,5 +1162,118 @@ mod tests {
             Some(&backend),
         )
         .is_none());
+    }
+
+    /// A rebuilt list, as `features::achievements::local` produces one.
+    fn rebuilt() -> RebuiltAchievements {
+        use vapor_forge_features::achievements::{
+            AchievementCounts, AchievementDisplay, RebuildSource, RebuiltAchievement,
+        };
+        RebuiltAchievements {
+            app_id: 480,
+            source: RebuildSource::Local,
+            achievements: vec![RebuiltAchievement {
+                key: "ACH_WIN".into(),
+                stat_id: 12,
+                bit: 3,
+                display: AchievementDisplay::from_key("ACH_WIN"),
+                groups: Vec::new(),
+                unlocked: true,
+                unlock_time: Some(10),
+            }],
+            groups: Vec::new(),
+            counts: AchievementCounts {
+                unlocked: 1,
+                total: 1,
+            },
+        }
+    }
+
+    /// Flag off — no local state — byte for byte what this reply carried before
+    /// the rebuild existed: the schema field per the conditional read, no stats,
+    /// no token.
+    #[test]
+    fn without_local_state_an_unusable_schema_answers_exactly_as_before() {
+        let request = PlayerGetUserStatsRequest {
+            appid: Some(480),
+            ..Default::default()
+        };
+        let donor = PlayerGetUserStatsResponse::default();
+        let body = merge_service_stats_response(&request, donor.clone(), &[], None)
+            .expect("an empty payload still encodes");
+        let mut expected = donor;
+        expected.schema = None;
+        expected.stats.clear();
+        expected.crc_stats = None;
+        expected.crc_schema = None;
+        assert_eq!(body, expected.encode_to_vec());
+    }
+
+    #[test]
+    fn a_local_rebuild_fills_the_reply_only_when_nothing_else_can() {
+        let request = PlayerGetUserStatsRequest {
+            appid: Some(480),
+            ..Default::default()
+        };
+        let local = rebuilt();
+        let body = super::merge_service_stats_response(
+            &request,
+            PlayerGetUserStatsResponse::default(),
+            &[],
+            None,
+            Some(&local),
+        )
+        .expect("the rebuilt list still encodes");
+        let response = PlayerGetUserStatsResponse::decode(body.as_slice()).unwrap();
+        assert_eq!(response.stats.len(), 1);
+        assert_eq!(response.stats[0].stat_id, Some(12));
+        assert_eq!(response.stats[0].stat_value, Some(1 << 3));
+        assert_eq!(
+            response.crc_stats, None,
+            "a rebuilt list speaks for the unlocks, not for the whole stats state"
+        );
+        // The backend arm still wins when it has state: a rebuild never replaces
+        // an authoritative answer.
+        let backend = modified_result(true, Some(10));
+        let with_backend = super::merge_service_stats_response(
+            &request,
+            PlayerGetUserStatsResponse::default(),
+            &[],
+            Some(&backend),
+            Some(&local),
+        );
+        assert!(
+            with_backend.is_none(),
+            "an empty schema cannot map the backend's keys, so the caller falls back"
+        );
+    }
+
+    #[test]
+    fn a_local_rebuild_fills_the_legacy_reply_too() {
+        const ACHIEVEMENTS_STAT: u32 = 12;
+        let request = ClientGetUserStatsRequest {
+            game_id: Some(480),
+            ..Default::default()
+        };
+        let local = rebuilt();
+        let body = super::merge_legacy_stats_response(
+            &request,
+            ClientGetUserStatsResponse::default(),
+            &[],
+            None,
+            Some(&local),
+        )
+        .expect("the rebuilt list still encodes");
+        let response = ClientGetUserStatsResponse::decode(body.as_slice()).unwrap();
+        assert_eq!(response.achievement_blocks.len(), 1);
+        assert_eq!(
+            response.achievement_blocks[0].achievement_id,
+            Some(ACHIEVEMENTS_STAT)
+        );
+        assert_eq!(
+            response.achievement_blocks[0].unlock_time,
+            vec![0, 0, 0, 10]
+        );
+        assert_eq!(response.crc_stats, None);
     }
 }
