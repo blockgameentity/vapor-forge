@@ -110,15 +110,14 @@ These are known, not bugs to chase:
 - **`ticket-overrides` installs** as of the vtable mining pass
   (`CUser::GetAppTicket`, both live builds). If it still disables itself, the
   report's reason is the evidence to send back.
-- **`achievements` disables itself.** The stats path is a job chain
-  (`CAPIJobRequestUserStats::{BInit,YieldingMergeStats}` are anchored) and has no
-  read-side counterpart of the Linux hook, so the rebuild stays a decision until a
-  merge-site hook shape exists.
-- **No request-code skip yet.** The dispatch body exists and the packet layout is
-  decoded at startup (log line: "packet layout decoded"), but the `(depot, gid)`
-  offsets inside the request body are still unmeasured, so each message is recorded
-  with the blocker `NoTarget` and Steam's own round trip happens. The depotcache
-  pre-seed is consulted at `GetDecryptionKey` instead.
+- **`achievements` rewrites the reply** when `[achievements] local_rebuild` is on:
+  the merge body decodes the response, substitutes the rebuilt set and restores
+  Steam's bytes afterwards. If the flag is off, behaviour is exactly Steam's.
+- **Request codes are served only from cache.** The dispatch body parses the
+  request payload, and if a code for that `(depot, gid)` is already cached it hands
+  Steam the encoded response for that call; otherwise the message is recorded with
+  `NoCachedCode` and Steam's own round trip happens. Nothing dials from the hook
+  path.
 - **Corpus coverage:** 28 symbols in `steamclient64.dll` public (27 beta) and 7 in
   `SteamUI.dll` (5 beta), including the `CNetPacket` layout family, so the
   request-code body can decode packet fields. Unresolved symbols disable only their

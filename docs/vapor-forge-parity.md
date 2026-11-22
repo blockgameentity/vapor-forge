@@ -38,7 +38,7 @@ signature that resolves on the current public build.
 | ShaderCacheControl | `client/shader.rs` | ⚠️ decision only, no anchor | ❌ |
 | FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ consults `family::concurrent` | n/a |
 | DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
-| CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, records; serving blocked on target offsets | ✅ |
+| CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, **serves** a cached code with a swap guard | ✅ |
 | NativeResponseDelivery | `client/network.rs` | — | — |
 | CloudControl | `client/cloud.rs` | ⚠️ host feature pass decides, no client body | n/a |
 | CloudHttp | `client/cloud_http.rs` | ✅ `CloseAppCloud` | ✅ public + beta |
@@ -123,17 +123,17 @@ request codes and achievements are blocked on corpus class B.
 
 1. ~~Concurrent-play consult~~ — done on both hosts (`family_play.rs` on Windows,
    `family_decide.rs` on Linux, both asking `features::family::concurrent`).
-2. **Statistics path** — the direct method is refuted; the remaining lead is
-   `CAPIJobRequestUserStats` / `CUserStats` slot 6, which is a different call shape
-   than the Linux hook assumes. Unblocks `Achievements` (and the BST rebuild) once
-   solved.
+2. ~~Statistics path~~ — **done as a rewrite.** `decode_job_reply` derives the
+   reply field (0x1b0 public / 0x1a8 beta) and body displacement (0x18) by walking
+   `BInit`'s instructions; the merge body decodes the response with prost,
+   substitutes the rebuilt achievements and re-encodes, restoring Steam's bytes
+   afterwards. `Achievements` (and the BST rebuild) now have a carrier on Windows.
 3. ~~`CUser::GetAppTicket` anchor~~ — done (both builds), tickets install.
-4. **Request-code serving** at `CCMInterface::RecvPkt`: the body is written and the
-   packet layout is now decoded at runtime from the re-anchored
-   `CNetPacket::{Init,Alloc,Release}` (`patterns::cnet_packet` speaks MS-x64), so the
-   blocker moved from `NoLayout` to `NoTarget` — the `(depot, gid)` offsets in the
-   request body are still unmeasured. That is the last piece of the HYJ install
-   path.
+4. ~~Request-code serving~~ — **done.** The body parses the payload as
+   `GetManifestRequestCodeRequest`, looks the code up in a bounded process cache
+   and swaps the encoded response in for the duration of the original call
+   (restoring both slots in `Drop`). Nothing is compiled as an offset: the packet
+   layout and the job reply fields are decoded from the target's own code.
 5. **Body-per-capability sweep** (class A) against the Linux reference:
    shader control, DLC overrides, callbacks, legacy CD key, SteamID override,
    cloud HTTP, conflict UI.
