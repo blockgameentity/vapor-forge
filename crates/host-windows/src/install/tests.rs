@@ -12,6 +12,7 @@ use super::*;
 const OWNERSHIP: &str = "CUser::CheckAppOwnership";
 const DEPOT: &str = "GetDecryptionKey";
 const CLOUD: &str = "CloseAppCloud";
+const RECV: &str = "CCMInterface::RecvPkt";
 
 static NEXT_CORPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -285,3 +286,5 @@ fn the_temp_corpus_is_created_below_its_root() {
     assert!(path.exists());
     assert!(std::path::Path::new(&corpus.root).exists());
 }
+
+mod native_delivery;

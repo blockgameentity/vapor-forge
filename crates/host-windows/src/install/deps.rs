@@ -51,6 +51,10 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         "RegisterJsMethod",
         &[Capability::ConflictUiBridge],
     ),
+    // The identity accessor takes an out-parameter on Windows (see
+    // `res/patterns/win64/VTABLE-REPORT.md`); the body presents the override through
+    // it and nothing else depends on it.
+    ("CUser::GetSteamID", &[Capability::SteamIdOverride]),
     (
         "CloseAppCloud",
         &[Capability::CloudControl, Capability::CloudHttp],
@@ -62,9 +66,25 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     // The dispatch site the capability actually needs. The previous name here was
     // `CNetPacket::Dispatch`, which `VTABLE-REPORT.md` §3 refutes: the packet
     // classes have no dispatch slot and the table lives at `CCMInterface` slot 3.
+    //
+    // `native-response-delivery` is mapped here too, because on Windows the
+    // delivery *is* this dispatch: the body fabricates the response and swaps it
+    // into Steam's packet inside the original call, and there is no queue to gate
+    // separately. The seventh pass of `res/patterns/win64/VTABLE-REPORT.md`
+    // measures the post machinery the Linux host uses (a `CWorkItem` handed to a
+    // `CWorkThreadPool`) and records why this host does not use it;
+    // `crate::hooks::netpacket` says what would have to change for a queue ever
+    // to be needed. Mapping it onto the symbol that serves keeps the report
+    // honest: if this body cannot install, nothing can deliver a response, and
+    // the capability is disabled with that reason rather than silently reported
+    // as active.
     (
         "CCMInterface::RecvPkt",
-        &[Capability::CmInterception, Capability::RequestCodes],
+        &[
+            Capability::CmInterception,
+            Capability::RequestCodes,
+            Capability::NativeResponseDelivery,
+        ],
     ),
     // SteamUI. Each body owns exactly one capability, so a missing library
     // anchor costs one library feature rather than the whole batch.
@@ -108,12 +128,6 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         "CUser::BuildSpawnEnvBlock",
         &[Capability::LaunchEnvironment],
     ),
-    // The out-parameter accessor the identity body replaces. The symbol is not in
-    // the shipped corpus yet (a `.pdata`-less leaf; see
-    // `res/patterns/win64/VTABLE-REPORT.md` §9), and a symbol a batch never
-    // resolves cannot fail in it - so `SteamIdOverride` stays enabled until the
-    // corpus carries the entry, and costs itself alone once it does.
-    ("CUser::GetSteamID", &[Capability::SteamIdOverride]),
 ];
 
 /// Capabilities that depend on `symbol`; empty for an unknown symbol.
@@ -125,168 +139,4 @@ pub fn capabilities_for_symbol(symbol: &str) -> &'static [Capability] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn known_symbols_name_their_capabilities() {
-        assert_eq!(
-            capabilities_for_symbol("CUser::CheckAppOwnership"),
-            &[Capability::Ownership]
-        );
-        assert_eq!(
-            capabilities_for_symbol("CloseAppCloud"),
-            &[Capability::CloudControl, Capability::CloudHttp]
-        );
-    }
-
-    #[test]
-    fn unknown_symbols_have_no_dependency() {
-        assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
-    }
-
-    #[test]
-    fn the_merge_symbol_gates_achievements_and_the_run_method_gates_nothing() {
-        // The merge carries the reply-rewrite body, so it is the dependency.
-        assert_eq!(
-            capabilities_for_symbol(crate::abi::achievements::MERGE_SYMBOL),
-            &[Capability::Achievements]
-        );
-        // The run method has no body. Mapping it would make every real install
-        // resolve a symbol it cannot install and disable `achievements` with
-        // "no replacement body", even though the merge body installed.
-        assert!(
-            capabilities_for_symbol(crate::abi::achievements::BINIT_SYMBOL).is_empty(),
-            "a bodyless symbol must not gate a capability it cannot serve"
-        );
-    }
-
-    #[test]
-    fn the_refuted_getter_is_not_a_dependency_any_more() {
-        // The table used to name `CUser::GetUserStats`. Keeping it would have read
-        // as a dependency the install pass can satisfy, while the symbol exists in
-        // no live build.
-        assert!(capabilities_for_symbol("CUser::GetUserStats").is_empty());
-    }
-
-    #[test]
-    fn each_anchored_body_names_the_capability_it_serves() {
-        // The six bodies the corpus gained in this pass, plus the subscription body
-        // that shares `ownership` with `CheckAppOwnership`.
-        for (symbol, capability) in [
-            (
-                "CShaderCacheManager::GetShaderCacheDepot",
-                Capability::ShaderCacheControl,
-            ),
-            (
-                "IClientAppManager::IsAppDlcInstalled",
-                Capability::DlcOverrides,
-            ),
-            ("IClientAppManager::BIsDlcEnabled", Capability::DlcOverrides),
-            ("CSteamEngine::SetAPICallResult", Capability::CallbackEvents),
-            (
-                "IClientUser::RequiresLegacyCDKey",
-                Capability::LegacyCdKeyControl,
-            ),
-            ("CUser::BuildSpawnEnvBlock", Capability::LaunchEnvironment),
-            ("CUser::GetSubscribedApps", Capability::Ownership),
-            ("CUser::GetSteamID", Capability::SteamIdOverride),
-        ] {
-            assert_eq!(
-                capabilities_for_symbol(symbol),
-                &[capability],
-                "{symbol} must gate {capability} and nothing else"
-            );
-        }
-    }
-
-    #[test]
-    fn the_identity_accessor_gates_the_identity_capability_alone() {
-        // The body presents a per-app SteamID and nothing else, so a corpus that
-        // stops resolving it must cost exactly that feature.
-        assert_eq!(
-            capabilities_for_symbol("CUser::GetSteamID"),
-            &[Capability::SteamIdOverride]
-        );
-    }
-
-    #[test]
-    fn both_dlc_entry_points_gate_the_same_capability() {
-        // Steam asks two questions and the host answers both: a corpus that anchors
-        // only one of them still needs the same capability, so a failure there is one
-        // disabled feature, not two.
-        for symbol in [
-            "IClientAppManager::IsAppDlcInstalled",
-            "IClientAppManager::BIsDlcEnabled",
-        ] {
-            assert_eq!(capabilities_for_symbol(symbol), &[Capability::DlcOverrides]);
-        }
-    }
-
-    #[test]
-    fn the_dispatch_site_gates_interception_and_request_codes() {
-        // The body reads the packet and, when the layout exists, answers a
-        // request code: both capabilities depend on the same symbol. The refuted
-        // name must not be mapped, or a corpus that never resolves it would look
-        // like a dependency the install pass can satisfy.
-        assert_eq!(
-            capabilities_for_symbol("CCMInterface::RecvPkt"),
-            &[Capability::CmInterception, Capability::RequestCodes]
-        );
-        assert!(capabilities_for_symbol("CNetPacket::Dispatch").is_empty());
-    }
-
-    #[test]
-    fn the_one_cloud_symbol_gates_both_cloud_capabilities() {
-        // `CloseAppCloud` is the only cloud site the win64 corpus anchors, so a
-        // failed install there has to cost both cloud capabilities.
-        assert_eq!(
-            capabilities_for_symbol("CloseAppCloud"),
-            &[Capability::CloudControl, Capability::CloudHttp]
-        );
-    }
-
-    #[test]
-    fn each_steamui_symbol_names_its_own_library_capability() {
-        assert_eq!(
-            capabilities_for_symbol("ShouldShowAppInLibrary"),
-            &[Capability::LibraryUi]
-        );
-        assert_eq!(
-            capabilities_for_symbol("CSteamUIAppController::FillInAppOverview"),
-            &[Capability::OverviewMetadata]
-        );
-        assert_eq!(
-            capabilities_for_symbol("CSteamUIAppController::BuildCompleteAppOverviewChange"),
-            &[Capability::LibrarySnapshot]
-        );
-        assert_eq!(
-            capabilities_for_symbol("CUpdateManager::MarkAppChange"),
-            &[Capability::LibrarySnapshot]
-        );
-    }
-
-    #[test]
-    fn a_steamui_anchor_never_gates_a_steamclient_capability() {
-        // A library symbol that fails to resolve must cost a library feature, not
-        // ownership or package injection: the two batches are independent.
-        for symbol in [
-            "ShouldShowAppInLibrary",
-            "CSteamUIAppController::FillInAppOverview",
-            "CSteamUIAppController::BuildCompleteAppOverviewChange",
-            "CUpdateManager::MarkAppChange",
-        ] {
-            for capability in capabilities_for_symbol(symbol) {
-                assert!(
-                    matches!(
-                        capability,
-                        Capability::LibraryUi
-                            | Capability::OverviewMetadata
-                            | Capability::LibrarySnapshot
-                    ),
-                    "{symbol} must not gate {capability}"
-                );
-            }
-        }
-    }
-}
+mod tests;
