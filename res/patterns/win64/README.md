@@ -76,9 +76,9 @@ Measured 2026-11-23 with build `1794536281` (public) / `1795048523` (publicbeta)
 
 | channel | module | sha256 | raw `.pdata` entries | functions (merged) | short extents < `0x18` | corpus patterns | on a function entry | passing the body gate |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| public | `steamclient64.dll` | `669fa08e2592…` | 92,949 | **52,946** | 254 | 14 | 13 | 13 |
+| public | `steamclient64.dll` | `669fa08e2592…` | 92,949 | **52,946** | 254 | 25 | 24 | 24 |
 | public | `SteamUI.dll` | `2dfb0a5d50dd…` | 72,223 | **40,826** | 200 | 7 | 7 | 7 |
-| publicbeta | `steamclient64.dll` | `4a2d79520a72…` | 93,858 | **53,430** | 253 | 13 | 12 | 12 |
+| publicbeta | `steamclient64.dll` | `4a2d79520a72…` | 93,858 | **53,430** | 253 | 24 | 23 | 23 |
 | publicbeta | `SteamUI.dll` | `55f7a4f9ad55…` | 72,694 | **41,159** | 204 | 5 | 5 | 5 |
 
 Per-fragment breakdown for those four tables (`--metrics`):
