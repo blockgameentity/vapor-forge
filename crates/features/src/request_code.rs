@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use prost::Message;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 use vapor_forge_config::{
     AppId, ManifestResponseFormat, ManifestSection, ManifestSource, RuntimeConfig,
@@ -69,10 +70,24 @@ const MAX_PENDING_FETCHES: usize = 16;
 // Pending fetch state
 // ---------------------------------------------------------------------------
 
+/// Name reported for the script (Lua) provider. The chain never contacts a
+/// host for it, but the caller still deserves to know who served the code.
+const SCRIPT_PROVIDER: &str = "script";
+
+/// What one completed fetch produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FetchOutcome {
+    /// `0` when no provider served the code, which the response layer turns
+    /// into `EResult No Connection`.
+    pub code: u64,
+    /// Provider that served the code, so the caller can surface it.
+    pub provider: Option<String>,
+}
+
 struct Pending {
     job_id: u64,
     gid: u64,
-    result: Arc<Mutex<Option<u64>>>,
+    result: Arc<Mutex<Option<FetchOutcome>>>,
     done: Arc<AtomicBool>,
     /// Serialized request header bytes used to fabricate the response header.
     req_hdr_bytes: Vec<u8>,
@@ -84,6 +99,8 @@ pub struct CompletedFetch {
     pub job_id: u64,
     pub gid: u64,
     pub code: u64,
+    /// Provider that served `code`; `None` when no provider did.
+    pub provider: Option<String>,
     pub req_hdr_bytes: Vec<u8>,
     pub response_generation: u64,
 }
@@ -140,6 +157,7 @@ impl PendingQueue {
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
         let providers = manifest.providers.clone();
+        let failover = manifest.failover;
         let timeout_connect_ms = manifest.timeout_connect_ms;
         let timeout_ms = manifest.timeout_ms;
         let min_interval_ms = manifest.min_interval_ms;
@@ -159,26 +177,54 @@ impl PendingQueue {
                         }
                     }
                 });
-                let code = script_code.or_else(|| {
-                    fetch_manifest_code(
+                let fetched = match script_code {
+                    Some(code) => {
+                        info!(gid, depot_id, code, "request_code: manifest code obtained");
+                        Ok(ChainSuccess {
+                            code,
+                            provider: SCRIPT_PROVIDER.to_owned(),
+                            attempts: vec![ProviderAttempt {
+                                provider: SCRIPT_PROVIDER.to_owned(),
+                                status: AttemptStatus::Served,
+                            }],
+                        })
+                    }
+                    None => fetch_manifest_code(
                         FetchContext {
                             app_id,
                             depot_id,
                             gid,
                         },
                         &providers,
+                        failover,
                         timeout_connect_ms,
                         timeout_ms,
                         min_interval_ms,
-                    )
-                });
+                    ),
+                };
+                let outcome = match fetched {
+                    Ok(success) => FetchOutcome {
+                        code: success.code,
+                        provider: Some(success.provider),
+                    },
+                    Err(error) => {
+                        // The caller can only answer with "no connection", so
+                        // the reason has to be visible here or nowhere.
+                        warn!(gid, depot_id, %error, "request_code: no manifest code obtained");
+                        FetchOutcome::default()
+                    }
+                };
                 {
                     let mut lock = result_clone.lock().unwrap();
-                    // Some(0) = failed, Some(n) = success
-                    *lock = Some(code.unwrap_or(0));
+                    *lock = Some(outcome.clone());
                 }
                 done_clone.store(true, Ordering::Release);
-                debug!(gid, code = ?code, "request_code: fetch complete");
+                debug!(
+                    gid,
+                    code = outcome.code,
+                    provider = outcome.provider.as_deref().unwrap_or("none"),
+                    "request_code: fetch complete"
+                );
                 // Dispatch the completed manifest response now instead of waiting
                 // for the next inbound packet.
                 crate::inject_wake::wake(crate::inject_wake::InjectionSource::Manifest);
@@ -207,11 +253,12 @@ impl PendingQueue {
             if list[i].done.load(Ordering::Acquire) {
                 let entry = list.swap_remove(i);
 
-                let code = entry.result.lock().unwrap().unwrap_or(0);
+                let outcome = entry.result.lock().unwrap().clone().unwrap_or_default();
                 completed.push(CompletedFetch {
                     job_id: entry.job_id,
                     gid: entry.gid,
-                    code,
+                    code: outcome.code,
+                    provider: outcome.provider,
                     req_hdr_bytes: entry.req_hdr_bytes,
                     response_generation: entry.response_generation,
                 });
@@ -373,6 +420,99 @@ enum ProviderOutcome {
     Failed(String),
 }
 
+/// What one attempt amounts to, kept for the logs and for the caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptStatus {
+    /// The provider returned a usable code.
+    Served,
+    /// The provider answered but had no code for this gid.
+    Denied(u16),
+    /// The provider asked us to come back later.
+    RateLimited { cooldown_ms: u64 },
+    /// The provider answered with a zero, which is not a code.
+    Zero,
+    /// Transport error, unexpected status, or an unparsable body.
+    Failed(String),
+    /// Not contacted: still inside a cooldown the provider asked for.
+    CoolingDown { remaining_ms: u64 },
+    /// Not contacted: the entry itself is malformed.
+    Rejected(String),
+}
+
+impl std::fmt::Display for AttemptStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Served => formatter.write_str("served a code"),
+            Self::Denied(status) => {
+                write!(formatter, "has no code for this manifest (http {status})")
+            }
+            Self::RateLimited { cooldown_ms } => {
+                write!(formatter, "rate limited, backing off for {cooldown_ms} ms")
+            }
+            Self::Zero => formatter.write_str("returned zero"),
+            Self::Failed(error) => write!(formatter, "failed: {error}"),
+            Self::CoolingDown { remaining_ms } => {
+                write!(
+                    formatter,
+                    "skipped, still cooling down for {remaining_ms} ms"
+                )
+            }
+            Self::Rejected(reason) => write!(formatter, "skipped, unusable entry: {reason}"),
+        }
+    }
+}
+
+/// One provider the chain considered, in the order it considered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAttempt {
+    pub provider: String,
+    pub status: AttemptStatus,
+}
+
+/// A served manifest code plus the trail that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainSuccess {
+    pub code: u64,
+    /// Name of the provider that served the code.
+    pub provider: String,
+    /// Every provider contacted or skipped before that, ending with the one
+    /// that served. This is what makes a failover run inspectable: no attempt
+    /// is invisible, even the ones the logs rolled past.
+    pub attempts: Vec<ProviderAttempt>,
+}
+
+/// Why no code could be obtained.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ChainError {
+    /// Failover is off: only the first configured provider was tried, so the
+    /// failure is reported against that provider alone.
+    #[error(
+        "manifest request code provider `{provider}` {status}; failover is off, so no other provider was tried"
+    )]
+    NoFailover {
+        provider: String,
+        status: AttemptStatus,
+    },
+    /// Nothing is configured to ask.
+    #[error("no manifest request code provider is configured")]
+    NoProviders,
+    /// Failover is on and the whole chain came up empty.
+    #[error("no provider served gid {gid}: {}", describe_attempts(.attempts))]
+    ChainFailed {
+        gid: u64,
+        attempts: Vec<ProviderAttempt>,
+    },
+}
+
+/// `name status; name status` form, for logs and for [`ChainError::ChainFailed`].
+fn describe_attempts(attempts: &[ProviderAttempt]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| format!("{} {}", attempt.provider, attempt.status))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Remaining cooldown for `provider`, clearing the entry once it has expired.
 fn cooldown_remaining_in(
     cooldowns: &mut HashMap<String, Instant>,
@@ -489,17 +629,18 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 fn fetch_manifest_code(
     context: FetchContext,
     providers: &[ManifestSource],
+    failover: bool,
     timeout_connect_ms: u64,
     timeout_ms: u64,
     min_interval_ms: u64,
-) -> Option<u64> {
+) -> Result<ChainSuccess, ChainError> {
     let FetchContext {
         app_id,
         depot_id,
         gid,
     } = context;
 
-    run_provider_chain(provider_state(), context, providers, |provider| {
+    run_provider_chain(provider_state(), context, providers, failover, |provider| {
         let url = provider.resolve_url(app_id, depot_id, gid);
         // Pace before the request, not after a 429: these are small shared
         // services and the cooldown only reacts once the damage is done.
@@ -512,8 +653,99 @@ fn run_provider_chain(
     state: &ProviderState,
     context: FetchContext,
     providers: &[ManifestSource],
+    failover: bool,
+    attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
+) -> Result<ChainSuccess, ChainError> {
+    if providers.is_empty() {
+        return Err(ChainError::NoProviders);
+    }
+    if !failover {
+        return run_configured_provider(state, context, providers, attempt);
+    }
+    run_failover_chain(state, context, providers, attempt)
+}
+
+/// Failover off: ask the first configured provider and nothing else.
+///
+/// The user picked a list; without `failover = true` only its head is used, so
+/// a depot lookup can never land on a host they did not choose. A failure is
+/// reported against that provider by name, which is also the only way the user
+/// learns which host their request went to.
+fn run_configured_provider(
+    state: &ProviderState,
+    context: FetchContext,
+    providers: &[ManifestSource],
     mut attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
-) -> Option<u64> {
+) -> Result<ChainSuccess, ChainError> {
+    let FetchContext { depot_id, gid, .. } = context;
+    let provider = &providers[0];
+    let name = provider.name().to_owned();
+    if providers.len() > 1 {
+        // Not a warning: this is the default and the documented behaviour. It
+        // is logged so a user wondering why host B was never asked can see it.
+        debug!(
+            provider = %name,
+            unused = providers.len() - 1,
+            "request_code: failover is off, only the first configured provider is used"
+        );
+    }
+
+    // Malformed entries and cooldowns are handled exactly as in failover mode;
+    // there is simply no next entry to move on to.
+    let status = if let Some(rejection) = provider.rejection() {
+        warn!(gid, %rejection, "request_code: provider entry is unusable");
+        AttemptStatus::Rejected(rejection)
+    } else if let Some(remaining) = state.cooldown_remaining(&name) {
+        let remaining_ms = remaining.as_millis() as u64;
+        debug!(
+            provider = %name,
+            gid, remaining_ms, "request_code: provider cooling down, not contacted"
+        );
+        AttemptStatus::CoolingDown { remaining_ms }
+    } else {
+        debug!(
+            provider = %name,
+            gid, depot_id, "request_code: trying provider"
+        );
+        match attempt(provider) {
+            ProviderOutcome::Code(code) if code > 0 => {
+                state.record_served(gid, &name);
+                info!(
+                    provider = %name,
+                    gid, depot_id, code,
+                    status = %AttemptStatus::Served,
+                    "request_code: manifest code obtained"
+                );
+                return Ok(ChainSuccess {
+                    code,
+                    provider: name.clone(),
+                    attempts: vec![ProviderAttempt {
+                        provider: name,
+                        status: AttemptStatus::Served,
+                    }],
+                });
+            }
+            other => record_refusal(state, context, &name, other),
+        }
+    };
+
+    info!(
+        provider = %name,
+        gid, %status, "request_code: attempt finished"
+    );
+    Err(ChainError::NoFailover {
+        provider: name,
+        status,
+    })
+}
+
+/// Failover on: walk the configured order until a provider serves the gid.
+fn run_failover_chain(
+    state: &ProviderState,
+    context: FetchContext,
+    providers: &[ManifestSource],
+    mut attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
+) -> Result<ChainSuccess, ChainError> {
     let FetchContext { depot_id, gid, .. } = context;
 
     let served = state.served_by(gid);
@@ -530,42 +762,56 @@ fn run_provider_chain(
     // answered the same gid. When the whole chain fails, the gid is the likelier
     // cause, and cooling every provider down would turn the following gids of
     // the same update into instant failures.
-    let mut failed = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut attempts = Vec::new();
 
     for provider in order_providers(providers, &served) {
-        let name = provider.name();
+        let name = provider.name().to_owned();
 
         // A user-defined entry can be malformed; skip it and keep the rest of
         // the chain working rather than failing the whole fetch.
         if let Some(rejection) = provider.rejection() {
             warn!(gid, %rejection, "request_code: skipping unusable provider");
+            attempts.push(ProviderAttempt {
+                provider: name,
+                status: AttemptStatus::Rejected(rejection),
+            });
             continue;
         }
 
-        if let Some(remaining) = state.cooldown_remaining(name) {
+        if let Some(remaining) = state.cooldown_remaining(&name) {
+            let remaining_ms = remaining.as_millis() as u64;
             debug!(
-                provider = name,
-                gid,
-                remaining_ms = remaining.as_millis() as u64,
-                "request_code: provider cooling down, skipping"
+                provider = %name,
+                gid, remaining_ms, "request_code: provider cooling down, skipping"
             );
+            attempts.push(ProviderAttempt {
+                provider: name,
+                status: AttemptStatus::CoolingDown { remaining_ms },
+            });
             continue;
         }
 
         debug!(
-            provider = name,
+            provider = %name,
             gid, depot_id, "request_code: trying provider"
         );
 
         match attempt(provider) {
             ProviderOutcome::Code(code) if code > 0 => {
                 info!(
-                    provider = name,
-                    gid, code, "request_code: manifest code obtained"
+                    provider = %name,
+                    gid, depot_id, code,
+                    status = %AttemptStatus::Served,
+                    "request_code: manifest code obtained"
                 );
-                state.record_served(gid, name);
+                state.record_served(gid, &name);
+                attempts.push(ProviderAttempt {
+                    provider: name.clone(),
+                    status: AttemptStatus::Served,
+                });
                 for failed_name in failed {
-                    let cooldown = state.start_cooldown(failed_name, FAILURE_COOLDOWN);
+                    let cooldown = state.start_cooldown(&failed_name, FAILURE_COOLDOWN);
                     warn!(
                         provider = failed_name,
                         gid,
@@ -573,30 +819,27 @@ fn run_provider_chain(
                         "request_code: backing off failed provider"
                     );
                 }
-                return Some(code);
+                return Ok(ChainSuccess {
+                    code,
+                    provider: name,
+                    attempts,
+                });
             }
-            ProviderOutcome::Code(_) => {
-                warn!(provider = name, gid, "request_code: provider returned zero")
-            }
-            ProviderOutcome::RateLimited(retry_after) => {
-                let cooldown = state.start_cooldown(name, retry_after);
-                warn!(
-                    provider = name,
-                    gid,
-                    cooldown_ms = cooldown.as_millis() as u64,
-                    "request_code: provider rate limited, backing off"
+            other => {
+                let status = record_refusal(state, context, &name, other);
+                // Every attempt is visible, including the ones that only
+                // produced a reason to move on to the next provider.
+                info!(
+                    provider = %name,
+                    gid, %status, "request_code: attempt finished"
                 );
-            }
-            ProviderOutcome::Denied(status) => {
-                // Per-target answer, not a provider fault: no cooldown.
-                debug!(
-                    provider = name,
-                    gid, depot_id, status, "request_code: provider does not have this manifest"
-                );
-            }
-            ProviderOutcome::Failed(error) => {
-                warn!(provider = name, gid, %error, "request_code: provider failed");
-                failed.push(name);
+                if matches!(status, AttemptStatus::Failed(_)) {
+                    failed.push(name.clone());
+                }
+                attempts.push(ProviderAttempt {
+                    provider: name,
+                    status,
+                });
             }
         }
     }
@@ -609,7 +852,46 @@ fn run_provider_chain(
             "request_code: no provider served this gid, failures not backed off"
         );
     }
-    None
+    Err(ChainError::ChainFailed { gid, attempts })
+}
+
+/// Record one refused attempt: apply the bookkeeping its class requires and
+/// turn it into the status the logs and the caller see.
+fn record_refusal(
+    state: &ProviderState,
+    context: FetchContext,
+    provider: &str,
+    outcome: ProviderOutcome,
+) -> AttemptStatus {
+    let FetchContext { depot_id, gid, .. } = context;
+    match outcome {
+        // `Code(0)` — the `> 0` guard above already took the usable ones.
+        ProviderOutcome::Code(_) => {
+            warn!(provider, gid, "request_code: provider returned zero");
+            AttemptStatus::Zero
+        }
+        ProviderOutcome::Denied(status) => {
+            // Per-target answer, not a provider fault: no cooldown.
+            debug!(
+                provider,
+                gid, depot_id, status, "request_code: provider does not have this manifest"
+            );
+            AttemptStatus::Denied(status)
+        }
+        ProviderOutcome::RateLimited(retry_after) => {
+            let cooldown = state.start_cooldown(provider, retry_after);
+            let cooldown_ms = cooldown.as_millis() as u64;
+            warn!(
+                provider,
+                gid, cooldown_ms, "request_code: provider rate limited, backing off"
+            );
+            AttemptStatus::RateLimited { cooldown_ms }
+        }
+        ProviderOutcome::Failed(error) => {
+            warn!(provider, gid, %error, "request_code: provider failed");
+            AttemptStatus::Failed(error)
+        }
+    }
 }
 
 fn fetch_from_provider(
@@ -899,6 +1181,8 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some((480, 481, 1234)));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].code, 4444);
+        // The Lua provider is named too, so the caller can say who answered.
+        assert_eq!(completed[0].provider.as_deref(), Some("script"));
     }
 
     #[test]
@@ -973,6 +1257,8 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].job_id, 99);
         assert_eq!(completed[0].code, 0);
+        // Nothing served it, so no provider may be claimed.
+        assert_eq!(completed[0].provider, None);
     }
 
     #[test]
@@ -1086,8 +1372,10 @@ mod tests {
             min_interval_ms: None,
         });
 
-        // fetch_manifest_code skips these, so an empty chain yields no code and
-        // — the point of the check — issues no HTTP request.
+        // fetch_manifest_code refuses malformed entries before any request, so
+        // the failure names the entry and — the point of the check — no HTTP
+        // request is issued. Failover on or off, a malformed entry is not a
+        // reason to dial anything.
         assert!(no_placeholder.rejection().is_some());
         let context = FetchContext {
             app_id: 730,
@@ -1095,9 +1383,23 @@ mod tests {
             gid: 1,
         };
         assert_eq!(
-            fetch_manifest_code(context, &[no_placeholder], 10, 10, 0),
-            None
+            fetch_manifest_code(
+                context,
+                std::slice::from_ref(&no_placeholder),
+                false,
+                10,
+                10,
+                0
+            ),
+            Err(ChainError::NoFailover {
+                provider: "mirror".to_owned(),
+                status: AttemptStatus::Rejected(no_placeholder.rejection().unwrap()),
+            })
         );
+        assert!(matches!(
+            fetch_manifest_code(context, &[no_placeholder], true, 10, 10, 0),
+            Err(ChainError::ChainFailed { gid: 1, .. })
+        ));
     }
 
     #[test]
@@ -1294,20 +1596,25 @@ mod tests {
         }
     }
 
-    /// Run the chain with scripted outcomes and return the code plus the order
-    /// in which providers were asked.
+    /// Run the chain with scripted outcomes and return its result plus the
+    /// order in which providers were actually asked.
     fn run_scripted(
         state: &ProviderState,
         gid: u64,
         providers: &[ManifestSource],
+        failover: bool,
         outcome: impl Fn(&str) -> ProviderOutcome,
-    ) -> (Option<u64>, Vec<String>) {
+    ) -> (Result<ChainSuccess, ChainError>, Vec<String>) {
         let mut asked = Vec::new();
-        let code = run_provider_chain(state, context(gid), providers, |provider| {
+        let result = run_provider_chain(state, context(gid), providers, failover, |provider| {
             asked.push(provider.name().to_owned());
             outcome(provider.name())
         });
-        (code, asked)
+        (result, asked)
+    }
+
+    fn served_code(result: Result<ChainSuccess, ChainError>) -> u64 {
+        result.expect("the chain should have served a code").code
     }
 
     #[test]
@@ -1316,13 +1623,13 @@ mod tests {
         let providers = chain(&["a", "b", "c"]);
         let serve = |_: &str| ProviderOutcome::Code(7);
 
-        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
-        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["b"]);
-        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["c"]);
+        assert_eq!(run_scripted(&state, 1, &providers, true, serve).1, ["a"]);
+        assert_eq!(run_scripted(&state, 1, &providers, true, serve).1, ["b"]);
+        assert_eq!(run_scripted(&state, 1, &providers, true, serve).1, ["c"]);
         // Every provider has served it: the least recent one comes back first.
-        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
+        assert_eq!(run_scripted(&state, 1, &providers, true, serve).1, ["a"]);
         // Another gid keeps the configured order.
-        assert_eq!(run_scripted(&state, 2, &providers, serve).1, ["a"]);
+        assert_eq!(run_scripted(&state, 2, &providers, true, serve).1, ["a"]);
     }
 
     #[test]
@@ -1330,13 +1637,13 @@ mod tests {
         let state = ProviderState::default();
         let providers = chain(&["a", "b"]);
 
-        run_scripted(&state, 1, &providers, |_| ProviderOutcome::Code(7));
-        let (code, asked) = run_scripted(&state, 1, &providers, |name| match name {
+        let _ = run_scripted(&state, 1, &providers, true, |_| ProviderOutcome::Code(7));
+        let (result, asked) = run_scripted(&state, 1, &providers, true, |name| match name {
             "a" => ProviderOutcome::Code(8),
             _ => ProviderOutcome::Denied(401),
         });
 
-        assert_eq!(code, Some(8));
+        assert_eq!(served_code(result), 8);
         assert_eq!(asked, ["b", "a"]);
     }
 
@@ -1363,16 +1670,16 @@ mod tests {
         let state = ProviderState::default();
         let providers = chain(&["a", "b"]);
 
-        let (code, _) = run_scripted(&state, 1, &providers, |name| match name {
+        let (result, _) = run_scripted(&state, 1, &providers, true, |name| match name {
             "a" => ProviderOutcome::Failed("http status 503".to_owned()),
             _ => ProviderOutcome::Code(7),
         });
 
-        assert_eq!(code, Some(7));
+        assert_eq!(served_code(result), 7);
         assert!(state.cooldown_remaining("a").is_some());
         assert!(state.cooldown_remaining("b").is_none());
         assert_eq!(
-            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)).1,
+            run_scripted(&state, 2, &providers, true, |_| ProviderOutcome::Code(9)).1,
             ["b"]
         );
     }
@@ -1382,18 +1689,31 @@ mod tests {
         let state = ProviderState::default();
         let providers = chain(&["a", "b"]);
 
-        let (code, asked) = run_scripted(&state, 1, &providers, |_| {
+        let (result, asked) = run_scripted(&state, 1, &providers, true, |_| {
             ProviderOutcome::Failed("http status 502".to_owned())
         });
 
-        assert_eq!(code, None);
+        assert!(matches!(
+            result,
+            Err(ChainError::ChainFailed { gid: 1, .. })
+        ));
         assert_eq!(asked, ["a", "b"]);
         assert!(state.cooldown_remaining("a").is_none());
         assert!(state.cooldown_remaining("b").is_none());
         // The next gid of the same update is still asked everywhere.
         assert_eq!(
-            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)),
-            (Some(9), vec!["a".to_owned()])
+            run_scripted(&state, 2, &providers, true, |_| ProviderOutcome::Code(9)),
+            (
+                Ok(ChainSuccess {
+                    code: 9,
+                    provider: "a".to_owned(),
+                    attempts: vec![ProviderAttempt {
+                        provider: "a".to_owned(),
+                        status: AttemptStatus::Served,
+                    }],
+                }),
+                vec!["a".to_owned()]
+            )
         );
     }
 
@@ -1402,12 +1722,181 @@ mod tests {
         let state = ProviderState::default();
         let providers = chain(&["a", "b"]);
 
-        run_scripted(&state, 1, &providers, |name| match name {
+        let _ = run_scripted(&state, 1, &providers, true, |name| match name {
             "a" => ProviderOutcome::RateLimited(Duration::from_secs(30)),
             _ => ProviderOutcome::Failed("timeout".to_owned()),
         });
 
         assert!(state.cooldown_remaining("a").is_some());
         assert!(state.cooldown_remaining("b").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Failover policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failover_off_asks_one_provider_and_names_it_on_failure() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b", "c"]);
+
+        let (result, asked) = run_scripted(&state, 1, &providers, false, |_| {
+            ProviderOutcome::Failed("http status 503".to_owned())
+        });
+
+        // One attempt only: the rest of the list is never contacted, so the
+        // user's lookup cannot reach a host they did not choose.
+        assert_eq!(asked, ["a"]);
+        let error = result.expect_err("failover off means a failure is returned");
+        assert_eq!(
+            error,
+            ChainError::NoFailover {
+                provider: "a".to_owned(),
+                status: AttemptStatus::Failed("http status 503".to_owned()),
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("`a`"), "{message}");
+        assert!(message.contains("failover is off"), "{message}");
+        // A lone provider is not cooled down on a failed lookup: the gid is the
+        // likelier cause, and cooling it would fail the rest of the update.
+        assert!(state.cooldown_remaining("a").is_none());
+    }
+
+    #[test]
+    fn failover_off_stops_at_the_first_success() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (result, asked) = run_scripted(&state, 1, &providers, false, |_| {
+            ProviderOutcome::Code(1234)
+        });
+
+        let success = result.expect("the first provider serves");
+        assert_eq!(success.code, 1234);
+        assert_eq!(success.provider, "a");
+        assert_eq!(asked, ["a"]);
+        assert_eq!(
+            success.attempts,
+            [ProviderAttempt {
+                provider: "a".to_owned(),
+                status: AttemptStatus::Served,
+            }]
+        );
+    }
+
+    #[test]
+    fn failover_off_does_not_contact_a_cooling_down_provider() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+        state.start_cooldown("a", Duration::from_secs(30));
+
+        let (result, asked) =
+            run_scripted(&state, 1, &providers, false, |_| ProviderOutcome::Code(7));
+
+        assert!(asked.is_empty());
+        assert!(matches!(
+            result,
+            Err(ChainError::NoFailover {
+                status: AttemptStatus::CoolingDown { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failover_on_follows_the_configured_order_and_keeps_every_attempt() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b", "c"]);
+
+        let (result, asked) = run_scripted(&state, 1, &providers, true, |name| match name {
+            "a" => ProviderOutcome::Failed("http status 503".to_owned()),
+            "b" => ProviderOutcome::Denied(401),
+            _ => ProviderOutcome::Code(42),
+        });
+
+        // Order respected, first success wins, and every attempt is in the
+        // result the caller gets — the failed one, the refusal, and the serve.
+        let success = result.expect("failover walks to the provider that serves");
+        assert_eq!(asked, ["a", "b", "c"]);
+        assert_eq!(success.code, 42);
+        assert_eq!(success.provider, "c");
+        assert_eq!(
+            success.attempts,
+            [
+                ProviderAttempt {
+                    provider: "a".to_owned(),
+                    status: AttemptStatus::Failed("http status 503".to_owned()),
+                },
+                ProviderAttempt {
+                    provider: "b".to_owned(),
+                    status: AttemptStatus::Denied(401),
+                },
+                ProviderAttempt {
+                    provider: "c".to_owned(),
+                    status: AttemptStatus::Served,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn failover_on_stops_asking_after_the_first_success() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (result, asked) =
+            run_scripted(&state, 1, &providers, true, |_| ProviderOutcome::Code(5));
+
+        assert_eq!(asked, ["a"]);
+        assert_eq!(served_code(result), 5);
+    }
+
+    #[test]
+    fn failover_on_reports_a_chain_that_served_nothing() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (result, _) = run_scripted(&state, 7, &providers, true, |_| {
+            ProviderOutcome::Denied(404)
+        });
+
+        let error = result.expect_err("nobody served gid 7");
+        assert!(matches!(error, ChainError::ChainFailed { gid: 7, .. }));
+        let message = error.to_string();
+        assert!(message.contains("a has no code"), "{message}");
+        assert!(message.contains("b has no code"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_provider_list_is_reported_not_attempted() {
+        let state = ProviderState::default();
+        let (result, asked) = run_scripted(&state, 1, &[], true, |_| ProviderOutcome::Code(1));
+
+        assert!(asked.is_empty());
+        assert_eq!(result, Err(ChainError::NoProviders));
+    }
+
+    #[test]
+    fn the_trail_keeps_a_rate_limited_first_attempt() {
+        // A provider that was rate limited is still part of the trail, with the
+        // cooldown it cost, so the run can be explained after the fact.
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+        let (result, _) = run_scripted(&state, 1, &providers, true, |name| match name {
+            "a" => ProviderOutcome::RateLimited(Duration::from_secs(5)),
+            _ => ProviderOutcome::Code(99),
+        });
+
+        let success = result.expect("the second provider serves");
+        assert_eq!(success.provider, "b");
+        // The rate-limited entry is in the trail too, with its cooldown.
+        assert_eq!(
+            success.attempts.first(),
+            Some(&ProviderAttempt {
+                provider: "a".to_owned(),
+                status: AttemptStatus::RateLimited { cooldown_ms: 5_000 },
+            })
+        );
     }
 }

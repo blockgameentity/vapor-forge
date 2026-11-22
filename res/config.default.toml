@@ -53,7 +53,7 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
-# Manifest request-code providers for controlled apps, tried in order.
+# Manifest request-code providers for controlled apps, in preference order.
 # An entry is either a built-in name ("20770407", "manifestdex", "opensteamtool",
 # "wudrm", "steamrun") or a table describing your own endpoint, so a new source
 # can be added without waiting for a new build. Tables may span several lines:
@@ -75,10 +75,18 @@ auto_delegate = false       # enable delegate mode when the helper detects it
 #       },
 #   ]
 #
-# An entry that fails these rules is skipped and the rest of the chain still
-# runs; `vapor-forge-config-check` lists what would be skipped.
+# An entry that fails these rules is skipped; `vapor-forge-config-check` lists
+# what would be skipped.
 [manifest]
 providers = ["20770407", "manifestdex", "opensteamtool", "wudrm", "steamrun"]
+# Try the next provider when one fails. Off by default: with failover off only
+# the first entry of `providers` is ever contacted, so the gid lookups of a
+# controlled app cannot silently travel to a host you did not choose. A failed
+# lookup is then reported against that one provider and Steam gets no code.
+# Turning this on (failover = true) walks the list in the order written, logs
+# every attempt at info level with the provider name and its outcome, and
+# reports which provider served each code.
+failover = false
 timeout_connect_ms = 5000
 timeout_ms = 15000
 # Minimum gap between two requests to the same provider. These are small shared
