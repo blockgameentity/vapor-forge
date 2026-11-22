@@ -120,6 +120,16 @@ pub fn plan(code: &[u8], entry_va: u64) -> Result<PatchPlan, PatchError> {
     })
 }
 
+impl PatchPlan {
+    /// Bytes to overwrite at the entry: the absolute jump, padded with `nop` up
+    /// to the instruction boundary chosen by [`plan`].
+    pub fn patch_bytes(&self, target: u64) -> Vec<u8> {
+        let mut bytes = absolute_jump(target).to_vec();
+        bytes.resize(self.patch_len, 0x90);
+        bytes
+    }
+}
+
 /// The 12 entry bytes: `mov rax, target; jmp rax`.
 pub fn absolute_jump(target: u64) -> [u8; PATCH_LEN] {
     let mut bytes = [0u8; PATCH_LEN];
@@ -203,6 +213,22 @@ mod tests {
             plan(&tail, 0x1000),
             Err(PatchError::UnsupportedEntry { .. })
         ));
+    }
+
+    #[test]
+    fn patch_bytes_are_padded_to_the_planned_boundary() {
+        let base_plan = plan(&PROLOGUE, 0x1000).expect("plan");
+        assert_eq!(base_plan.patch_len, 12);
+        assert_eq!(base_plan.patch_bytes(0x2000).len(), 12);
+
+        // One byte more of displacement must still land on a boundary, and the
+        // padding must be nops rather than part of the jump.
+        let longer = [0x55, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x45, 0x08, 0x48, 0x83, 0xC0, 0x01, 0xC3];
+        let longer_plan = plan(&longer, 0x1000).expect("plan");
+        assert_eq!(longer_plan.patch_len, 13, "whole instructions");
+        let bytes = longer_plan.patch_bytes(0x2000);
+        assert_eq!(bytes.len(), 13);
+        assert_eq!(bytes[12], 0x90);
     }
 
     #[test]

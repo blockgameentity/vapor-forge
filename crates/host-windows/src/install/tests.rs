@@ -71,6 +71,7 @@ impl DetourInstaller for FakeInstaller {
         Ok(Installed {
             symbol: symbol.to_owned(),
             address,
+            trampoline: None,
         })
     }
 }
@@ -134,6 +135,7 @@ fn a_matching_pattern_resolves_and_installs_through_the_fake() {
     assert_eq!(
         report.installed,
         vec![Installed {
+            trampoline: None,
             symbol: OWNERSHIP.to_owned(),
             address: 0x1010,
         }]

@@ -24,6 +24,21 @@ pub fn read_module_head(name: &str, len: usize) -> Result<Vec<u8>, HostError> {
     imp::read_module_head(name, len)
 }
 
+/// Copy `len` bytes out of this process at `address`.
+pub fn read_bytes(address: usize, len: usize) -> Result<Vec<u8>, HostError> {
+    imp::read_bytes(address, len)
+}
+
+/// Allocate executable memory for a trampoline. Returns the address.
+pub fn allocate_executable(len: usize) -> Result<usize, HostError> {
+    imp::allocate_executable(len)
+}
+
+/// Release memory returned by [`allocate_executable`].
+pub fn free_executable(address: usize) -> Result<(), HostError> {
+    imp::free_executable(address)
+}
+
 /// Mark `len` bytes at `address` writable, returning the previous protection.
 ///
 /// Callers must restore it: leaving `.text` writable weakens the process.
@@ -64,6 +79,13 @@ mod imp {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+        fn VirtualAlloc(
+            address: *mut core::ffi::c_void,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut core::ffi::c_void;
+        fn VirtualFree(address: *mut core::ffi::c_void, size: usize, free_type: u32) -> i32;
         fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn FlushInstructionCache(
             process: *mut core::ffi::c_void,
@@ -102,6 +124,46 @@ mod imp {
         // SAFETY: the module is mapped; we read a caller-bounded prefix of it.
         let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
         Ok(bytes.to_vec())
+    }
+
+    pub fn read_bytes(address: usize, len: usize) -> Result<Vec<u8>, HostError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: the caller passes a range inside a loaded module.
+        let slice = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
+        Ok(slice.to_vec())
+    }
+
+    pub fn allocate_executable(len: usize) -> Result<usize, HostError> {
+        const MEM_COMMIT_RESERVE: u32 = 0x3000;
+        // SAFETY: plain VirtualAlloc with no caller pointer involvement.
+        let address = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                len,
+                MEM_COMMIT_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        if address.is_null() {
+            return Err(HostError::Unsupported(format!(
+                "VirtualAlloc failed for {len} bytes"
+            )));
+        }
+        Ok(address as usize)
+    }
+
+    pub fn free_executable(address: usize) -> Result<(), HostError> {
+        const MEM_RELEASE: u32 = 0x8000;
+        // SAFETY: paired with allocate_executable; size must be 0 for release.
+        let ok = unsafe { VirtualFree(address as *mut core::ffi::c_void, 0, MEM_RELEASE) };
+        if ok == 0 {
+            return Err(HostError::Unsupported(format!(
+                "VirtualFree failed for {address:#x}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn make_writable(address: usize, len: usize) -> Result<Protection, HostError> {
@@ -183,6 +245,18 @@ mod imp {
     }
 
     pub fn read_module_head(_name: &str, _len: usize) -> Result<Vec<u8>, HostError> {
+        unsupported()
+    }
+
+    pub fn read_bytes(_address: usize, _len: usize) -> Result<Vec<u8>, HostError> {
+        unsupported()
+    }
+
+    pub fn allocate_executable(_len: usize) -> Result<usize, HostError> {
+        unsupported()
+    }
+
+    pub fn free_executable(_address: usize) -> Result<(), HostError> {
         unsupported()
     }
 

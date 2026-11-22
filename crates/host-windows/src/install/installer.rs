@@ -4,15 +4,16 @@
 //! whole resolve/install/report flow on Linux with a fake installer. The real
 //! Win32 implementation only exists when compiling for Windows.
 //!
-//! `vapor-forge-hook-engine` is not reusable as-is on Windows: its page
-//! protection calls go straight to `libc::mprotect`/`libc::sysconf` and are not
-//! cfg-gated, even though its `retour` backend is portable. This trait is the
-//! seam where a Win32-capable hook engine can replace the absolute-jump writer
-//! below without changing the planner or the report.
+//! `vapor-forge-hook-engine` now builds for Windows (its page protection has a
+//! `VirtualProtect` backend), but its writer still targets the ELF layouts the
+//! Linux host needs. This trait stays the seam: the planner and the report do
+//! not care who writes the bytes.
 //!
-//! The Win32 writer patches a 12-byte absolute jump and has no trampoline, so
-//! a replacement must not call the original entry point. Trampoline creation
-//! belongs to the hook engine that replaces this seam.
+//! The Win32 writer patching the entry delegates the two decisions that must
+//! never be improvised to [`super::patch`]: how many bytes are safe to overwrite
+//! (whole instructions only) and what the displaced instructions become
+//! (a trampoline in freshly allocated executable memory, so a replacement can
+//! still call the original).
 
 use thiserror::Error;
 
@@ -21,6 +22,9 @@ use thiserror::Error;
 pub struct Installed {
     pub symbol: String,
     pub address: usize,
+    /// Executable address of the displaced-instruction trampoline, when one was
+    /// created. `None` for installers that do not preserve the original path.
+    pub trampoline: Option<usize>,
 }
 
 /// One attempted hook installation.
@@ -41,28 +45,12 @@ pub enum InstallError {
     },
 }
 
-/// Length of `mov rax, imm64; jmp rax`, the architecture-sized absolute jump
-/// used on x86-64.
-#[cfg(any(windows, test))]
-const ABSOLUTE_JUMP_LEN: usize = 12;
-
-/// Patch bytes that transfer control to `target` without a distance limit.
-#[cfg(any(windows, test))]
-fn absolute_jump(target: usize) -> [u8; ABSOLUTE_JUMP_LEN] {
-    let mut patch = [0u8; ABSOLUTE_JUMP_LEN];
-    patch[0] = 0x48; // REX.W
-    patch[1] = 0xB8; // mov rax, imm64
-    patch[2..10].copy_from_slice(&(target as u64).to_le_bytes());
-    patch[10] = 0xFF; // jmp rax
-    patch[11] = 0xE0;
-    patch
-}
-
 #[cfg(windows)]
 mod win32 {
     use std::collections::BTreeMap;
 
-    use super::{absolute_jump, DetourInstaller, InstallError, Installed, ABSOLUTE_JUMP_LEN};
+    use super::super::patch;
+    use super::{DetourInstaller, InstallError, Installed};
     use crate::inject;
 
     /// Writes an absolute jump to a registered replacement function.
@@ -89,34 +77,74 @@ mod win32 {
                     symbol: symbol.to_owned(),
                 }
             })?;
-            let patch = absolute_jump(replacement);
-            let protection =
-                inject::make_writable(address, ABSOLUTE_JUMP_LEN).map_err(|error| {
-                    InstallError::Patch {
-                        symbol: symbol.to_owned(),
-                        address,
-                        message: error.to_string(),
-                    }
-                })?;
 
-            // SAFETY: the caller resolved `address` as a function entry inside
-            // the loaded module and `make_writable` accepted the same range.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    patch.as_ptr(),
-                    address as *mut u8,
-                    ABSOLUTE_JUMP_LEN,
-                );
-            }
-
-            inject::restore(address, ABSOLUTE_JUMP_LEN, protection).map_err(|error| {
+            // Read enough of the entry to reach the 12-byte patch boundary; the
+            // planner picks the shortest whole-instruction run and refuses
+            // anything it cannot relocate by copying.
+            let window = inject::read_bytes(address, 32).map_err(|error| InstallError::Patch {
+                symbol: symbol.to_owned(),
+                address,
+                message: error.to_string(),
+            })?;
+            let plan = patch::plan(&window, address as u64).map_err(|error| {
                 InstallError::Patch {
                     symbol: symbol.to_owned(),
                     address,
                     message: error.to_string(),
                 }
             })?;
-            inject::flush_instruction_cache(address, ABSOLUTE_JUMP_LEN).map_err(|error| {
+
+            let trampoline = inject::allocate_executable(plan.trampoline.len()).map_err(
+                |error| InstallError::Patch {
+                    symbol: symbol.to_owned(),
+                    address,
+                    message: error.to_string(),
+                },
+            )?;
+            // SAFETY: `trampoline` is a fresh allocation of exactly this size.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    plan.trampoline.as_ptr(),
+                    trampoline as *mut u8,
+                    plan.trampoline.len(),
+                );
+            }
+            inject::flush_instruction_cache(trampoline, plan.trampoline.len()).map_err(|error| {
+                InstallError::Patch {
+                    symbol: symbol.to_owned(),
+                    address,
+                    message: error.to_string(),
+                }
+            })?;
+
+            let bytes = plan.patch_bytes(replacement as u64);
+            let protection = inject::make_writable(address, plan.patch_len).map_err(|error| {
+                InstallError::Patch {
+                    symbol: symbol.to_owned(),
+                    address,
+                    message: error.to_string(),
+                }
+            })?;
+
+            // SAFETY: the caller resolved `address` as a function entry inside
+            // the loaded module, the plan covers whole instructions only, and
+            // `make_writable` accepted the same range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, plan.patch_len);
+            }
+
+            if let Err(error) = inject::restore(address, plan.patch_len, protection) {
+                // Leaving the page writable is worse than a dead hook: release
+                // the trampoline and report the failure so the capability is
+                // disabled rather than silently half-installed.
+                let _ = inject::free_executable(trampoline);
+                return Err(InstallError::Patch {
+                    symbol: symbol.to_owned(),
+                    address,
+                    message: error.to_string(),
+                });
+            }
+            inject::flush_instruction_cache(address, plan.patch_len).map_err(|error| {
                 InstallError::Patch {
                     symbol: symbol.to_owned(),
                     address,
@@ -128,11 +156,14 @@ mod win32 {
                 symbol,
                 address = format_args!("{address:#x}"),
                 replacement = format_args!("{replacement:#x}"),
+                trampoline = format_args!("{trampoline:#x}"),
+                patch_len = plan.patch_len,
                 "windows detour installed"
             );
             Ok(Installed {
                 symbol: symbol.to_owned(),
                 address,
+                trampoline: Some(trampoline),
             })
         }
     }
@@ -143,11 +174,10 @@ pub use win32::Win32DetourInstaller;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn absolute_jump_encoding_is_a_full_register_move_then_jump() {
-        let patch = absolute_jump(0x1_4000_1234);
+        let patch = super::super::patch::absolute_jump(0x1_4000_1234);
         assert_eq!(
             patch,
             [0x48, 0xB8, 0x34, 0x12, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE0]
