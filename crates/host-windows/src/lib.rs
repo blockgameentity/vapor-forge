@@ -12,6 +12,7 @@
 
 pub mod capability;
 pub mod inject;
+pub mod install;
 pub mod module;
 pub mod proxy;
 
