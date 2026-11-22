@@ -23,6 +23,7 @@
 //! | [`callbacks`] | `CSteamEngine::SetAPICallResult` (body in [`callback_result`]) | yes / yes |
 //! | [`legacy_cdkey`] | `IClientUser::RequiresLegacyCDKey` | yes / yes |
 //! | [`launch_env`] | `CUser::BuildSpawnEnvBlock` | yes / yes |
+//! | [`family_lock`] | `CUser::GetFamilySharedLockAccount` | yes / yes |
 //! | [`achievements`] (rewrites the reply) | `CAPIJobRequestUserStats::YieldingMergeStats` | yes / yes |
 //! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
 //! | [`steam_id`] | `CUser::GetSteamID` | **no / no** — body written, cannot install until the corpus carries the symbol |
@@ -67,8 +68,11 @@
 //! [`achievements::geometry`]); until that is merged the body records the gap and
 //! forwards Steam's reply unchanged.
 //!
-//! [`family_play`] is the one decision that is not a hook: it is the concurrent-play
-//! consult that [`ownership`] and [`package`] call.
+//! [`family_play`] is the concurrent-play consult that [`ownership`], [`package`]
+//! and [`family_lock`] call. [`family_lock`] is the one that replaced a real
+//! symbol: `CUser::GetFamilySharedLockAccount` is the Windows family shared-lock
+//! query, and the module doc says why it is not Linux's
+//! `CFamilySharing::GetLockingAccount`.
 
 pub mod achievements;
 pub mod callback_result;
@@ -78,6 +82,7 @@ pub mod conflict_ui;
 pub mod depot;
 pub mod depot_store;
 pub mod dlc;
+pub mod family_lock;
 pub mod family_play;
 pub mod launch_env;
 pub mod legacy_cdkey;
@@ -133,6 +138,7 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (callback_result::SYMBOL, callback_result::address),
     (legacy_cdkey::SYMBOL, legacy_cdkey::address),
     (launch_env::SYMBOL, launch_env::address),
+    (family_lock::SYMBOL, family_lock::address),
     (achievements::SYMBOL, achievements::address),
     (conflict_ui::registration::SYMBOL, conflict_ui::registration::address),
     (ui::visibility::SYMBOL, ui::visibility::address),

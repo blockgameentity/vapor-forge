@@ -61,6 +61,22 @@ pattern = "48 8B C4 89 50 10 48 89 48 08 55 53 48"
 follow = "none"
 pattern = "48 89 5C 24 10 55 56 57 48 81 EC A0 04 00 00 49 63 E9 49 8B F8 8B F2 41"
 
+# `CUser::GetFamilySharedLockAccount`: the family shared-library lock query - the
+# Windows answer to Linux's `CFamilySharing::GetLockingAccount(this, appid)`.
+# `mov r9d,[rcx+0x6bb0]` reads the family shared-lock tree's root, `mov
+# r11d,edx` proves the second argument is a 32-bit app id, and the two `[r9+disp]`
+# loads are the tree walk. It returns the account holding the app (0 when it is
+# free, or when the holder is us) in `eax`. It is a plain `.pdata` function, not a
+# vtable slot: the only two callers are `CUserAppManager` slot 71 (which sets bit
+# `0x100` of the play-info flags from a non-zero answer) and the launch-decision
+# function that answers `0x21` from it. See `res/patterns/win64/VTABLE-REPORT.md`
+# the eighth pass of `res/patterns/win64/VTABLE-REPORT.md`. The two member
+# displacements (0x6bb0/0x6bc8 here, 0x6a30/0x6a48 in public) are the
+# discriminator; the rest of the signature is identical.
+[steamclient."CUser::GetFamilySharedLockAccount"]
+follow = "none"
+pattern = "48 89 5C 24 08 48 89 7C 24 10 44 8B 89 B0 6B 00 00 44 8B DA 48 8B F9 41 83 F9 FF 74 54 48 8B 99 C8 6B 00 00"
+
 # `CUser::GetSteamID`: `CUser` 41-slot vtable slot 4, an out-parameter accessor
 # (`mov 0x20a(%rcx),%rax; mov %rax,(%rdx); mov %rdx,%rax; ret`). A leaf: no
 # `.pdata` entry, so the anchor passes the gate as a leaf (12 bytes of `int3`

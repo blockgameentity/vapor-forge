@@ -1941,6 +1941,15 @@ candidate. Not "unanchored yet": absent. A `FamilyLockBypass` on Windows would
 have to be written against whatever consumes those borrowed-licence flags, which
 this measurement did not find as a method.
 
+**Superseded in part by the eighth pass below.** The search above looked for one shape (a
+class with an `AppId -> account` slot) and stopped at the message classes. Windows
+makes the same decision in `CUser` instead: `m_mapFamilyRunningApps` holds the
+per-app lock record, and `CUser::GetFamilySharedLockAccount(this, appid) -> u32`
+is the `AppId -> account` query both of Steam's own lock consumers call. It is
+anchored in both live builds. Everything measured above still holds — there is no
+`CFamilySharing` on Windows — but the capability is **not** retired; see the eighth
+pass at the end of this report.
+
 # Seventh pass: the work-item post, and why this host does not use it
 
 `NativeResponseDelivery` on the Linux host is a **queue**: a fabricated response is
@@ -2052,3 +2061,304 @@ object and the `execute` slot **confirmed by observation** rather than inferred.
 **Verdict: no corpus entry. The post machinery is real and the item class is
 stable across builds, but the half the host would execute is unverified, and the
 synchronous serve path already delivers every response the host can fabricate.**
+
+# Eighth pass: the family lock is client-side, and Steam's own consumers call one query
+
+Section 11 searched for Linux's `CFamilySharing::GetLockingAccount` — a class, a
+slot, an `AppId -> account` shape — and found neither, because Windows does not
+ship that subsystem. It ships **family groups** instead, and the lock verdict is
+made *in the client*: `CUser` keeps a per-app record of who holds a shared app,
+recomputes it from the notifications Steam sends, and answers it through one
+plain function that both of Steam's own lock consumers call. That function is what
+`FamilyLockBypass` was missing, and it is now anchored in both builds.
+
+Section 11's measurements are not retracted: there is still no `CFamilySharing`
+class, the 68 `Family`-named RTTI tables are still all 19-slot PBO messages, and
+`GetLockingAccount` still occurs zero times. What section 11 did not do is follow
+the *strings* out of the message classes into `CUser`. Its own evidence list
+(`m_mapFamilyRunningApps`, `CUser::UpdateFamilyRunningApps`, `borrower_id`) named
+the carrier; this pass reads it.
+
+## What was measured
+
+Both live builds, engine and tool:
+
+```
+vapor-forge-vtable-pe --dll <steamclient64.dll> --module steamclient --class ''     # every RTTI class
+vapor-forge-vtable-pe --dll <steamclient64.dll> --module steamclient --class CUserAppManager --all-slots
+vapor-forge-pe-probe  --dll <steamclient64.dll> --module steamclient --dump <rva>
+vapor-forge-pe-probe  --dll <steamclient64.dll> --module steamclient --callers <rva>
+vapor-forge-pe-probe  --dll <steamclient64.dll> --module steamclient --near <rva> --window <hex>
+vapor-forge-pattern-mine --verify <corpus.toml>
+```
+
+The RTTI names below were enumerated by scanning `.rdata` for `.?AV…` type
+descriptors (8 580 in public, 8 682 in publicbeta) rather than by `--class`, which
+only reaches classes that own a vtable: a class with no virtual function has a type
+descriptor and no table, and the job classes are exactly that case.
+
+## 1. The family-groups classes are messages; the handler is not a class
+
+`--class` with an empty needle lists every RTTI table: 6 523 in public, 6 587 in
+publicbeta. Names containing `Family`: **68 in each build, the same 68**, all of
+them `CFamilyGroups_*` / `CFamilyGroupsClient_*` protobuf messages or value types.
+There is no `CFamilyGroupsClient` **class**: the client half of family groups is
+not an object with a vtable, it is `CUser` methods plus protobuf handlers. The
+message classes are real (`CFamilyGroupsClient_NotifyRunningApps_Notification` with
+its `_PlayingMember` and `_RunningApp` sub-messages), but a message class body is a
+serializer, which is why ranking their slots for "takes an AppId, returns an
+account" came out empty in section 11 — correctly.
+
+Three RTTI names outside the `Family` set matter, and none has a useful vtable
+either:
+
+| class | public | publicbeta | what it is |
+| --- | --- | --- | --- |
+| `CClientJobSetPreferredLender` | present | present | job wrapper for `CFamilyGroups_SetPreferredLender` |
+| `CClientJobSharedLibraryStopPlaying` | present | present | job wrapper for the stop-playing message |
+| `CMsgClientSharedLibraryLockStatus` (+`_LockedLibrary`) | present | present | the GC connection's "your library is locked" message |
+
+## 2. Where the client keeps the lock: `m_mapFamilyRunningApps`
+
+The client's own debug serializer names the member and its type in the same call, so
+the pair is ground truth rather than inference:
+
+```
+lea r8,[rsi+0x6a18]                          ; the member, public
+lea r9,[rip+…]      -> "m_mapFamilyRunningApps"
+lea rdx,[rip+…]     -> ".?AV?$CUtlMap@IVCSharedRunningApp@@HVCDefLess@@@@"
+call  DumpMap(writer, type, member, name)
+```
+
+| | public | publicbeta |
+| --- | --- | --- |
+| serializer function | `0xa23eb0`..`0xa254cc` (5 660 B) | `0xa4d420`..`0xa4ea7c` (5 724 B) |
+| member displacement | `+0x6a18` | `+0x6b98` |
+| type string | `0x17cd010` | `0x1808dd0` |
+
+`CUtlMap<unsigned int, CSharedRunningApp*, int, CDefLess>` — keyed by `AppId_t`,
+in both builds, byte-identical type descriptor. The value is a pointer to a
+`CSharedRunningApp`, so the per-app record is a heap object, not an inline struct.
+
+The writer, `CUser::UpdateFamilyRunningApps`, is anchored twice over — by its own
+name string and by the `FamilyGroupRunningApp_t` field names it formats for the log:
+
+| | public | publicbeta |
+| --- | --- | --- |
+| `.pdata` entry | `0xa21d27`..`0xa22481` (1 882 B) | `0xa4b147`..`0xa4b8a1` (1 882 B) |
+| `"CUser::UpdateFamilyRunningApps"` xref | `0xa21d63` | `0xa4b183` |
+| `"FamilyGroupRunningApp_t"` xref | `0xa220c0` | `0xa4b4eb`, `0xa4b742` |
+| field-name strings | `m_unAppID`, `m_bLocked`, `m_unNumMembersPlaying` | same three |
+
+**Identical body size in both builds** — 1 882 bytes — is the strongest
+cross-build datum in this pass: the family-running-apps handler has not changed
+between the public and publicbeta builds.
+
+It also carries the four strings that name the state machine it drives, all inside
+that one function (0 references anywhere else in either module):
+
+```
+Shared lock for app %u removed : preferred owner %u
+Shared lock for app %u changed : available owner %u, preferred owner %u, no players
+Shared lock for app %u changed : available owner %u, preferred owner %u, current player %u
+Shared lock for app %u changed : available owner %u, preferred owner %u, %u current players
+```
+
+"available owner", "preferred owner" and "current players" are the family-groups
+lending model, not the legacy wallet model. The record the function formats for
+those lines is `FamilyGroupRunningApp_t { AppId_t m_unAppID; bool m_bLocked;
+uint m_unNumMembersPlaying; }` — measured from the formatter's own stores
+(`mov [rbp-0x69], ebx`, `mov [rbp-0x65], al`, `mov [rbp-0x61], esi`), not from a
+header.
+
+## 3. The query: `CUser::GetFamilySharedLockAccount`
+
+One plain function, 225 bytes in **both** builds, reads that state for one app and
+returns an account id:
+
+| | public | publicbeta |
+| --- | --- | --- |
+| entry | `0xa07460` | `0xa2f7f0` |
+| extent | `0xa07460`..`0xa07541` | `0xa2f7f0`..`0xa2f8d1` |
+| size | 225 B | 225 B |
+| callers | `CUserAppManager` slot 71 `0x4f2300`, launch `0x4ff2c0` | `0x507ff0`, `0x515080` |
+
+Body, identical in both builds apart from two member displacements:
+
+```
+48 89 5C 24 08        mov  [rsp+0x8], rbx
+48 89 7C 24 10        mov  [rsp+0x10], rdi
+44 8B 89 30 6A 00 00  mov  r9d, [rcx+0x6a30]   ; tree root (publicbeta: 0x6bb0)
+44 8B DA              mov  r11d, edx           ; the app id
+48 8B F9              mov  rdi, rcx
+41 83 F9 FF           cmp  r9d, -1
+74 54                 je   …                   ; empty tree
+48 8B 99 48 6A 00 00  mov  rbx, [rcx+0x6a48]   ; node array (publicbeta: 0x6bc8)
+…                     imul r8, rax, 0x38 / cmp r11d, [r8+rbx+0x10]   ; key = the app id
+…                     lea  rax, [rcx+0x6a18]   ; the empty-node sentinel
+```
+
+The `msflow` shape, all of it measured from the body and the anchor:
+
+* **argument 1** `rcx` — a 64-bit pointer, loaded through `rex.W` opcodes twice.
+* **argument 2** `edx` — a **32-bit app id**: `mov r11d, edx`, then compared
+  unsigned-less/unsigned-greater against the tree node's 32-bit key at `[node+0x10]`.
+  That is the app id, not an account id: both call sites pass the same 32-bit value
+  they pass to the ownership-info call.
+* **return** `eax` — a 32-bit account id: `xor eax, eax` on the not-found path,
+  `mov eax, [r10+rdx*8]` on the found path, then
+  `cmp eax, [rdi+0x20a]; cmove eax, ecx` — **the self filter**. `[rcx+0x20a]` is
+  the `CSteamID` member `CUser::GetSteamID` returns (`48 8B 81 0A 02 00 00`, the
+  leaf anchored in section 10), so "the account is me" is answered `0`.
+* **no other arguments**: `r8` and `r9` are never spilled in the prologue and `r9d`
+  is overwritten by the first load, so neither is a parameter.
+* **no out-parameter**: nothing is written through any pointer, so a replacement
+  body can change exactly one thing — the returned account id.
+
+What it does with the app id, decoded: a red-black tree descent on the app id
+(`imul …, 0x38` node stride; `<` walks `[node]`, `>` walks `[node+4]`, `==`
+terminates), then a 16-byte-stride linear walk of a vector inside the
+node's value, comparing one of its fields to a value read from the node, returning
+another. The returned account is then compared against our own `CSteamID` and
+zeroed when it matches. Read plainly: **"which account, other than me, holds this
+app"**, `0` meaning nobody.
+
+One thing this pass could not resolve, and does not need to: the node stride
+(0x38) and the inline 0x20-byte value the linear walk reads do not match a
+`CSharedRunningApp*` map value (8 bytes), so the tree the query walks is either a
+second container whose head sits at the same member base or a `CSharedRunningApp`
+layout the formatter does not print. That ambiguity changes no part of the anchor —
+the anchor is the function entry — but it is why this section names the container
+from the instruction evidence ("a red-black tree") rather than claiming the C++
+class.
+
+## 4. Both of Steam's own consumers, in both builds
+
+The query has exactly two callers in each image, and both convert a non-zero answer
+into a refusal:
+
+**`CUserAppManager` vtable slot 71** — the play-info fill. (This class *is* in the
+corpus: `CUser`'s app manager, 116 slots, class name on the table in both builds.)
+
+```
+mov  rcx, [r14+0xd8]            ; the CUser
+cmp  [rcx+0x6a10], rsi          ; family group id == 0 -> skip (publicbeta: 0x6b90)
+je   skip
+mov  edx, r15d
+call 0xa07460                   ; GetFamilySharedLockAccount(user, appid)
+test eax, eax
+je   skip
+mov  rcx, [r14+0xd8]
+mov  edx, r15d
+call 0x9fc910                   ; a package-based "do I have it anyway" check
+test al, al
+jne  skip
+or   [rdi+0x4], 0x100           ; <- the lock flag on the play-info struct
+```
+
+| | public | publicbeta |
+| --- | --- | --- |
+| table | `0x12bbef0`, 116 slots, `class(CUserAppManager)` | `0x12ef5e0`, 116 slots, `class(CUserAppManager)` |
+| slot 71 | `0x4f2300` | `0x507ff0` |
+| group-id guard | `[rcx+0x6a10]` | `[rcx+0x6b90]` |
+| lock flag | `or [rdi+4], 0x100` @ `0x4f243b` | `or [rdi+4], 0x100` @ `0x50812b` |
+
+**The launch path.** `0x4ff2c0` (public) / `0x515080` (publicbeta) walk a chain of
+guard checks and return a small result code; when the query reports a holder they
+answer `0x21` instead of proceeding:
+
+```
+call 0xa07460                   ; public        (publicbeta: call 0xa2f7f0)
+test eax, eax
+je   next_check
+mov  eax, 0x21                  ; public        (publicbeta: identical, 0x51524a)
+jmp  epilogue                   ; 0x500983 / 0x516765 -- a plain ret with eax
+```
+
+The caller of that path (`0x4eca00` public) stores the code at `[CUser+0x1a0]` and
+posts it, so the code is what the launch flow and the UI end up seeing. `0x21` is
+therefore the launch result a family-locked app produces.
+
+## 5. How the record is recomputed — why the lock is *client*-side
+
+`UpdateFamilyRunningApps` does not decide on its own; it calls a 625-byte helper
+(public `0xa217d0`, `0xa217d0`..`0xa21a41`) that fills the record from two inputs:
+
+1. the app's ownership info — the same call the play-info fill uses
+   (`call 0xa03a70`), whose lender field becomes the record's owner;
+2. `CUser+0x2480`, a map of **preferred lenders**, consulted only when the
+   ownership info reports at least two lenders (`cmp [rbp-0x34], 2; jb …`,
+   `call 0xa06e40`, node stride 0x40). Its assert string is
+   `pPreferredOwnerDLC` (`0x13a62c8`; publicbeta `0x13db818`).
+
+So the *lender set* arrives from the server (`CFamilyGroups_GetPreferredLenders`,
+`CClientJobSetPreferredLender`), but the **verdict** — "is this app playable right
+now, and if not who holds it" — is computed and stored locally, and read locally by
+one function. A client hook can therefore change the verdict without touching a
+server message, which is exactly what section 11 assumed was impossible.
+
+## 6. Corpus entries added and verified
+
+One entry, in both `steamclient` corpora, wildcard-free, uniqueness-checked and
+re-verified through the anchor gate:
+
+| symbol | public | publicbeta |
+| --- | --- | --- |
+| `CUser::GetFamilySharedLockAccount` | `0xa07460`, 1 match, verified | `0xa2f7f0`, 1 match, verified |
+
+```
+CUser::GetFamilySharedLockAccount            OK               1  0x0000a07460 verified
+CUser::GetFamilySharedLockAccount            OK               1  0x0000a2f7f0 verified
+```
+
+The two patterns differ only in the two member displacements (`0x6a30`/`0x6a48`
+against `0x6bb0`/`0x6bc8`) — wildcarding them is also unique in both images, and the
+two exact forms are what the corpus carries, per build, like every other entry.
+
+`vapor-forge-pattern-mine --verify` still exits non-zero on both files for a
+reason that predates this pass: `GetPipeClient` resolves to a body the gate calls
+`unmapped` (`0x8c50b0` public, `0x8e6f70` publicbeta). That is an existing corpus
+defect outside this pass's scope; every other pattern, including this one, reports
+`verified`.
+
+## 7. What a live client would have to show to change this answer
+
+The anchor and the shape are measured; the *sufficiency* of hooking this one query
+is not, and cannot be from a static image:
+
+* **Would the play button change?** The flag consumer measured here is
+  `CUserAppManager` slot 71 — the struct Steam fills for
+  `IClientAppManager`'s app-state queries. If the SteamUI half reads its "In use by
+  <member>" label from a *different* path (a cached snapshot, a
+  `CFamilyGroupsClient_NotifyRunningApps_Notification` handler in `SteamUI.dll`, or
+  the launch result it was posted), the label would stay. Live test: enable
+  `family-lock-bypass`, have a member start the app, and check whether the button
+  flips *and* whether `Shared lock for app … changed` still logs with a non-zero
+  available owner — the log line proves the record is still locked while the
+  button is enabled, i.e. that the hook, not the record, is what changed.
+* **Would the launch succeed?** The launch path answers `0x21` from the same query,
+  so the refusal code should disappear. A client that still refuses has a second
+  gate; the next place to look is `CUserAppManager` slot 71's `0x9fc910`
+  (package-based ownership), which is *after* the query and not bypassed by it.
+* **Does anything else call the record directly?** `UpdateFamilyRunningApps`
+  recomputes on every notification, so a bypass survives a later
+  `NotifyRunningApps` — but a consumer that reads `m_mapFamilyRunningApps` without
+  going through this query would keep the lock. The serializer walk
+  (`0xa23eb0`) shows the map is also readable; other functions in the `CUser`
+  code blob use the same member displacement, and only this query has the
+  `AppId -> account` shape with Steam's two lock consumers on the other end.
+
+What would refute the anchor: a live build where the query's return stops being the
+account that gates the launch (for example if Valve moved the check into the
+`SteamUI.dll` side, which this pass did not measure — `SteamUI.dll` has its own
+corpus but no family symbol in it).
+
+**Verdict: anchored, and wired.** Windows decides the family shared-library lock
+**client-side**, in `CUser`: `m_mapFamilyRunningApps` holds
+`CSharedRunningApp` records, `CUser::UpdateFamilyRunningApps` recomputes them from
+`CFamilyGroupsClient_NotifyRunningApps_Notification` and the preferred-lender map,
+and `CUser::GetFamilySharedLockAccount(this, appid) -> u32` reads them for both of
+Steam's own consumers — the `0x100` play-info lock flag and the `0x21` launch
+result. The capability is no longer retired: it is
+`crates/host-windows/src/hooks/family_lock.rs`, gated by `family-lock-bypass`, and
+mapped in `install/deps.rs` to the symbol that truly backs it.

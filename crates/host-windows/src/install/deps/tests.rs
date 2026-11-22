@@ -207,3 +207,19 @@ fn the_identity_accessor_gates_the_identity_capability_alone() {
         &[Capability::ConflictUiBridge]
     );
 }
+
+#[test]
+fn the_family_lock_query_gates_the_family_lock_capability_alone() {
+    // Windows has no `CFamilySharing::GetLockingAccount`; the shared-lock query
+    // the client's own consumers call is `CUser::GetFamilySharedLockAccount`
+    // (`res/patterns/win64/VTABLE-REPORT.md`, eighth pass). Naming the Linux
+    // symbol here would read as a dependency no Windows install can satisfy.
+    assert_eq!(
+        capabilities_for_symbol(crate::hooks::family_lock::SYMBOL),
+        &[Capability::FamilyLockBypass]
+    );
+    assert!(
+        capabilities_for_symbol("CFamilySharing::GetLockingAccount").is_empty(),
+        "the Linux family-sharing class exists in no Windows build"
+    );
+}

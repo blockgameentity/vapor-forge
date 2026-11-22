@@ -36,7 +36,7 @@ signature that resolves on the current public build.
 | TicketOverrides | `client/{ticket,eticket,user}.rs` | ✅ `CUser::GetAppTicket` | ✅ public + beta (mined from the CUser vtable, 2026-11-22) |
 | DepotInjection | `client/depot.rs` | ✅ `GetDecryptionKey` | ✅ |
 | ShaderCacheControl | `client/shader.rs` | ⚠️ decision only, no anchor | ❌ |
-| FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ consults `family::concurrent` | n/a |
+| FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ body at `CUser::GetFamilySharedLockAccount` (the Windows family shared-lock query, not Linux's `CFamilySharing`) | ✅ public + beta |
 | DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
 | CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, **serves** a cached code with a swap guard | ✅ |
 | NativeResponseDelivery | `client/network.rs` (queue + work item) | **retired on Windows**: serving is synchronous inside Steam's `RecvPkt` call, so there is no cross-thread hand-off to gate — mapped onto the serving symbol | n/a |
@@ -52,19 +52,23 @@ signature that resolves on the current public build.
 | Achievements | `client/{achievement,user_stats}.rs` (now calls the local rebuild) | ❌ body absent | ❌ stats path refuted: no slot writes N u32s through a pointer |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 21 of 21 capabilities accounted for**: 19 have a body and install,
-`NativeResponseDelivery` is retired with evidence (synchronous serving), and
-`FamilyLockBypass` is the only one whose carrier never appeared in a hunt so far. Linux implements ~19 and now consults the shared
+Counts: **Windows 21 of 21 capabilities accounted for**: 20 have a body and install and
+`NativeResponseDelivery` is retired with evidence (synchronous serving). Linux implements ~19 and now consults the shared
 family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
-when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
+when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds, and
+`FamilyLockBypass` stopped being the capability without a carrier: the eighth pass
+of `res/patterns/win64/VTABLE-REPORT.md` found the family lock is decided
+client-side in `CUser` and anchored the query both of Steam's own lock consumers
+call (`0xa07460` public / `0xa2f7f0` publicbeta).
 
-Corpus coverage: Linux ships **34** symbols, Windows **35** (public 28 + 7, beta
-27 + 5). The `CNetPacket` layout family (`Init`/`Alloc`/`Release`) is now anchored
+Corpus coverage: Linux ships **34** symbols, Windows **38** (public 30 + 8, beta
+29 + 6). The `CNetPacket` layout family (`Init`/`Alloc`/`Release`) is now anchored
 too, with the packet field offsets decoded identically in both builds. Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
 x64 licence stride), `CUser::BuildSpawnEnvBlock` (candidate, found by its 63 env-key
-strings and its caller), and the real dispatch site — `CCMInterface::RecvPkt`,
-a two-level MSVC jump table over EMsg `0x2f3..0x370` (the `CNetPacket::*` tables
-were refuted: no slot holds an indirect jump).
+strings and its caller), `CUser::GetFamilySharedLockAccount` (the family
+shared-lock query, eighth pass of `VTABLE-REPORT.md`), and the real dispatch site
+— `CCMInterface::RecvPkt`, a two-level MSVC jump table over EMsg `0x2f3..0x370`
+(the `CNetPacket::*` tables were refuted: no slot holds an indirect jump).
 
 ## 3. Gap classes, and what each one costs
 
@@ -102,7 +106,7 @@ have no Linux analogue because Proton handles that path.
 | fake ownership | ✅ | ✅ | ✅ body + anchor, ABI unverified |
 | library UI / purchase time / removal | ✅ | ✅ | ✅ bodies (new) |
 | family label + borrower marker | ✅ | ⚠️ decisions exist, hooks partial | ✅ in ownership/package bodies |
-| concurrent play | ✅ | ✅ `family_lock.rs` | ⚠️ decision only |
+| concurrent play | ✅ | ✅ `family_lock.rs` | ✅ `hooks/family_lock.rs` at the family shared-lock query |
 | tickets | ✅ | ✅ | ❌ no anchor |
 | Denuvo lease/pulse | ✅ | ⚠️ model + authorisation window | ❌ blocked by the ticket anchor |
 | request codes / manifest download | ✅ 6 providers | ✅ CM interception | ❌ no anchor |
@@ -123,7 +127,10 @@ request codes and achievements are blocked on corpus class B.
 ## 5. Order of work to close the remaining distance
 
 1. ~~Concurrent-play consult~~ — done on both hosts (`family_play.rs` on Windows,
-   `family_decide.rs` on Linux, both asking `features::family::concurrent`).
+   `family_decide.rs` on Linux, both asking `features::family::concurrent`), and
+   **hooked** on Windows: `hooks/family_lock.rs` replaces
+   `CUser::GetFamilySharedLockAccount`, the query Steam's play-info flags and
+   launch result both read.
 2. ~~Statistics path~~ — **done as a rewrite.** `decode_job_reply` derives the
    reply field (0x1b0 public / 0x1a8 beta) and body displacement (0x18) by walking
    `BInit`'s instructions; the merge body decodes the response with prost,

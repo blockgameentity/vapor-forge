@@ -40,6 +40,7 @@ pub mod callbacks;
 pub mod cloud;
 pub mod depot;
 pub mod dlc;
+pub mod family_lock;
 pub mod launch_env;
 pub mod legacy_cdkey;
 pub mod netpacket;

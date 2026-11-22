@@ -128,6 +128,17 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
         "CUser::BuildSpawnEnvBlock",
         &[Capability::LaunchEnvironment],
     ),
+    // The Windows family shared-lock query. It is the only site the win64 corpus
+    // anchors for `FamilyLockBypass`, so a build whose signature stops resolving
+    // costs that capability and nothing else. The name is not Linux's
+    // `CFamilySharing::GetLockingAccount`: that class exists in no Windows build
+    // (`res/patterns/win64/VTABLE-REPORT.md` section 11), while this function is
+    // the `CUser` query both of Steam's own lock consumers call (eighth pass of
+    // that report).
+    (
+        "CUser::GetFamilySharedLockAccount",
+        &[Capability::FamilyLockBypass],
+    ),
 ];
 
 /// Capabilities that depend on `symbol`; empty for an unknown symbol.
