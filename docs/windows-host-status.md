@@ -25,6 +25,8 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 | Windows corpus (public + publicbeta) | done | `res/patterns/win64/<component>/<sha256>.toml` |
 | module identity, capability gate, proxy plan, Win32 FFI | done | `crates/host-windows/src/{module,capability,proxy,inject}.rs` |
 | install layer (corpus → BatchPlan → DetourInstaller) | done, no live client | `crates/host-windows/src/install*` |
+| loadable DLL: `DllMain` + worker thread + report bundle | done, compiled for `x86_64-pc-windows-gnu`, **never loaded by Steam** | `crates/host-windows/src/entry*`, `src/thread.rs` |
+| hook bodies: ownership, package/marker pass, depot pre-seed consult, ticket decision | done; 3 of 4 have a corpus anchor, the ticket body has none | `crates/host-windows/src/hooks/*`, `src/abi/*` |
 | behavioural probes (msabi + 4 profiles) | done, **all four targets still open** | `crates/patterns/src/{msabi,probe_facts,probe_rank}.rs`, `res/patterns/win64/PROBE-REPORT.md` |
 | depotcache pre-seed logic | done (traits only, no host wiring) | `crates/features/src/depotcache.rs` |
 | egress policy check | done | `scripts/check-egress.sh` |
@@ -38,10 +40,32 @@ cargo clippy --workspace --all-targets -- -D warnings    # clean
 cargo check --workspace --all-targets                    # clean
 cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok
 scripts/check-egress.sh                                  # ok
+cargo test -p vapor-forge-host-windows                   # 104 passed
+cargo clippy -p vapor-forge-host-windows --all-targets -- -D warnings   # clean
+cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu  # DllMain exported
 ./target/debug/vapor-forge-pattern-mine --dll <public steamclient64.dll> \
   --module steamclient --arch x86_64 \
   --verify res/patterns/win64/steamclient/669fa08e….toml  # all 14 patterns resolve
 ```
+
+`cargo build --target x86_64-pc-windows-gnu` for the **whole workspace** still fails,
+and has done since before the host was loadable: `crates/diagnostics` calls
+`libc::write(2, …, bytes.len())`, whose Windows signature takes a `u32` length. The
+host DLL itself builds for that target. `i686-pc-windows-gnu` is not installed in
+this environment, so the 32-bit build is untested here.
+
+## What the hook bodies actually do
+
+| hook | corpus symbol (public / publicbeta) | decision it applies |
+| --- | --- | --- |
+| ownership | `CUser::CheckAppOwnership` (yes / yes) | `features::apps::decide_check_ownership` + `features::family` provenance, and the borrower marker for a named lender |
+| package | `CPackageInfo::GetPackageInfo` (yes / yes) | `features::package` marker housekeeping (`family::marker::remove_if_unborrowed`) over the controlled set |
+| depot | `GetDecryptionKey` (yes / yes) | `features::depotcache`'s `satisfies_install` for the depot the key is for — reported, never fetched or written |
+| ticket | `CUser::GetAppTicket` (**no / no**) | `features::ticket` source chain + authorisation window; the body cannot install, and would not serve bytes if it could |
+
+Nothing is served from a ticket buffer and no package structure is rewritten: the
+out-buffer layouts those would need are not measured on any Windows build.
+
 
 ## Known limits
 
@@ -60,6 +84,17 @@ scripts/check-egress.sh                                  # ok
 - Capabilities whose symbol is simply absent from a present corpus stay enabled;
   only unresolved/failed symbols disable dependents.
 - No Windows runtime test: cross-compilation and fake-installer tests only.
+- The DLL is loadable and exports `DllMain`, but **it has never been loaded into a
+  Steam process**. Every assumption the owner has to check on a live client is
+  listed at the top of `crates/host-windows/src/abi*` and in the delivery notes:
+  `CAppOwnershipInfo`'s layout, whether `r8` of `CheckAppOwnership` is the out
+  pointer, whether `GetPackageInfo`'s 32-bit argument is a package id, and which
+  of the three `<host dir>/…` corpus layouts Steam installs actually use.
+- The worker polls for `steamclient64.dll` / `SteamUI.dll` for ten seconds and then
+  gives up; a module mapped later is missed for the process lifetime.
+- `features::depotcache`'s pre-seed is consulted at `GetDecryptionKey`, because no
+  request-code site (`CUser::BuildSpawnEnvBlock`) is anchored. Nothing skips
+  Steam's request-code round trip yet.
 - Windows corpus covers 14/26 (steamclient) and 7/10 (steamui) symbols on public.
   The remainder were never published as hints; behavioural probing did not
   identify them (`PROBE-REPORT.md`), and vtable anchoring found one candidate.

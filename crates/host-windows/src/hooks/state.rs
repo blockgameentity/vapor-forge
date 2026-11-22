@@ -1,0 +1,180 @@
+//! What a hook body is allowed to read, published once during startup.
+//!
+//! The bodies run on Steam's threads and must be callable before the host has
+//! finished starting: [`get`] returning `None` is the "not initialised" answer
+//! and every body then falls through to the original. Publication happens before
+//! the first entry patch is enabled (see [`crate::hooks::installer`]), so in
+//! practice a body either sees the whole state or the detour is not installed.
+//!
+//! The gate is behind a lock and tightened after the install pass: the state is
+//! published with every capability enabled so the window between "first entry
+//! patched" and "install results known" behaves like a normal run, and the
+//! capabilities whose symbols did not resolve are disabled immediately
+//! afterwards.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
+
+use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_features::family::FamilySettings;
+use vapor_forge_features::package::PackageState;
+use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
+use vapor_forge_features::ticket::TicketCache;
+
+use crate::capability::{Capability, Gate};
+use crate::hooks::depot_store::DepotPlan;
+
+/// Everything a hook body may consult. Immutable except for the gate and the
+/// interior state of the feature objects.
+pub struct HostState {
+    config: RuntimeConfig,
+    gate: RwLock<Gate>,
+    package: PackageState,
+    family: FamilySettings,
+    /// Apps the effective config controls, DLC ids included, computed once.
+    controlled: Vec<AppId>,
+    ticket_cache: TicketCache,
+    /// Lua-provided tickets. Empty today: the scripting crate is not a
+    /// dependency of this host, so nothing populates it yet.
+    lua_tickets: HashMap<AppId, Vec<u8>>,
+    /// The Denuvo authorisation lease, acquired once when the host starts.
+    ///
+    /// `[ticket] denuvo_mode = "off"` (the default) means there is no lease at
+    /// all, which is the historical one-shot behaviour. Checking one acquired
+    /// window - rather than acquiring a fresh one per request - is what makes
+    /// expiry observable.
+    authorisation: Option<AuthorisationWindow>,
+    depot: DepotPlan,
+}
+
+impl HostState {
+    pub fn new(
+        config: RuntimeConfig,
+        family: FamilySettings,
+        controlled: Vec<AppId>,
+        ticket_dir: Option<PathBuf>,
+        depot: DepotPlan,
+    ) -> Self {
+        let authorisation = authorisation::from_config(&config.ticket, started_at());
+        Self {
+            config,
+            gate: RwLock::new(Gate::all_enabled()),
+            package: PackageState::new(),
+            family,
+            controlled,
+            ticket_cache: TicketCache::new(ticket_dir),
+            lua_tickets: HashMap::new(),
+            authorisation,
+            depot,
+        }
+    }
+
+    /// Replace the authorisation lease. Tests use it to check an exact instant
+    /// without waiting; the host only ever sets the one time-derived lease.
+    #[must_use]
+    pub fn with_authorisation(mut self, authorisation: Option<AuthorisationWindow>) -> Self {
+        self.authorisation = authorisation;
+        self
+    }
+
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+
+    pub fn package(&self) -> &PackageState {
+        &self.package
+    }
+
+    pub fn family_settings(&self) -> FamilySettings {
+        self.family
+    }
+
+    /// The current account's Steam account id, or 0 when it is not known.
+    ///
+    /// The Windows host has no measured way to read it yet, so it is always 0.
+    /// `features::family::provenance::lender_account` treats 0 as "unknown", not
+    /// as a lender, so a family label is never invented from it.
+    pub fn self_account_id(&self) -> u32 {
+        0
+    }
+
+    pub fn controlled_apps(&self) -> &[AppId] {
+        &self.controlled
+    }
+
+    pub fn ticket_cache(&self) -> &TicketCache {
+        &self.ticket_cache
+    }
+
+    pub fn lua_tickets(&self) -> &HashMap<AppId, Vec<u8>> {
+        &self.lua_tickets
+    }
+
+    pub fn depot(&self) -> &DepotPlan {
+        &self.depot
+    }
+
+    /// The Denuvo lease this process holds, if `[ticket] denuvo_mode` asked for
+    /// one.
+    pub fn authorisation(&self) -> Option<AuthorisationWindow> {
+        self.authorisation
+    }
+
+    /// Whether `capability` survived the install pass.
+    pub fn allows(&self, capability: Capability) -> bool {
+        self.gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_enabled(capability)
+    }
+
+    /// Snapshot of the gate, for the one feature pass that runs after install.
+    pub fn gate(&self) -> Gate {
+        self.gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The install pass's reason, when `capability` was disabled by it.
+    pub fn disabled_reason(&self, capability: Capability) -> Option<String> {
+        self.gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reason(capability)
+            .map(str::to_owned)
+    }
+
+    /// Replace the gate with the install pass's result.
+    pub fn set_gate(&self, gate: Gate) {
+        *self
+            .gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = gate;
+    }
+}
+
+static STATE: OnceLock<Arc<HostState>> = OnceLock::new();
+
+/// Seconds since the Unix epoch, saturating at 0 for a clock set before it.
+fn started_at() -> Duration {
+    Duration::from_secs(u64::try_from(vapor_forge_core::unix_now()).unwrap_or(0))
+}
+
+/// The published state, or `None` before the host finished starting.
+pub fn get() -> Option<&'static HostState> {
+    STATE.get().map(Arc::as_ref)
+}
+
+/// Publish `state` for the hook bodies.
+///
+/// `Err` means this process already published one: there is exactly one host
+/// state per process, and a second publication would silently swap the config a
+/// live hook is reading.
+pub fn publish(state: Arc<HostState>) -> Result<(), String> {
+    STATE
+        .set(state)
+        .map_err(|_| "the host state was already published in this process".to_owned())
+}

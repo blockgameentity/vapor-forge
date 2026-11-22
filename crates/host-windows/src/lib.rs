@@ -11,17 +11,31 @@
 //! are testable without a live client. [`lifecycle`] composes the install pass and
 //! the feature pass into one report.
 //!
-//! The Windows-specific FFI is confined to [`inject`]; every other module is
-//! plain logic and is unit-tested on the build host, so the crate builds and
-//! tests on Linux as well as on `x86_64-pc-windows-gnu`.
+//! The Windows-specific FFI is confined to [`inject`], [`thread`] and
+//! [`entry::windows`]; every other module is plain logic and is unit-tested on the
+//! build host, so the crate builds and tests on Linux as well as on
+//! `x86_64-pc-windows-gnu`.
+//!
+//! The crate is a loadable library (`cdylib`) as well as a library: [`entry::dll`]
+//! is the `DllMain` a Steam process loads, and [`entry::worker`] is the flow it
+//! spawns — see [`entry`]. [`hooks`] holds the replacement bodies that flow
+//! installs, one per corpus symbol, and [`abi`] documents exactly which parts of
+//! each call shape are measured and which are assumed.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+pub mod abi;
 pub mod capability;
+pub mod entry;
 pub mod features;
+pub mod hooks;
 pub mod inject;
 pub mod install;
 pub mod lifecycle;
 pub mod module;
 pub mod proxy;
+pub mod thread;
 
 use thiserror::Error;
 
