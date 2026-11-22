@@ -30,34 +30,39 @@ signature that resolves on the current public build.
 
 | capability | Linux (module) | Windows body | Windows anchor |
 | --- | --- | --- | --- |
-| CallbackEvents | `client/{user,internal_callbacks,callback_notify,client_id,steam_context}.rs` | — | — |
+| CallbackEvents | `client/{user,internal_callbacks,callback_notify,client_id,steam_context}.rs` | ⚠️ decision only | ❌ |
 | Ownership | `client/ownership.rs` | ✅ `CUser::CheckAppOwnership` | ✅ public + beta |
 | PackageInjection | `client/package.rs`, `install/package_info.rs` | ✅ `CPackageInfo::GetPackageInfo` | ✅ |
 | TicketOverrides | `client/{ticket,eticket,user}.rs` | ✅ `CUser::GetAppTicket` | ✅ public + beta (mined from the CUser vtable, 2026-11-22) |
 | DepotInjection | `client/depot.rs` | ✅ `GetDecryptionKey` | ✅ |
-| ShaderCacheControl | `client/shader.rs` | — | ✅ `CShaderCacheManager::…` (steamclient, unanchored in win64 corpus) |
-| FamilyLockBypass | `client/family_lock.rs` | ⚠️ decision only, no body consults it | n/a |
-| DlcOverrides | `client/dlc.rs` | — | ✅ `CPackageInfo::…` |
-| CmInterception | `client/network.rs` | — | ❌ `CNetPacket` dispatch unanchored |
+| ShaderCacheControl | `client/shader.rs` | ⚠️ decision only, no anchor | ❌ |
+| FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ consults `family::concurrent` | n/a |
+| DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
+| CmInterception | `client/network.rs` | ⚠️ anchor exists (`CCMInterface::RecvPkt`), body not written | ✅ newly mined |
 | NativeResponseDelivery | `client/network.rs` | — | — |
 | CloudControl | `client/cloud.rs` | ⚠️ host feature pass decides, no client body | n/a |
-| CloudHttp | `client/cloud_http.rs` | — | — |
-| LaunchEnvironment | `client/env.rs` | — | `CUser::BuildSpawnEnvBlock` not anchored |
-| LegacyCdKeyControl | `client/legacy_cdkey.rs` | — | — |
-| SteamIdOverride | `client/user.rs` | — | — |
+| CloudHttp | `client/cloud_http.rs` | ✅ `CloseAppCloud` | ✅ public + beta |
+| LaunchEnvironment | `client/env.rs` | ⚠️ decision only | ✅ `CUser::BuildSpawnEnvBlock` newly anchored (candidate) |
+| LegacyCdKeyControl | `client/legacy_cdkey.rs` | ⚠️ decision only | ❌ |
+| SteamIdOverride | `client/user.rs` | ⚠️ decision only | ❌ |
 | LibraryUi | `ui/library.rs` | ✅ `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | ✅ (4 of 8 SteamUI symbols used) |
 | OverviewMetadata | `ui/library.rs` | ✅ via the overview bodies | ✅ |
 | LibrarySnapshot | `ui/library.rs` | ✅ via the snapshot body | ✅ |
-| ConflictUiBridge | `ui/reverse_bridge.rs` | — | — |
-| Achievements | `client/{achievement,user_stats}.rs` | ❌ body absent | ❌ stats path unanchored (class fully named, target shape absent) |
+| ConflictUiBridge | `ui/reverse_bridge.rs` | ⚠️ decision only | ❌ |
+| Achievements | `client/{achievement,user_stats}.rs` (now calls the local rebuild) | ❌ body absent | ❌ stats path refuted: no slot writes N u32s through a pointer |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 8 of 21 capabilities have a body, all 8 installable** (every
-body's symbol is anchored in both live builds). Linux implements ~19. Ticket moved from "written but unanchored" to installable
+Counts: **Windows 9 of 21 capabilities have a body, all 9 installable**; 7 more
+have a tested decision with no anchor. Linux implements ~19 and now consults the
+shared family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
-Corpus coverage: Linux ships **34** symbols, Windows **24** (union of public +
-publicbeta; public 15 + 7, beta 14 + 7). All 8 Windows bodies resolve.
+Corpus coverage: Linux ships **34** symbols, Windows **27** (public 19 + 8, beta
+18 + 6). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
+x64 licence stride), `CUser::BuildSpawnEnvBlock` (candidate, found by its 63 env-key
+strings and its caller), and the real dispatch site — `CCMInterface::RecvPkt`,
+a two-level MSVC jump table over EMsg `0x2f3..0x370` (the `CNetPacket::*` tables
+were refuted: no slot holds an indirect jump).
 
 ## 3. Gap classes, and what each one costs
 
@@ -67,12 +72,12 @@ implements it: `ShaderCacheControl`, `DlcOverrides`, `CallbackEvents`,
 `LaunchEnvironment`. Linux has a working reference for each. This is mechanical
 work — one body plus its decide function and tests per capability.
 
-**B. No anchor (corpus).** Body or not, shape-based derivation found nothing for:
-`CNetPacket` dispatch, the stats path, `CUser::GetSubscribedApps` (one unconfirmed
-vtable candidate, slot 183) and `CUser::BuildSpawnEnvBlock`. These block
-CmInterception, Achievements and the request-code skip on Windows. `GetAppTicket`
-was the one that succeeded — slot-anchored in both builds — which is the evidence
-that vtable passes produce anchors where prologue hunting does not. Vtable anchoring is
+**B. No anchor (corpus).** What remains: the **stats path**, refuted cleanly —
+no `CUserStats` (67 slots) or `CGameStats` (14) slot writes N 32-bit values
+through a pointer argument, and the name appears in no string; the real path is
+the `CAPIJobRequestUserStats` pair, whose creator is `CUserStats` slot 6. That
+blocks `Achievements` on Windows. Everything else moved: `CmInterception`'s
+anchor now exists (body not yet written), `LaunchEnvironment`'s too. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
 **C. Unverified ABI.** Everything below the planner assumes MS-x64 argument
@@ -112,13 +117,15 @@ request codes and achievements are blocked on corpus class B.
 
 ## 5. Order of work to close the remaining distance
 
-1. **Concurrent-play consult** in the ownership body (Linux has `family_lock.rs`;
-   the Windows decision exists and has no caller). Small.
-2. **Statistics path anchor** (class B) — unblocks achievements *and* the local
-   rebuild that BST contributed.
-3. **`CUser::GetAppTicket` anchor** (class B) — unblocks tickets and Denuvo.
-4. **`CNetPacket` dispatch anchor** (class B) — unblocks request codes, the last
-   piece of the HYJ install path.
+1. ~~Concurrent-play consult~~ — done on both hosts (`family_play.rs` on Windows,
+   `family_decide.rs` on Linux, both asking `features::family::concurrent`).
+2. **Statistics path** — the direct method is refuted; the remaining lead is
+   `CAPIJobRequestUserStats` / `CUserStats` slot 6, which is a different call shape
+   than the Linux hook assumes. Unblocks `Achievements` (and the BST rebuild) once
+   solved.
+3. ~~`CUser::GetAppTicket` anchor~~ — done (both builds), tickets install.
+4. **Request-code body** at `CCMInterface::RecvPkt` — anchor mined, body not
+   written; this is the last piece of the HYJ install path.
 5. **Body-per-capability sweep** (class A) against the Linux reference:
    shader control, DLC overrides, callbacks, legacy CD key, SteamID override,
    cloud HTTP, conflict UI.
