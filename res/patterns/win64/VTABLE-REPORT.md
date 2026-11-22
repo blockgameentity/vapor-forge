@@ -488,3 +488,273 @@ for "all stats of a user".
 * Store-through-argument counts are upper bounds on the *prefix*: a body that
   writes its out-parameter only in a late error path is under-counted, and stack
   argument pointers are not tracked at all.
+
+---
+
+# Third pass: the four remaining anchors, mined from names
+
+The first two passes measured slot *shape* and then slot *position*. Both are
+blind to a method's identity when its selector has no discriminative shape —
+which is exactly the situation the second pass ended in for three of these four
+targets. This pass adds the axis that was in the binaries all along: **MSVC
+leaves the method name in the module**. Steam logs its own method names, so a
+`.rdata` string xref plus "which `.pdata` entry and which table hold the
+containing function" is ground truth for identity, and `msflow` plus the
+EMsg / RTTI data tables are ground truth for behaviour.
+
+Method (read-only, no network contact, no new dependency): a RIP-relative
+reference scan over `.text` (`lea`/`mov` with a `RIP` disp32) maps every string
+and every `.data` pointer to its containing `.pdata` extent;
+`vapor-forge-vtable-pe --holds` resolves that extent to a slot and an RTTI
+class; `vapor-forge-pe-functions --near/--dump` gives extents; `objdump -d`
+gives operands; `/tmp/gate0/hints/steamclient/<sha>.toml` (an older Windows
+build) gives names, RVAs and signatures; the `.data` EMsg record table
+`{char *name, 0, u32 emsg}` gives EMsg → name.
+
+| symbol | verdict | anchor, public / publicbeta | corpus entry |
+| --- | --- | --- | --- |
+| `CUser::GetSubscribedApps` | **confirmed** | `0xa0bca0` / `0xa34310` — `CUser` slot 183 in both | **added** |
+| `CUser::BuildSpawnEnvBlock` | **candidate** (strong) | `0xa1c5d0` / `0xa45520` | **added** |
+| `CNetPacket::Dispatch` | **refuted as named**; site located as `CCMInterface::RecvPkt` slot 3 | `0x5d3030` / `0x5f0b50` | **added** under the real name |
+| `CUser::GetUserStats` / user-stats slot | **refuted** (shape absent, name absent) | path found: `CUserStats` slot 6 → `CAPIJobRequestUserStats` | none |
+
+Two of the four negatives are the expected outcome, and both are stated with the
+measurement that produced them rather than as an opinion.
+
+## 1. `CUser::GetSubscribedApps` — confirmed
+
+Identity and shape agree, from two independent measurements, in both builds.
+
+| evidence | public | publicbeta |
+| --- | --- | --- |
+| method-name string `CUser::GetSubscribedApps` (`0x13a11c8` / `0x13d66b8`) referenced from | `0xa0beab` | `0xa34535` |
+| containing slot | `CUser` 260-slot table, **slot 183** | `CUser` 261-slot table, **slot 183** |
+| function extent (shared `.pdata` rule, upper bound) | `0xa0bca0`, 932 B | `0xa34310`, 964 B |
+| argument registers read in the first 15 bytes | `r9@0x3 r8@0x7 rdx@0xb rcx@0xf` | identical |
+| `msflow` licence stride | `stride5 12 shl4 1` (i\*5 then `<<4` = **0x50**) | `stride5 12 shl4 1` |
+| `msflow` argument forwarding | `fwd 1:1,2:1,3:1`, `arg32 0:8` | `fwd 1:1,2:1,3:1`, `arg32 0:8` |
+| `msflow` byte-argument reads | `bytearg 3`, one of them `movzbl %r9b,%r15d` at `0xa0bce4` | same at the same offset into the body |
+
+The Linux 32-bit body walks its licence vector with an `index * 9` stride, and
+that form is **refuted** for this window: `msflow` reports `stride9 0` for the
+slot in both builds. The 64-bit form is what survives, and it survives exactly:
+`stride5 12 shl4 1` is the `lea (%rax,%rax,4)` + `shl $0x4` pair, i.e. a
+0x50-byte licence-entry stride, which is the shape the Linux **64-bit** validator
+for this symbol asks for. The `bool` argument is also present and is the fourth:
+`movzbl %r9b,%r15d` at `0xa0bce4` (public) zero-extends `r9b`, and `bytearg 3`
+counts three argument-byte reads in the body. Twelve further
+`lea (%rcx,%rcx,4)` sites walk the same stride through a base held in `rdi`.
+
+**ABI as measured:** `(this, u32 app id, <out>, bool)` — arg 1 is read as a
+32-bit register (`arg32 0:8`), args 1, 2 and 3 are each forwarded to at least
+one call, and arg 3 is consumed as the `bool`. The 4-byte stores into the caller
+array are still *inferred* from the loop position, not traced: `u32@arg` is `-`
+for this slot because register provenance is dropped at the branch, the same
+limitation the second pass recorded. The second pass's independent label (the
+same string, found from `.rdata` without `msflow`) and this pass's flow
+measurement agree on the slot; that is as far as static evidence goes.
+
+**What a live client would show to overturn it:** the function being called with
+something other than `(this, app id, array, bool)` — e.g. a CSteamID where the
+app id is, or the fourth argument never being 0/1. **What would confirm the
+ABI:** a caller that allocates `cMaxApps * 4` bytes and passes that count.
+
+## 2. `CUser::BuildSpawnEnvBlock` — candidate (strong)
+
+The hint corpus names this symbol in an older Windows build:
+
+```
+name = "BuildSpawnEnvBlock"   rva = "0x9D2C70"
+sig  = "4C 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 B8 FD FF FF"
+```
+
+That signature does **not** land in either live build (0 matches; also 0 for the
+relaxed `4 homes … lea rbp,[rsp-neg]` form and for the neighbouring
+`SpawnProcess` / `RecvPkt` hints — the prologues were all rebuilt). The function
+was found by role instead:
+
+| evidence | public | publicbeta |
+| --- | --- | --- |
+| env-variable name strings referenced by one function (`SteamAppId`, `SteamGameId`, `SteamOverlayGameId`, `SteamAppUser`, `SteamUserDataFolder`, `PATH`, `SteamEnv`, `STEAM_COMPAT_PROTON`, `SteamVirtualGamepadInfo`, 10 `SteamStreaming*`, 5 `SDL_*`, `XR_RUNTIME_JSON`, `http_proxy`/`https_proxy`/`no_proxy`, …) | 63 key-like strings out of 75 string references, inside `0xa1c5d0` | 58 key-like out of 69, inside `0xa45520` |
+| source-path assert string in the same function | `…\src\clientdll\user.cpp` at `0xa1d052` | same TU |
+| called from | `0xa1e26a`, inside `CUser::SpawnProcessInternal` (`0xa1e050`, named by its own log string `SpawnProcessInternal`) | `0xa47269`, inside `0xa47040` |
+| extent / second caller | 6,076 B; also called from `0xa09ac6` (244 B, builds a launch descriptor) | 5,838 B; callers `0xa47269`, `0xa3200a` |
+| process creation | none: no `CreateProcess*`/`ShellExecute*` reference in the body, only `tier0_s64!g_pMemAllocSteam` | same |
+| entry delta to the spawner | `0xa1e050 - 0xa1c5d0 = 0x1a80` | `0xa47040 - 0xa45520 = 0x1b20` |
+
+**ABI as measured:** `rcx` = `CUser *this`; `rdx` = a launch descriptor read at
+`+0x0`, `+0x8`, `+0x10` (64-bit ids), `+0x18` (the `u32` app id that becomes
+`SteamAppId=`), `+0x20` and `+0x21` (two `bool`s, `movzbl`); `r8` is forwarded to
+the engine's env-builder interfaces (`call *0x50(%rax)` with `rdx = r8`, then
+`call *0x80(%rax)` with the assembled block in `r8` and `r8`-the-argument in
+`r9`). The block itself is assembled in local string objects and handed over; it
+is not returned.
+
+**Why this is a candidate and not confirmed:** the name comes from the older
+build's corpus, not from a string in these images. The role — one function, in
+`user.cpp`, that materialises the complete child-process environment and is
+called by `SpawnProcessInternal` immediately before the spawn — is the role the
+hint names, and it is the only function in either module that references all
+three of `SteamAppId`, `SteamGameId` and `SteamAppUser` as *keys* (the three
+`…=` literals at `0x13a4e60` belong to the *parser* of another process's
+environment, `0xa204b0` / `0xa4987a`, which reads them with `strncmp`).
+
+**What a live client would show to overturn it:** a game launch in which
+`0xa1c5d0` is *not* called, or in which the environment it hands to the spawned
+process lacks `SteamAppId`. **What would confirm the ABI:** hooking it and
+logging the descriptor — one call per launch, `+0x18` equal to the launched app
+id, and the resulting child environment carrying `SteamAppId=<that id>`.
+
+## 3. `CNetPacket` dispatch — the site is `CCMInterface::RecvPkt`; the name `CNetPacket::Dispatch` is refuted
+
+The first pass concluded that no packet-class slot is dispatch shaped. That is
+re-confirmed here with a direct measurement — for each of the 46 slots of
+`IMsgNetPacket`, `CProtoBufNetPacket`, `CStructNetPacket` and
+`CClientStructNetPacket` (184 slots) the `.pdata` extent contains **0** indirect
+or register jumps. The dispatch is not on the packet class; it is one class up:
+
+| `CCMInterface` slot | public | indirect jumps |
+| --- | --- | --- |
+| 0, 1, 2, 4 | `0x5ca520`, `0x5ca980`, `0x5cb060`, `0x5c5f30` | 0 |
+| **3** | **`0x5d3030`, 4,274 B** | **1** |
+
+Slot 3 logs `CCMInterface::RecvPkt` (`0x12e6178` → `0x5d3074`), and its body is
+exactly a message dispatch:
+
+* the EMsg comes from the packet through a virtual call — `mov (%rbx),%rax; mov %rbx,%rcx; call *0x60(%rax)` — into `r14d`;
+* a first compare handles `0x93` (`k_EMsgServiceMethod` = 147) and `0x92`
+  (`k_EMsgDestJobFailed` = 146) plus `0x2bf`, `0x2ef`, `0x157c`, `0x157d`,
+  `0x15f8`, and routes them to the job path;
+* the rest reaches a real jump table at `0x5d32ab`: `add $0xfffffd0d,%r14d`
+  (bias 0x2f3), `cmp $0x7d; ja default`, then the two-level MSVC switch —
+  `movzbl byte_table[0x5d4064 + i]`, `mov offset_table[0x5d4038 + case*4],%ecx`,
+  `add %rdx,%rcx`, `jmp *%rcx`. One site, in both builds.
+
+The 126 values `0x2f3..0x370` collapse to **9 real case bodies**; 117 values —
+including `0x2fd` and `0x370` — reach the shared exit at `0x5d3fce`. The handled
+EMsgs are, from the `.data` `{name, 0, emsg}` record table: `0x2f3`
+`k_EMsgClientLogOnResponse`, `0x2f5` `k_EMsgClientNotLoggedOnDeprecated`,
+`0x2fc` `k_EMsgClientPurchaseResponse`, `0x305` `k_EMsgClientServerList`,
+`0x306` `k_EMsgClientGameConnectDeny`, `0x30b` `k_EMsgClientNOP`, `0x311`
+`k_EMsgClientGetLegacyGameKey`, `0x32d` `k_EMsgClientSteamUsageEvent`, `0x33e`
+`k_EMsgClientClanState`. `CCMConnection::RecvPkt` (`0x5d2f80` / `0x5f09c0`) is a
+167-byte forwarder: it takes the packet, and calls `*(this+8)` slot `0x18` —
+that is this same `CCMInterface` slot 3.
+
+**Correction to the previous pass:** the "EMsg dispatch is not reachable"
+conclusion is wrong in one respect — it is a jump table, but it is over the
+0x2f3..0x370 core-message range, not over the whole EMsg space, which is why a
+`chain <= 0x4000` ranking never surfaced it (the chain here is a seven-value
+pre-check, and 126 range values are dispatched by table). There is also **no
+table of handler pointers** anywhere: application messages are not dispatched
+here at all — the API that wants a response creates the job
+(`CUserStats` slot 6 constructs `CAPIJobRequestUserStats`, section 4) and the job
+waits for its own message (`CJob::BYieldingWaitForServiceMethodResponse`,
+`0xd39410`).
+
+**Verdict:** `CNetPacket::Dispatch` as a body is **refuted** — `CNetPacket`
+subclasses are marshalling objects with no dispatch slot. The dispatch site that
+the capability actually needs is `CCMInterface::RecvPkt` (slot 3).
+
+**What a live client would show to overturn it:** an application EMsg reaching a
+handler table in a *different* function (that table would be the real dispatch),
+or `r14d` at `0x5d3030` not being the wire EMsg. **What would confirm the hook
+point:** breaking on `0x5d3030` and seeing every inbound message arrive there
+with `r14d` equal to its EMsg.
+
+## 4. user-stats path — the proposed shape is refuted; the path is a CAPI job pair
+
+### 4a. The shape does not exist in `CUserStats` / `CGameStats`
+
+Measured with `msflow` argument tracking over every slot of both classes in the
+public build (`CUserStats` 56-slot + 11-slot tables, `CGameStats` 14 slots):
+
+| class | slots | slots with a 32-bit store through an argument | where |
+| --- | --- | --- | --- |
+| `CUserStats` (`0x13b2330`, `0x13b24f8`) | 67 | **1** | slot 21 (`0xa9d1c0`, 20 insns): `u32thru 0:1` — through **`this`**, not a caller pointer |
+| `CGameStats` (`0x12c63d8`) | 14 | **0** | — |
+
+No slot writes N 32-bit values through a pointer argument, and no slot returns a
+count of values written. This is not a ranking failure, it is an absence: the
+`IClientUserStats` surface is per-stat (`GetUserStat(CSteamID, name, out)`),
+per-achievement (`GetUserAchievement`, three stack out-pointers) and async
+(`RequestUserStats`), and the aggregate "all stats of a user" path is not a
+vtable method at all. The first-pass warning applies: a five-store selector is
+not discriminative — `CUser` slot 257 has `thru 1:5 u32thru 1:5` and is a
+hash-bucket teardown.
+
+`CUser::GetUserStats` also has **no string anywhere** in either module (unlike
+`CUser::GetSubscribedApps`, `CUserStats::*` and the `IClientUser` name table), so
+there is nothing to anchor a name to.
+
+### 4b. Where the user-stats path actually lives
+
+Names come from the log strings, functions from the xrefs:
+
+| role | public | publicbeta | how named |
+| --- | --- | --- | --- |
+| job creator | `0xa92cc0` — `CUserStats` **slot 6** (56-slot table) | `0xabc850` — slot 6 (57-slot table) | allocates `0x198` bytes, constructs with the `CAPIJobRequestUserStats` name string (`0xa92de6`), sets the vtable, registers the job |
+| request/response handler + schema writer | `0xa93120`, 2,163 B (schema part starts at a continuation entry `0xa93428`) | `0xabcc20`, 2,043 B | `CAPIJobRequestUserStats - received error/… response failed/missing schema`, `failed to init schema KV`, `updated schema from server` |
+| local rebuild / merge | `0xaa03d0` (66 B, returns) then continuation `0xaa0420`, 3,562 B | `0xac97d0`, 3,491 B | `CAPIJobRequestUserStats::YieldingMergeStats - beginning merge/server vs. local/using %s stats` |
+| uploader | `0xa902b0` | `0xab9f70` | `CAPIJobStoreUserStats::BYieldingRunAPIJob` |
+
+The merge block is the local-rebuild (BST) point: `… YieldingMergeStats - server
+vs. local …` is where server values are reconciled with the client's own. It is
+**not anchored here**: `0xaa0420` begins `sub $0x2,%edx; je case2; sub $1,%edx;
+je case1; cmp $0xd,%edx; je …` — a coroutine resume block, not a function entry
+with a stable prologue, and mining a signature for it would pin a resume state.
+The clean, entry-aligned anchors on this path are slot 6 (`0xa92cc0`), the
+handler (`0xa93120`) and the uploader (`0xa902b0`).
+
+**Verdict:** `CUser::GetUserStats` as a `CUserStats`/`CGameStats` method is
+**refuted**; the capability's real interception points are the `CAPIJob` pair,
+and `Capability::Achievements` should be re-pointed at one of them (a
+`crates/host-windows` change, outside this corpus-only branch).
+
+**What a live client would show to overturn the negative:** a `CUserStats` slot
+that is called with an `AppId_t`, an out array and a capacity while a game asks
+for its stats. **What would confirm the replacement:** `0xa93120` being entered
+on the `Player.GetUserStats#1` response with the schema protobuf and the local
+stats map in hand.
+
+## Corpus entries added and verified
+
+Three symbols, one pattern each, **the same bytes in both builds** (no variant
+needed): `follow = "none"`, mined by `vapor-forge-pattern-mine` (1 match,
+unique) and accepted by the anchor body gate:
+
+| symbol | pattern | public | publicbeta |
+| --- | --- | --- | --- |
+| `CUser::GetSubscribedApps` | `48 8B C4 44 88 48 20 44 89 40 18 48 89 50 10 48 89 48 08 55 ?? ?? 48 8D 68 A1 48 81 EC A0 00 00 00 48` | `0xa0bca0` verified | `0xa34310` verified |
+| `CUser::BuildSpawnEnvBlock` | `48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? FF FF 48 81 EC ?? ?? 00 00 8B 42 18 0F 57 C0 48 8B 1A 4D 8B F8 48 8B 72 08` | `0xa1c5d0` verified | `0xa45520` verified |
+| `CCMInterface::RecvPkt` | `48 8B C4 55 48 8D A8 E8 FB FF FF 48 81 EC 10 05 00 00 48 89 58 08 48 8B DA 48 89 70 F0 48 8B F1 4C 89 68 D8 45 33 ED 48` | `0x5d3030` verified | `0x5f0b50` verified |
+
+`--verify` on the full corpus, both images: 18 patterns (public) / 17 (beta)
+resolve, the three new ones `verified`, and the only rejection is the
+pre-existing `GetPipeClient: unmapped` — unchanged from before this pass.
+
+`CCMInterface::RecvPkt` is a **new symbol name**: the host has no hook body for
+it, so the install pass resolves and skips it ("no replacement on this host
+yet") rather than failing, and `install::deps` still maps `CNetPacket::Dispatch`
+to `CmInterception`. Wiring it up is a one-line `deps.rs` change plus a body.
+
+## Limits of this third pass
+
+* The method-name evidence names the function that *logs* the name. MSVC inlines
+  and merges, so a label can belong to the surviving copy of a merged body; for
+  every function quoted above the string sits inside the body that the log text
+  describes, and slot membership was checked separately.
+* `CUser::BuildSpawnEnvBlock` is the weakest of the three entries because its
+  name is inherited from an older build's corpus rather than read out of these
+  images. Its *behaviour* is established; its *identity* rests on role +
+  call-graph position + the key set.
+* The EMsg names come from the module's own `.data` record table
+  (`{char *name, 0, u32 value}`), whose layout was inferred, not documented. It
+  is validated at the two values the dispatch code itself treats specially —
+  146 and 147, `k_EMsgDestJobFailed` and `k_EMsgServiceMethod` — and the whole
+  `0x2f3..0x370` set is coherent with the client-message range. A name that is
+  off by one somewhere in that range changes no anchor and no verdict here: the
+  evidence is the jump table and the values in it, not the names.
+* Nothing here is a live confirmation. A hook on `0xa0bca0`, `0xa1c5d0` or
+  `0x5d3030` in a running client is what would turn these from static evidence
+  into fact.

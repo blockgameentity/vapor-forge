@@ -9,9 +9,17 @@ architecture = "x86_64"
 follow = "none"
 pattern = "48 8B C4 55 48 8D 68 A1 48 81 EC C0 00 00 00 48 89 70 18 49"
 
+[steamclient."CCMInterface::RecvPkt"]
+follow = "none"
+pattern = "48 8B C4 55 48 8D A8 E8 FB FF FF 48 81 EC 10 05 00 00 48 89 58 08 48 8B DA 48 89 70 F0 48 8B F1 4C 89 68 D8 45 33 ED 48"
+
 [steamclient."CUtlBufferEnsureCapacity"]
 follow = "none"
 pattern = "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 8D 7A 01 0F"
+
+[steamclient."CUser::BuildSpawnEnvBlock"]
+follow = "none"
+pattern = "48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? FF FF 48 81 EC ?? ?? 00 00 8B 42 18 0F 57 C0 48 8B 1A 4D 8B F8 48 8B 72 08"
 
 [steamclient."CUser::CheckAppOwnership"]
 follow = "none"
@@ -20,6 +28,10 @@ pattern = "48 8B C4 89 50 10 48 89 48 08 55 53 48"
 [steamclient."CUser::GetAppTicket"]
 follow = "none"
 pattern = "48 89 5C 24 10 55 56 57 48 81 EC A0 04 00 00 49 63 E9 49 8B F8 8B F2 41"
+
+[steamclient."CUser::GetSubscribedApps"]
+follow = "none"
+pattern = "48 8B C4 44 88 48 20 44 89 40 18 48 89 50 10 48 89 48 08 55 ?? ?? 48 8D 68 A1 48 81 EC A0 00 00 00 48"
 
 [steamclient."CloseAppCloud"]
 follow = "none"
