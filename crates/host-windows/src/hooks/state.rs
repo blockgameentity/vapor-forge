@@ -31,6 +31,7 @@ use crate::hooks::achievements::cache::SchemaCache as AchievementSchemaCache;
 use crate::hooks::achievements::geometry::JobReply;
 use crate::hooks::depot_store::DepotPlan;
 use crate::hooks::netpacket::cache::CodeCache as RequestCodeCache;
+use crate::hooks::netpacket::fetch::Fetch as RequestCodeFetch;
 use crate::hooks::netpacket::ledger::Ledger as NetPacketLedger;
 
 pub mod access;
@@ -93,10 +94,17 @@ pub struct HostState {
     /// The manifest request codes this process holds, keyed by `(depot, gid)`.
     ///
     /// The dispatch body reads it on Steam's networking thread, so it is a bounded
-    /// table behind one mutex and never dials: a provider fetch belongs on a
-    /// worker, and this host has none yet (see
-    /// [`crate::hooks::netpacket::cache`]).
+    /// table behind one mutex and never dials: a code is written by the fetch
+    /// worker only (see [`crate::hooks::netpacket::cache`]).
     request_codes: RequestCodeCache,
+    /// The producer for the table above: the bounded queue the dispatch body
+    /// fills on a miss, and the one-per-process decision to run a worker at all.
+    ///
+    /// Separate from the cache because the two have different readers and
+    /// different failure modes: the cache is read on Steam's networking thread and
+    /// never blocked, while this is written there (one push) and read by the
+    /// worker. See [`crate::hooks::netpacket::fetch`].
+    code_fetch: RequestCodeFetch,
     /// The stats-reply geometry the corpus decoder resolved, if it has landed.
     ///
     /// Written once per module after the install batch, like [`Self::layout`],
@@ -137,6 +145,7 @@ impl HostState {
             netpacket: NetPacketLedger::new(),
             layout: RwLock::new(None),
             request_codes: RequestCodeCache::new(),
+            code_fetch: RequestCodeFetch::new(),
             reply: RwLock::new(None),
             achievement_schemas: AchievementSchemaCache::new(),
         }
@@ -159,6 +168,12 @@ impl HostState {
     /// The request codes this process holds.
     pub fn request_codes(&self) -> &RequestCodeCache {
         &self.request_codes
+    }
+
+    /// The queue the dispatch body fills on a cache miss, plus the fetch worker's
+    /// one-per-process start decision.
+    pub fn code_fetch(&self) -> &RequestCodeFetch {
+        &self.code_fetch
     }
 
     /// Publish the decoded stats-reply geometry. First decode wins, like

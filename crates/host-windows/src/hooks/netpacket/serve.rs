@@ -8,7 +8,7 @@
 //! capability off                  -> Prepared::pass()                (no reads)
 //! no layout                       -> observe(NoLayout)               (no reads)
 //! payload unreadable / no target   -> observe(NoTarget)               (no writes)
-//! target, nothing cached          -> observe(NoCachedCode)           (no writes)
+//! target, nothing cached          -> observe(NoCachedCode) + enqueue  (no writes)
 //! target, cached code             -> observe(none) + swap            (swap + restore)
 //! ```
 //!
@@ -18,6 +18,14 @@
 //! released before the original call, and the payload is copied into a `Vec`
 //! before it is parsed: no lock and no Steam pointer outlives this function. The
 //! swap itself owns its bytes and restores them on drop; see [`super::swap`].
+//!
+//! The one miss row has a side effect, and it is deliberately the cheapest thing
+//! this body can do: a cache miss offers the target to the fetch worker (see
+//! [`super::fetch`]), which is a push onto a bounded ring behind a mutex the
+//! worker never holds across a fetch. It never dials, never waits and never
+//! allocates past that ring, so a provider round trip can never stall Steam's
+//! networking thread. Nothing is enqueued on any other row — not without a
+//! layout, not with the capability off, and not when a code was served.
 
 use core::ffi::c_void;
 
@@ -26,6 +34,7 @@ use crate::capability::Capability;
 use crate::hooks::state::HostState;
 
 use super::decision::{self, Disposition, Inputs, Observation, RequestTarget, ServeBlocker};
+use super::fetch::Request;
 use super::{payload, swap::PacketSwap};
 
 /// What the body must do for one message.
@@ -62,9 +71,8 @@ pub unsafe fn prepare(state: &HostState, packet: *mut c_void) -> Prepared {
     // SAFETY: the caller guarantees `packet` is null or a live CNetPacket of the
     // layout the state published.
     let read = unsafe { read_payload(packet, layout) };
-    let cached = read
-        .target
-        .and_then(|target| state.request_codes().get(target));
+    let target = read.request.map(|request| request.target);
+    let cached = target.and_then(|target| state.request_codes().get(target));
     let inputs = Inputs {
         cm_enabled: true,
         request_codes_enabled: state.allows(Capability::RequestCodes),
@@ -72,15 +80,21 @@ pub unsafe fn prepare(state: &HostState, packet: *mut c_void) -> Prepared {
         // The message id comes from an accessor this corpus does not anchor (see
         // `crate::abi::netpacket`), so nothing here claims to know it.
         emsg: None,
-        target: read.target,
+        target,
         cached,
     };
     match decision::decide(&inputs) {
         Disposition::Pass => Prepared::pass(),
-        Disposition::Observe(observation) => Prepared {
-            observation: Some(refine(observation, read.cause)),
-            swap: None,
-        },
+        Disposition::Observe(observation) => {
+            let observation = refine(observation, read.cause);
+            if observation.blocker == ServeBlocker::NoCachedCode {
+                enqueue_miss(state, read.request);
+            }
+            Prepared {
+                observation: Some(observation),
+                swap: None,
+            }
+        }
         Disposition::Serve { target, code } => {
             let Some(layout) = layout else {
                 // `decide` returns `NoLayout` before it can serve, so this is a
@@ -116,7 +130,8 @@ pub unsafe fn prepare(state: &HostState, packet: *mut c_void) -> Prepared {
 /// What one read of the packet produced.
 #[derive(Clone, Copy, Debug, Default)]
 struct Read {
-    target: Option<RequestTarget>,
+    /// The `(app, depot, gid)` a fetch would need, when the payload named one.
+    request: Option<Request>,
     /// Why the payload could not be turned into a target, when it could not.
     cause: Option<PayloadCause>,
 }
@@ -164,13 +179,13 @@ impl PayloadCause {
 unsafe fn read_payload(packet: *mut c_void, layout: Option<Layout>) -> Read {
     let Some(layout) = layout else {
         return Read {
-            target: None,
+            request: None,
             cause: Some(PayloadCause::NoLayout),
         };
     };
     if packet.is_null() {
         return Read {
-            target: None,
+            request: None,
             cause: Some(PayloadCause::NullPacket),
         };
     }
@@ -184,15 +199,15 @@ unsafe fn read_payload(packet: *mut c_void, layout: Option<Layout>) -> Read {
     };
     if data.is_null() || size == 0 {
         return Read {
-            target: None,
+            request: None,
             cause: Some(PayloadCause::Empty),
         };
     }
     // SAFETY: Steam's packet supplies a non-null pointer and its own byte count.
     let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
-    match payload::target(bytes) {
-        Ok(target) => Read {
-            target: Some(target),
+    match payload::request(bytes) {
+        Ok(request) => Read {
+            request: Some(request),
             cause: None,
         },
         Err(blocker) => {
@@ -202,11 +217,25 @@ unsafe fn read_payload(packet: *mut c_void, layout: Option<Layout>) -> Read {
                 "netpacket: payload could not be read as a request-code request"
             );
             Read {
-                target: None,
+                request: None,
                 cause: Some(PayloadCause::Unreadable),
             }
         }
     }
+}
+
+/// Offer a cache miss to the fetch worker.
+///
+/// The only thing this body does with the fetch layer, and it only enqueues: see
+/// [`super::fetch`] for why the round trip runs on a worker instead. The result
+/// is not inspected on purpose — the queue's counters carry why an offer was
+/// refused, and the reasons a host never fetches at all are logged once by the
+/// lifecycle, not once per inbound message.
+fn enqueue_miss(state: &HostState, request: Option<Request>) {
+    let Some(request) = request else {
+        return;
+    };
+    state.code_fetch().queue().enqueue(request);
 }
 
 fn observation_of(target: RequestTarget, blocker: ServeBlocker) -> Observation {

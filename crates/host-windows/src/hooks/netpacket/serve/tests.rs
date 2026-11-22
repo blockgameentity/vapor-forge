@@ -235,3 +235,5 @@ fn without_a_layout_the_record_says_no_layout_and_nothing_is_read() {
         Some(ServeBlocker::NoLayout)
     );
 }
+
+mod fetch;

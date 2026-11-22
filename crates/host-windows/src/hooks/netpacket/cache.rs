@@ -9,10 +9,11 @@
 //! # Who fills it
 //!
 //! Not the hook. A provider fetch takes a network round trip, so it belongs on the
-//! worker: the hook looks a code up, and if there is none it records
-//! [`ServeBlocker::NoCachedCode`](super::decision::ServeBlocker::NoCachedCode) and
-//! forwards the message. The next message for the same target is answered from the
-//! cache once the worker has stored one. Nothing here dials.
+//! worker in [`super::fetch`]: the hook looks a code up, and if there is none it
+//! records [`ServeBlocker::NoCachedCode`](super::decision::ServeBlocker::NoCachedCode),
+//! offers the target to that worker's queue, and forwards the message. The next
+//! message for the same target is answered from the cache once the worker has
+//! stored one. Nothing here dials.
 
 use std::sync::Mutex;
 

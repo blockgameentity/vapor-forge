@@ -33,11 +33,11 @@
 //!    instead: does this body parse as that request, and does it name a target. A
 //!    payload that does not parse is left alone, and every record says
 //!    [`ServeBlocker::NoTarget`].
-//! 2. **A producer for the cache.** Nothing on this host fills it yet: a provider
-//!    round trip belongs on a worker, and this host has no request-code worker.
-//!    So a live client records [`ServeBlocker::NoCachedCode`] for every message it
-//!    can read — the cache is the seam a worker fills, not a second silent no-op.
-//!    The body never dials: [`serve::prepare`] only ever reads.
+//! 2. **A producer for the cache.** [`fetch`] is it: the body offers a
+//!    `(app, depot, gid)` to a bounded queue on a miss and reads the answer out of
+//!    [`cache`] on the next message. The round trip runs on a worker through
+//!    `features::request_code`, so the body never dials: [`serve::prepare`] only
+//!    reads, and the one thing it writes is a queue push.
 //!
 //! # Gating
 //!
@@ -97,9 +97,9 @@
 //!
 //! ## What would have to change for async delivery to be worth building
 //!
-//! 1. A producer that can answer **after** a dispatch returns. Today nothing fills
-//!    the code cache (see [`ServeBlocker::NoCachedCode`]); caching ahead of the
-//!    request keeps the synchronous body sufficient.
+//! 1. A producer that can answer **after** a dispatch returns. [`fetch`] does
+//!    that now, which is exactly why the synchronous body stays sufficient: the
+//!    producer fills the cache ahead of the next request.
 //! 2. A captured dispatch context: the receiver (`recv_pkt`'s `this`) and the
 //!    `conn_id` [`Layout`] already decodes, published somewhere a worker can read.
 //! 3. Callable `CNetPacket::Alloc`/`Init`/`Release` addresses, not just their field
@@ -117,6 +117,7 @@ pub mod availability;
 pub mod cache;
 pub mod classify;
 pub mod decision;
+pub mod fetch;
 pub mod layout;
 pub mod ledger;
 pub mod lookup;

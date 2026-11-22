@@ -1,12 +1,11 @@
 //! The request-code lookup the dispatch hook would perform, decided from config.
 //!
 //! `features::request_code` owns the provider chain: which entries exist, whether
-//! failover walks past a failure, per-provider pacing and cooldowns. The Windows
-//! host cannot run it — `PendingQueue::queue_fetch` needs a decoded
-//! `CMsgProtoBufHeader` from `vapor_forge_steam_protocol`, which this crate does
-//! not depend on, and the payload it would decode is unreadable without a packet
-//! layout anyway (see [`super`]). What it *can* do is run the chain's **decision**
-//! over the real inputs it holds:
+//! failover walks past a failure, per-provider pacing and cooldowns. The worker in
+//! [`super::fetch`] runs that chain for real, on a thread of its own and only once
+//! a code is actually missing. What this module adds is the chain's **decision**
+//! projected over the config the host already holds, so the first dispatch can log
+//! who would be asked before anything has been fetched:
 //!
 //! * `request_code::should_intercept_with_ownership` — does this controlled app
 //!   need an injected code at all, or is it genuinely owned (a code would be
