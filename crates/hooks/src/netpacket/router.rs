@@ -972,9 +972,13 @@ fn handle_manifest_send(
             as request_code::ManifestCodeCallback
     });
     if script_callback.is_none() && cfg.manifest.providers.is_empty() {
+        // No Lua provider and no configured chain: report the reason and
+        // degrade instead of dialling anything.
         warn!(
             app_id,
-            depot_id, gid, "netpacket: manifest request has no provider"
+            depot_id,
+            gid,
+            "netpacket: no manifest provider configured, answering without a request code"
         );
         queue_local_response_for_generation(
             request_code::build_response_packet(&req_hdr_bytes, job_id, gid, 0),

@@ -1424,6 +1424,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vapor-forge-host-windows"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "prost",
+ "sha2",
+ "thiserror",
+ "tracing",
+ "vapor-forge-config",
+ "vapor-forge-core",
+ "vapor-forge-features",
+ "vapor-forge-hook-engine",
+ "vapor-forge-patterns",
+ "vapor-forge-pe",
+ "vapor-forge-scripting",
+ "vapor-forge-steam-protocol",
+]
+
+[[package]]
 name = "vapor-forge-memory"
 version = "0.1.0"
 dependencies = [

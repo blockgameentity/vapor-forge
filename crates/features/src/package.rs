@@ -5,6 +5,10 @@ use std::sync::Mutex;
 use tracing::debug;
 use vapor_forge_config::{AppId, RuntimeConfig};
 
+use crate::family::marker::{remove_if_unborrowed, BorrowerMarkers, MarkerOutcome};
+use crate::family::provenance::Provenance;
+use crate::family::FamilySettings;
+
 /// Safe business logic for pkg0 injection.
 ///
 /// This module does NOT touch Steam memory. It produces "what to do"
@@ -13,6 +17,12 @@ pub struct PackageState {
     active: AtomicBool,
     /// Track what we've injected so hot-reload can diff.
     injected_apps: Mutex<HashSet<AppId>>,
+    /// Borrower markers stamped while a lender's license covers an app.
+    ///
+    /// Kept apart from `injected_apps` on purpose: a family-shared app is
+    /// deliberately left out of pkg0, so pkg0 membership says nothing about
+    /// whether an app is borrowed.
+    borrower_markers: Mutex<BorrowerMarkers>,
 }
 
 /// What to inject on first pkg0 capture.
@@ -31,6 +41,7 @@ impl PackageState {
         Self {
             active: AtomicBool::new(false),
             injected_apps: Mutex::new(HashSet::new()),
+            borrower_markers: Mutex::new(BorrowerMarkers::new()),
         }
     }
 
@@ -42,9 +53,69 @@ impl PackageState {
         self.active.store(true, Ordering::Release);
     }
 
+    /// Forget everything learned about the previous account.
+    ///
+    /// Borrower markers go too: a marker is only meaningful for the account
+    /// whose licenses produced it, and a marker left behind is what keeps an app
+    /// labelled "from family library" after it has left our library.
     pub fn reset_account_state(&self) {
         self.active.store(false, Ordering::Release);
-        self.injected_apps.lock().unwrap().clear();
+        self.injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.borrower_markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Stamp the borrower marker for an app a lender covers, returning the
+    /// lender it replaced.
+    ///
+    /// Wired by the host later: the license owner is only visible in the hooks
+    /// layer, so nothing in this crate stamps a marker yet.
+    pub fn stamp_borrower_marker(&self, app_id: AppId, lender: u32) -> Option<u32> {
+        self.borrower_markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stamp(app_id, lender)
+    }
+
+    /// The lender the app's borrower marker records, if one is stamped.
+    pub fn borrower_marker(&self, app_id: AppId) -> Option<u32> {
+        self.borrower_markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lender(app_id)
+    }
+
+    pub fn borrower_marker_count(&self) -> usize {
+        self.borrower_markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Remove the app's marker once it is no longer borrowed.
+    ///
+    /// Idempotent and safe to call on every refresh: an app without a marker
+    /// reports [`MarkerOutcome::Absent`] and nothing is written.
+    pub fn remove_borrower_marker(
+        &self,
+        app_id: AppId,
+        real: Provenance,
+        settings: FamilySettings,
+    ) -> MarkerOutcome {
+        remove_if_unborrowed(
+            &mut self
+                .borrower_markers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            app_id,
+            real,
+            settings,
+        )
     }
 
     /// Compute what app IDs to inject into pkg0 on first capture.
@@ -58,7 +129,10 @@ impl PackageState {
 
     /// Record what we injected so hot-reload can diff later.
     pub fn record_injected(&self, ids: &[AppId]) {
-        let mut guard = self.injected_apps.lock().unwrap();
+        let mut guard = self
+            .injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.extend(ids.iter().copied());
     }
 
@@ -67,11 +141,17 @@ impl PackageState {
     /// This is runtime diagnostics state, not an ownership or network-policy
     /// signal. `RuntimeConfig::is_controlled_app` is authoritative for policy.
     pub fn is_injected_into_pkg0(&self, app_id: AppId) -> bool {
-        self.injected_apps.lock().unwrap().contains(&app_id)
+        self.injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&app_id)
     }
 
     pub fn injected_count(&self) -> usize {
-        self.injected_apps.lock().unwrap().len()
+        self.injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Compute the diff between current controlled set and what was previously injected.
@@ -79,7 +159,10 @@ impl PackageState {
     /// `controlled_ids` = union of config inject IDs + script addappid IDs.
     pub fn compute_hot_reload_diff(&self, controlled_ids: &[AppId]) -> ReloadDiff {
         let new_set: HashSet<AppId> = controlled_ids.iter().copied().collect();
-        let guard = self.injected_apps.lock().unwrap();
+        let guard = self
+            .injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let additions: Vec<AppId> = new_set.difference(&guard).copied().collect();
         let removals: Vec<AppId> = guard.difference(&new_set).copied().collect();
@@ -97,8 +180,15 @@ impl PackageState {
     }
 
     /// Update the injected set after a hot-reload diff is applied.
+    ///
+    /// Borrower markers are deliberately untouched: an app dropped from pkg0
+    /// because a lender now covers it must keep its marker, and stamping or
+    /// clearing is a provenance decision, not a pkg0 one.
     pub fn apply_diff(&self, diff: &ReloadDiff) {
-        let mut guard = self.injected_apps.lock().unwrap();
+        let mut guard = self
+            .injected_apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for &id in &diff.removals {
             guard.remove(&id);
         }
@@ -242,5 +332,59 @@ mod tests {
         assert_eq!(&ids[..2], &[AppId(100), AppId(200)]);
         assert!(ids.contains(&AppId(300)));
         assert_eq!(ids.len(), 3);
+    }
+
+    // Invariant 3, through the package layer: removal is idempotent and says so.
+    #[test]
+    fn a_borrower_marker_is_removed_once_and_then_reported_absent() {
+        let state = PackageState::new();
+        state.stamp_borrower_marker(AppId(570), 9_999_999);
+        assert_eq!(state.borrower_marker(AppId(570)), Some(9_999_999));
+
+        let settings = FamilySettings::default();
+        let first = state.remove_borrower_marker(AppId(570), Provenance::Owned, settings);
+        assert!(first.changed());
+        assert_eq!(state.borrower_marker_count(), 0);
+
+        let second = state.remove_borrower_marker(AppId(570), Provenance::Owned, settings);
+        assert_eq!(second, MarkerOutcome::Absent);
+        assert!(!second.changed());
+    }
+
+    #[test]
+    fn a_family_app_left_out_of_pkg0_keeps_its_borrower_marker() {
+        let state = PackageState::new();
+        state.record_injected(&[AppId(100), AppId(200), AppId(570)]);
+        state.stamp_borrower_marker(AppId(570), 4_242);
+
+        // 570 leaves pkg0 because a lender covers it, not because it left the
+        // library: the marker must stay.
+        let diff = ReloadDiff {
+            additions: Vec::new(),
+            removals: vec![AppId(570)],
+        };
+        state.apply_diff(&diff);
+
+        assert_eq!(state.borrower_marker(AppId(570)), Some(4_242));
+        assert_eq!(
+            state.remove_borrower_marker(
+                AppId(570),
+                Provenance::FamilyShared,
+                FamilySettings::default()
+            ),
+            MarkerOutcome::StillBorrowed { lender: 4_242 }
+        );
+    }
+
+    #[test]
+    fn an_account_switch_drops_every_borrower_marker() {
+        let state = PackageState::new();
+        state.stamp_borrower_marker(AppId(570), 4_242);
+        state.stamp_borrower_marker(AppId(730), 5_353);
+
+        state.reset_account_state();
+
+        assert_eq!(state.borrower_marker_count(), 0);
+        assert_eq!(state.borrower_marker(AppId(570)), None);
     }
 }

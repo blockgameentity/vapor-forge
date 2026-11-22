@@ -125,6 +125,24 @@ Lua scripts can register apps, set avatars, provide stat donors, and more. Scrip
 2. `~/.config/vapor-forge/scripts/`
 3. Paths listed in `[scripting].paths`
 
+Binding names are case-insensitive. A rejected call is a script error reported with its line number, and nothing is written for it.
+
+| binding | meaning |
+| --- | --- |
+| `addappid(appid [, depot, key_hex])` | register a controlled app, optionally with its depot key |
+| `setmanifestid(depot, gid [, size])` | pin a depot to a manifest id |
+| `setappticket(appid, hex)` / `seteticket(appid, hex)` | supply an app or encrypted-app ticket |
+| `setstat(appid, steamid_decimal)` | present another account's SteamID to a game |
+| `setavatar(appid, avatar_appid)` | network as another app's avatar |
+| `addtoken(appid, token_decimal)` | add an access token for an app |
+| `setachievement(appid, key, true)` | report an achievement as unlocked (time unknown) |
+| `setachievement(appid, key, false)` | report it as locked, clearing any time |
+| `setachievement(appid, key, unix_time)` | unlocked at that rtime32; `0` means time unknown |
+| `fetch_manifest_code(gid)` / `fetch_manifest_code_ex(appid, depot, gid)` | provider callbacks for manifest request codes |
+| `http_get(url [, headers])` / `http_post(url, body [, headers])` | restricted HTTP helpers (see `--allow-network`) |
+
+`setachievement` is intent, not data: nothing is fetched and nothing is invented. The achievements reply is composed as the schema's definitions, then Steam's own unlock map, then these overrides, so a key the schema does not define is ignored (one `debug` line per app) and a reply no override changes is forwarded byte for byte.
+
 ## Check
 
 ```sh

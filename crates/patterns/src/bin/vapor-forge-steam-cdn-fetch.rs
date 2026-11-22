@@ -605,7 +605,7 @@ fn scan_extracted_libraries(
                 args.text_print(format_args!(
                     "scan {} {}-bit: {} ok={} miss={} failures={} path={}",
                     report.module,
-                    report.elf_class.bits(),
+                    report.bits(),
                     if fail_count == 0 { "OK" } else { "MISS" },
                     report.ok_count(),
                     report.miss_count(),
@@ -699,7 +699,7 @@ fn arch_bits_label(bits: u8) -> String {
 }
 
 fn json_scan_from_report(report: ModuleScanReport) -> JsonPatternScan {
-    let arch_bits = report.elf_class.bits();
+    let arch_bits = report.bits();
     let path = report.path.display().to_string();
     let ok_count = report.ok_count();
     let miss_count = report.miss_count();
@@ -729,7 +729,7 @@ fn json_failure(report: &ModuleScanReport, entry: &PatternScanEntry) -> JsonPatt
     JsonPatternFailure {
         module: report.module.clone(),
         path: report.path.display().to_string(),
-        arch_bits: report.elf_class.bits(),
+        arch_bits: report.bits(),
         pattern: entry.name.to_owned(),
         status: entry.status.label().to_owned(),
         hits: entry.match_count,

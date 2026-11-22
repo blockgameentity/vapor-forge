@@ -1,4 +1,4 @@
-use serde::de::{IntoDeserializer, MapAccess, Visitor};
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -125,6 +125,19 @@ pub struct SharedSection {
     pub include: Vec<AppId>,
     #[serde(default)]
     pub exclude: Vec<AppId>,
+    /// Re-validate a claimed lender before trusting a family label.
+    ///
+    /// Without this, a licence we fabricated ourselves reads back as borrowed
+    /// and the library says "from family library". On by default: it is the
+    /// correct behaviour, and turning it off restores the pre-fix label.
+    #[serde(default = "default_true")]
+    pub validate_lender: bool,
+    /// Remove a borrower marker once an app is no longer borrowed.
+    ///
+    /// On by default; off leaves the marker in place, which is the pre-fix
+    /// behaviour and can mislabel an ingested app.
+    #[serde(default = "default_true")]
+    pub clean_borrower_markers: bool,
 }
 
 impl SharedSection {
@@ -148,6 +161,8 @@ impl Default for SharedSection {
             enabled: true,
             include: Vec::new(),
             exclude: Vec::new(),
+            validate_lender: true,
+            clean_borrower_markers: true,
         }
     }
 }
@@ -277,11 +292,39 @@ pub struct ScriptingSection {
 }
 
 /// Achievement/stats schema configuration.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AchievementsSection {
     #[serde(default)]
     pub offline_schema: bool,
+    /// Rebuild achievement replies from the local definition set when the schema
+    /// cache is absent or unreadable.
+    ///
+    /// **On by default since the Lua override landed**, because the rebuild is now
+    /// inert without one. The reply is composed as schema definitions, then
+    /// Steam's own unlock map, then the user's `setachievement` intent; when no
+    /// override changes a defined achievement the composed reply is byte for byte
+    /// what Steam sent, so nothing is swapped and no behaviour changes. With an
+    /// override it is what puts a requested achievement on a controlled app's
+    /// page. Set it to `false` to leave every reply on the schema path. See
+    /// `features::achievements::local::LocalRebuildSettings`.
+    #[serde(default = "default_local_rebuild")]
+    pub local_rebuild: bool,
+}
+
+/// `[achievements] local_rebuild` defaults to on: safe because the rebuild only
+/// swaps a reply it can prove differs from Steam's own bytes.
+fn default_local_rebuild() -> bool {
+    true
+}
+
+impl Default for AchievementsSection {
+    fn default() -> Self {
+        Self {
+            offline_schema: false,
+            local_rebuild: default_local_rebuild(),
+        }
+    }
 }
 
 /// AppAvatar: map a real AppId to another for networking.
@@ -507,18 +550,168 @@ pub struct LibraryInjectEntry {
 /// - Forge source tickets: always memory-only.
 /// - Delegate captured tickets: always persisted to disk.
 /// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "TicketSectionRaw")]
 pub struct TicketSection {
     /// Persistence for non-delegate, non-derived tickets (Lua-provided or
     /// intercepted real tickets). Default: disk.
-    #[serde(default)]
     pub cache: TicketCacheMode,
     /// Automatically detect Denuvo-protected games (via PE section scanning
     /// in the vapor-forge-proton-inject helper) and enable delegate ticket mode for them.
     /// Requires library injection with a proton helper configured.
-    #[serde(default)]
     pub auto_delegate: bool,
+    /// Ticket sources to ask, in order. The first source that has the ticket
+    /// wins; the default is the single source this build has always used, so
+    /// leaving the key alone keeps the previous behaviour exactly.
+    pub source_order: Vec<TicketSourceKind>,
+    /// How a Denuvo app is authorised. `off` (default) keeps the historical
+    /// one-shot ticket; `lease` gives the authorisation an explicit validity
+    /// window that the caller has to renew.
+    pub denuvo_mode: DenuvoMode,
+    /// Manual Denuvo override: `true` treats every app as Denuvo-protected,
+    /// `false` as never, `None` (default) lets detection decide. It wins over
+    /// detection in both directions.
+    pub denuvo_override: Option<bool>,
+    /// Enable structural Denuvo detection (section names, DLL names, flags).
+    /// Off by default, so an app is only ever treated as Denuvo-protected when
+    /// `denuvo_override` says so.
+    pub denuvo_detection: bool,
+    /// Validity of one lease in seconds when `denuvo_mode = "lease"`.
+    pub denuvo_lease_secs: u64,
+}
+
+impl Default for TicketSection {
+    fn default() -> Self {
+        Self {
+            cache: TicketCacheMode::default(),
+            auto_delegate: false,
+            source_order: default_ticket_source_order(),
+            denuvo_mode: DenuvoMode::default(),
+            denuvo_override: None,
+            denuvo_detection: false,
+            denuvo_lease_secs: default_denuvo_lease_secs(),
+        }
+    }
+}
+
+/// A ticket source, as named in `[ticket] source_order`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketSourceKind {
+    /// The ticket this process already holds, or the one in the local ticket
+    /// cache (memory first, then disk). This is the only source used when
+    /// `source_order` is left at its default.
+    LocalCache,
+    /// A ticket kept in the platform credential store.
+    CredentialStore,
+    /// A ticket published in the Steam registry.
+    Registry,
+}
+
+impl TicketSourceKind {
+    pub const ALL: [Self; 3] = [Self::LocalCache, Self::CredentialStore, Self::Registry];
+
+    /// Config spelling, and the name used in logs and errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LocalCache => "local_cache",
+            Self::CredentialStore => "credential_store",
+            Self::Registry => "registry",
+        }
+    }
+}
+
+impl std::fmt::Display for TicketSourceKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// How a Denuvo app is authorised.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenuvoMode {
+    /// Historical behaviour: one ticket, acquired when the app asks for it.
+    #[default]
+    Off,
+    /// Lease/pulse authorisation: the authorisation has an acquisition time and
+    /// an explicit expiry, and the caller renews it.
+    Lease,
+}
+
+/// Wire form of [`TicketSection`]. Separate so the order can be validated while
+/// the config is parsed: a repeated (or empty) source list is a load error, not
+/// something the ticket path discovers later.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketSectionRaw {
+    #[serde(default)]
+    cache: TicketCacheMode,
+    #[serde(default)]
+    auto_delegate: bool,
+    #[serde(default = "default_ticket_source_order")]
+    source_order: Vec<TicketSourceKind>,
+    #[serde(default)]
+    denuvo_mode: DenuvoMode,
+    #[serde(default)]
+    denuvo_override: Option<bool>,
+    #[serde(default)]
+    denuvo_detection: bool,
+    #[serde(default = "default_denuvo_lease_secs")]
+    denuvo_lease_secs: u64,
+}
+
+impl TryFrom<TicketSectionRaw> for TicketSection {
+    type Error = String;
+
+    fn try_from(raw: TicketSectionRaw) -> Result<Self, String> {
+        let section = Self {
+            cache: raw.cache,
+            auto_delegate: raw.auto_delegate,
+            source_order: raw.source_order,
+            denuvo_mode: raw.denuvo_mode,
+            denuvo_override: raw.denuvo_override,
+            denuvo_detection: raw.denuvo_detection,
+            denuvo_lease_secs: raw.denuvo_lease_secs,
+        };
+        if let Some(problem) = section.source_order_problems().into_iter().next() {
+            return Err(problem);
+        }
+        Ok(section)
+    }
+}
+
+impl TicketSection {
+    /// Problems with the configured source order, empty when it is usable.
+    ///
+    /// The order is a chain, so an entry that appears twice would be asked
+    /// twice and an empty order would never answer at all. Both are reported
+    /// against the config, with the offending source named.
+    pub fn source_order_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.source_order.is_empty() {
+            problems.push(
+                "[ticket] source_order is empty: configure at least one ticket source".to_owned(),
+            );
+        }
+        let mut seen = HashSet::new();
+        for source in &self.source_order {
+            if !seen.insert(*source) {
+                problems.push(format!(
+                    "[ticket] source_order lists `{source}` more than once: each ticket source may appear at most once"
+                ));
+            }
+        }
+        problems
+    }
+}
+
+fn default_ticket_source_order() -> Vec<TicketSourceKind> {
+    vec![TicketSourceKind::LocalCache]
+}
+
+fn default_denuvo_lease_secs() -> u64 {
+    300
 }
 
 /// Persistence mode for non-delegate, non-derived tickets.
@@ -536,18 +729,31 @@ pub enum TicketCacheMode {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestSection {
-    #[serde(default = "default_manifest_providers")]
+    /// Provider chain, in preference order.
+    ///
+    /// Written by the host tool (cheesetool); Vapor Forge resolves no provider
+    /// names and ships no default list. An empty list means request codes are
+    /// never fetched: the reason is reported and the request degrades instead.
+    #[serde(default)]
     pub providers: Vec<ManifestSource>,
+    /// Try the next entry of `providers` when one fails.
+    ///
+    /// Off by default, and that is the point: with failover off only the first
+    /// entry is ever contacted, so a depot lookup cannot quietly travel to a
+    /// host the user did not pick. When it is on, the chain is walked in order,
+    /// every attempt is logged at `info`, and the provider that served the code
+    /// is reported back to the caller.
+    #[serde(default)]
+    pub failover: bool,
     #[serde(default = "default_timeout_connect_ms")]
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Minimum gap between two requests to the same provider.
     ///
-    /// These endpoints are small shared services — 20770407 publishes 10
-    /// requests / 10 s per IP and degrades for everyone when one client
-    /// floods it — and Steam asks for one code per depot, so a big install
-    /// would burst without this.
+    /// Provider endpoints are typically small shared services that degrade for
+    /// everyone when one client floods them, and Steam asks for one code per
+    /// depot, so a big install would burst without this.
     #[serde(default = "default_min_interval_ms")]
     pub min_interval_ms: u64,
 }
@@ -555,80 +761,11 @@ pub struct ManifestSection {
 impl Default for ManifestSection {
     fn default() -> Self {
         Self {
-            providers: default_manifest_providers(),
+            providers: Vec::new(),
+            failover: false,
             timeout_connect_ms: default_timeout_connect_ms(),
             timeout_ms: default_timeout_ms(),
             min_interval_ms: default_min_interval_ms(),
-        }
-    }
-}
-
-/// A provider shipped with the build.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
-pub enum ManifestProvider {
-    /// A pool of accounts that hold real licences. Since 2026-09-09 Valve only
-    /// mints a request code for an account that owns the app, so this is the
-    /// shape that still works: it asks Valve per request and takes Valve's own
-    /// (depot, manifest) parameters, resolving the app id itself. A title
-    /// nobody in the pool owns answers `Unauthorized`.
-    #[serde(rename = "20770407")]
-    Pool20770407,
-    #[serde(rename = "manifestdex")]
-    ManifestDex,
-    #[serde(rename = "opensteamtool")]
-    OpenSteamTool,
-    #[serde(rename = "wudrm")]
-    Wudrm,
-    #[serde(rename = "steamrun")]
-    SteamRun,
-}
-
-impl ManifestProvider {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Pool20770407 => "20770407",
-            Self::ManifestDex => "manifestdex",
-            Self::OpenSteamTool => "opensteamtool",
-            Self::Wudrm => "wudrm",
-            Self::SteamRun => "steamrun",
-        }
-    }
-
-    pub const fn url_template(self) -> &'static str {
-        match self {
-            Self::Pool20770407 => "https://20770407.xyz/manifest/{depotId}/{gid}",
-            Self::ManifestDex => "https://manifest.manifestdex.com/{gid}",
-            Self::OpenSteamTool => "https://manifest.opensteamtool.com/{gid}",
-            Self::Wudrm => "http://gmrc.wudrm.com/manifest/{gid}",
-            Self::SteamRun => "https://manifest.steam.run/api/manifest/{gid}",
-        }
-    }
-
-    /// Providers that reject or rate-limit the default agent string.
-    pub const fn user_agent(self) -> Option<&'static str> {
-        match self {
-            // Identify as ourselves rather than borrow another client's string:
-            // this endpoint is a small shared service whose operator may one day
-            // quota by client, and we would rather be our own small bucket.
-            Self::Pool20770407 => Some(concat!("vapor-forge/", env!("CARGO_PKG_VERSION"))),
-            Self::ManifestDex => Some("ManifestDeX/1.0"),
-            Self::OpenSteamTool => Some("OpenSteamTool/1.0"),
-            Self::Wudrm | Self::SteamRun => None,
-        }
-    }
-
-    pub const fn response_format(self) -> ManifestResponseFormat {
-        match self {
-            Self::SteamRun => ManifestResponseFormat::Json,
-            _ => ManifestResponseFormat::Plain,
-        }
-    }
-
-    /// Field holding the code for [`ManifestResponseFormat::Json`] providers.
-    pub const fn json_field(self) -> Option<&'static str> {
-        match self {
-            Self::SteamRun => Some("content"),
-            _ => None,
         }
     }
 }
@@ -644,76 +781,79 @@ pub enum ManifestResponseFormat {
     Json,
 }
 
-/// A provider defined in the config file, so a new source can be used without
-/// waiting for a build that knows about it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct CustomManifestProvider {
+/// One entry of the provider chain.
+///
+/// Vapor Forge ships no provider catalogue and resolves no provider names: the
+/// host tool (cheesetool) writes this list into the config. An entry describes
+/// its own endpoint, and `url` may use the `{gid}`, `{depotId}` (legacy
+/// `{depot_id}`) and `{appId}` placeholders.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestSource {
     /// Identifies the entry in logs and in the rate-limit cooldown table.
     pub name: String,
-    /// Endpoint with a `{gid}` placeholder.
+    /// Endpoint; must contain a `{gid}` placeholder.
     pub url: String,
-    #[serde(default)]
+    /// Agent string to send instead of the default one.
     pub user_agent: Option<String>,
-    #[serde(default)]
+    /// How a 200 response carries the code.
     pub format: ManifestResponseFormat,
     /// Required when `format = "json"`.
-    #[serde(default)]
     pub json_field: Option<String>,
     /// Overrides `[manifest] min_interval_ms` for this provider.
-    #[serde(default)]
     pub min_interval_ms: Option<u64>,
 }
 
-/// One entry of the provider chain: a built-in name, or an inline table.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ManifestSource {
-    BuiltIn(ManifestProvider),
-    Custom(CustomManifestProvider),
+/// Placeholders a provider `url` may use. `{depot_id}` is the legacy spelling
+/// of `{depotId}` and is still expanded for configs written before the rename.
+const URL_PLACEHOLDERS: [&str; 4] = ["{gid}", "{depotId}", "{depot_id}", "{appId}"];
+
+/// The first placeholder in `url` that no substitution covers, if any.
+///
+/// A placeholder nothing expands would be sent to the host verbatim, so it is
+/// refused while the config is parsed rather than producing a nonsense request.
+fn url_placeholder_problem(url: &str) -> Option<String> {
+    let allowed = URL_PLACEHOLDERS.join(", ");
+    let mut rest = url;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open..];
+        let Some(close) = after.find('}') else {
+            return Some(format!("unterminated url placeholder in `{url}`"));
+        };
+        let token = &after[..=close];
+        if !URL_PLACEHOLDERS.contains(&token) {
+            return Some(format!(
+                "unknown url placeholder `{token}`; allowed placeholders: {allowed}"
+            ));
+        }
+        rest = &after[close + 1..];
+    }
+    None
 }
 
 impl ManifestSource {
     pub fn name(&self) -> &str {
-        match self {
-            Self::BuiltIn(provider) => provider.name(),
-            Self::Custom(custom) => &custom.name,
-        }
+        &self.name
     }
 
     pub fn url_template(&self) -> &str {
-        match self {
-            Self::BuiltIn(provider) => provider.url_template(),
-            Self::Custom(custom) => &custom.url,
-        }
+        &self.url
     }
 
     pub fn user_agent(&self) -> Option<&str> {
-        match self {
-            Self::BuiltIn(provider) => provider.user_agent(),
-            Self::Custom(custom) => custom.user_agent.as_deref(),
-        }
+        self.user_agent.as_deref()
     }
 
     pub fn response_format(&self) -> ManifestResponseFormat {
-        match self {
-            Self::BuiltIn(provider) => provider.response_format(),
-            Self::Custom(custom) => custom.format,
-        }
+        self.format
     }
 
     pub fn json_field(&self) -> Option<&str> {
-        match self {
-            Self::BuiltIn(provider) => provider.json_field(),
-            Self::Custom(custom) => custom.json_field.as_deref(),
-        }
+        self.json_field.as_deref()
     }
 
     /// Minimum gap before the next request to this provider.
     pub fn min_interval(&self, section_default_ms: u64) -> std::time::Duration {
-        let ms = match self {
-            Self::BuiltIn(_) => section_default_ms,
-            Self::Custom(custom) => custom.min_interval_ms.unwrap_or(section_default_ms),
-        };
+        let ms = self.min_interval_ms.unwrap_or(section_default_ms);
         std::time::Duration::from_millis(ms)
     }
 
@@ -721,47 +861,77 @@ impl ManifestSource {
     ///
     /// `{gid}` is always substituted; `{depotId}` and `{appId}` let a provider
     /// that mints codes through licensed accounts take Valve's own
-    /// GetManifestRequestCode shape (depot plus manifest).
+    /// GetManifestRequestCode shape (depot plus manifest). `{depot_id}` is the
+    /// legacy spelling of `{depotId}` and is still expanded.
     pub fn resolve_url(&self, app_id: u32, depot_id: u32, gid: u64) -> String {
         self.url_template()
             .replace("{gid}", &gid.to_string())
             .replace("{depotId}", &depot_id.to_string())
+            .replace("{depot_id}", &depot_id.to_string())
             .replace("{appId}", &app_id.to_string())
     }
 
     /// Why this entry cannot be used, or `None` when it is well-formed.
     ///
-    /// A bad entry is skipped rather than failing the whole config: the point
-    /// of custom providers is that users edit them without a build, so one typo
-    /// must not take the other sources down with it.
+    /// An entry that parses but is unusable is skipped rather than failing the
+    /// whole config: entries are written by the host tool, so one typo must not
+    /// take the other sources down with it. Structural problems — a bare name,
+    /// an unknown url placeholder — are refused at load instead, because they
+    /// cannot be interpreted at all.
     pub fn rejection(&self) -> Option<String> {
-        let Self::Custom(custom) = self else {
-            return None;
-        };
-        if custom.name.trim().is_empty() {
-            return Some("custom manifest provider has an empty name".to_owned());
+        if self.name.trim().is_empty() {
+            return Some("manifest provider has an empty name".to_owned());
         }
-        if !custom.url.contains("{gid}") {
+        if !self.url.contains("{gid}") {
             return Some(format!(
-                "custom manifest provider `{}` has no {{gid}} placeholder in its url",
-                custom.name
+                "manifest provider `{}` has no {{gid}} placeholder in its url",
+                self.name
             ));
         }
-        if !custom.url.starts_with("http://") && !custom.url.starts_with("https://") {
+        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
             return Some(format!(
-                "custom manifest provider `{}` must use an http:// or https:// url",
-                custom.name
+                "manifest provider `{}` must use an http:// or https:// url",
+                self.name
             ));
         }
-        if custom.format == ManifestResponseFormat::Json
-            && custom.json_field.as_deref().unwrap_or("").trim().is_empty()
+        if self.format == ManifestResponseFormat::Json
+            && self.json_field.as_deref().unwrap_or("").trim().is_empty()
         {
             return Some(format!(
-                "custom manifest provider `{}` sets format = \"json\" but no json_field",
-                custom.name
+                "manifest provider `{}` sets format = \"json\" but no json_field",
+                self.name
             ));
         }
         None
+    }
+}
+
+/// The table form of one provider entry, exactly as TOML writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestSourceTable {
+    name: String,
+    url: String,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    format: ManifestResponseFormat,
+    #[serde(default)]
+    json_field: Option<String>,
+    #[serde(default)]
+    min_interval_ms: Option<u64>,
+}
+
+impl From<ManifestSourceTable> for ManifestSource {
+    fn from(table: ManifestSourceTable) -> Self {
+        Self {
+            name: table.name,
+            url: table.url,
+            user_agent: table.user_agent,
+            format: table.format,
+            json_field: table.json_field,
+            min_interval_ms: table.min_interval_ms,
+        }
     }
 }
 
@@ -773,20 +943,34 @@ impl<'de> Deserialize<'de> for ManifestSource {
             type Value = ManifestSource;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a built-in provider name or a custom provider table")
+                formatter.write_str(
+                    "a [manifest] providers table with `name` and `url`, written by the host",
+                )
             }
 
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                // Delegate so an unknown name still reports the built-in list.
-                ManifestProvider::deserialize(value.into_deserializer())
-                    .map(ManifestSource::BuiltIn)
+                // Bare names addressed a built-in catalogue this build no longer
+                // ships, so the error says what to write instead of only
+                // rejecting the value.
+                Err(E::custom(format!(
+                    "manifest provider `{value}` is a bare name, but providers are now tables \
+                     written by the host tool (cheesetool) and Vapor Forge ships no built-in \
+                     providers; write {{ name = \"{value}\", url = \"https://host.example/manifest/{{depotId}}/{{gid}}\" }}"
+                )))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                CustomManifestProvider::deserialize(serde::de::value::MapAccessDeserializer::new(
-                    map,
-                ))
-                .map(ManifestSource::Custom)
+                let table = ManifestSourceTable::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                let source = ManifestSource::from(table);
+                if let Some(problem) = url_placeholder_problem(&source.url) {
+                    return Err(serde::de::Error::custom(format!(
+                        "manifest provider `{}` has a {problem}",
+                        source.name
+                    )));
+                }
+                Ok(source)
             }
         }
 
@@ -816,16 +1000,6 @@ impl ManifestSection {
         }
         problems
     }
-}
-
-fn default_manifest_providers() -> Vec<ManifestSource> {
-    vec![
-        ManifestSource::BuiltIn(ManifestProvider::Pool20770407),
-        ManifestSource::BuiltIn(ManifestProvider::ManifestDex),
-        ManifestSource::BuiltIn(ManifestProvider::OpenSteamTool),
-        ManifestSource::BuiltIn(ManifestProvider::Wudrm),
-        ManifestSource::BuiltIn(ManifestProvider::SteamRun),
-    ]
 }
 
 fn default_timeout_connect_ms() -> u64 {
@@ -1043,5 +1217,90 @@ impl RuntimeConfig {
 
     pub fn cumulus_configured(&self) -> bool {
         self.cloud.backend == CloudBackendMode::Cumulus
+    }
+}
+
+#[cfg(test)]
+mod ticket_section_tests {
+    use super::*;
+
+    fn parse(text: &str) -> Result<TicketSection, String> {
+        toml::from_str::<TicketSection>(text).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn ticket_section_defaults_preserve_current_behaviour() {
+        let section = TicketSection::default();
+        assert_eq!(section.cache, TicketCacheMode::Disk);
+        assert!(!section.auto_delegate);
+        assert_eq!(section.source_order, vec![TicketSourceKind::LocalCache]);
+        assert_eq!(section.denuvo_mode, DenuvoMode::Off);
+        assert_eq!(section.denuvo_override, None);
+        assert!(!section.denuvo_detection);
+        assert!(section.source_order_problems().is_empty());
+
+        let parsed = parse("").expect("empty ticket table should parse");
+        assert_eq!(parsed.source_order, vec![TicketSourceKind::LocalCache]);
+        assert_eq!(parsed.denuvo_lease_secs, 300);
+    }
+
+    #[test]
+    fn ticket_section_parses_the_new_flags() {
+        let section = parse(
+            r#"
+            source_order = ["local_cache", "credential_store", "registry"]
+            denuvo_mode = "lease"
+            denuvo_override = false
+            denuvo_detection = true
+            denuvo_lease_secs = 90
+            "#,
+        )
+        .expect("flags should parse");
+
+        assert_eq!(
+            section.source_order,
+            vec![
+                TicketSourceKind::LocalCache,
+                TicketSourceKind::CredentialStore,
+                TicketSourceKind::Registry,
+            ]
+        );
+        assert_eq!(section.denuvo_mode, DenuvoMode::Lease);
+        assert_eq!(section.denuvo_override, Some(false));
+        assert!(section.denuvo_detection);
+        assert_eq!(section.denuvo_lease_secs, 90);
+    }
+
+    #[test]
+    fn every_ticket_source_round_trips_through_its_config_name() {
+        for kind in TicketSourceKind::ALL {
+            let text = format!("source_order = [\"{}\"]", kind.name());
+            let section = parse(&text).expect("each source name must parse");
+            assert_eq!(section.source_order, vec![kind]);
+        }
+    }
+
+    #[test]
+    fn repeated_ticket_source_is_rejected_while_parsing() {
+        let error = parse(r#"source_order = ["local_cache", "registry", "local_cache"]"#)
+            .expect_err("a repeated source must be rejected at load time");
+        assert!(error.contains("local_cache"), "unclear error: {error}");
+        assert!(error.contains("more than once"), "unclear error: {error}");
+    }
+
+    #[test]
+    fn empty_ticket_source_order_is_rejected_while_parsing() {
+        let error = parse("source_order = []").expect_err("an empty order must be rejected");
+        assert!(error.contains("empty"), "unclear error: {error}");
+    }
+
+    #[test]
+    fn unknown_ticket_source_is_rejected() {
+        let error = parse(r#"source_order = ["carrier_pigeon"]"#)
+            .expect_err("an unknown source must be rejected");
+        assert!(
+            error.contains("carrier_pigeon") || error.contains("unknown variant"),
+            "unclear error: {error}"
+        );
     }
 }

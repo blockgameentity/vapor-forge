@@ -20,14 +20,27 @@ pub mod depot_key_loader;
 pub mod elf;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod engine_work_item_site;
+pub mod pe_image;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod http;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod job_fields;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod msabi;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod pdata;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod probe_facts;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod probe_rank;
 pub mod semantic;
 pub mod vtable_scan;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod vtable_pe;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod work_item_site;
 

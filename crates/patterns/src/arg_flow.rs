@@ -18,6 +18,8 @@ use iced_x86::{
     OpKind, Register,
 };
 
+use crate::msabi;
+
 /// Arguments the tracker seeds, which covers every function it is used on.
 const TRACKED_ARGUMENTS: u8 = 6;
 /// System V integer argument registers, in order.
@@ -43,6 +45,45 @@ const CALLER_SAVED_64: [Register; 9] = [
 const CALLER_SAVED_32: [Register; 3] = [Register::RAX, Register::RCX, Register::RDX];
 /// Call arguments recorded per call site.
 pub const CALL_ARGUMENTS: usize = 4;
+
+/// The integer-argument convention a function was compiled for.
+///
+/// The two differ in *where* arguments arrive, not in what the walk records, so
+/// one tracker serves both: the Linux client is System V, the Windows client is
+/// MS-x64 ([`crate::msabi`]). A 32-bit build is cdecl either way, and the walk
+/// seeds its arguments on the stack whatever this says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Abi {
+    /// `rdi, rsi, rdx, rcx, r8, r9`.
+    SysV,
+    /// `rcx, rdx, r8, r9`, then the caller's 32-byte shadow space and the
+    /// stacked fifth and sixth arguments.
+    MsX64,
+}
+
+/// How far, and how faithfully, one entry is walked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Walk {
+    pub abi: Abi,
+    /// Bytes decoded from the entry.
+    pub window: usize,
+    /// Follow an unconditional jump whose target is ahead and still inside the
+    /// window. Compilers emit that to step over a `lock`-prefixed fallback path,
+    /// and the walk would otherwise end before the code it is looking for. Off
+    /// by default: the linear walk then stops at the first unconditional jump.
+    pub follow_forward_jumps: bool,
+}
+
+impl Walk {
+    /// A plain linear walk of `window` bytes in `abi`.
+    pub const fn linear(abi: Abi, window: usize) -> Self {
+        Self {
+            abi,
+            window,
+            follow_forward_jumps: false,
+        }
+    }
+}
 
 /// A value the tracker can name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,20 +153,27 @@ impl Trace {
     }
 }
 
-/// Walk at most `limit` bytes of the function at `offset` in `code`.
+/// Walk at most `limit` bytes of the function at `offset` in `code`, in System V
+/// order.
 ///
 /// Instruction addresses in the result are offsets into `code`, so the caller
 /// can compare them with other resolved offsets directly.
 pub fn trace(bitness: u32, code: &[u8], offset: usize, limit: usize) -> Trace {
+    trace_with(Walk::linear(Abi::SysV, limit), bitness, code, offset)
+}
+
+/// [`trace`] for a named convention and walk shape.
+pub fn trace_with(walk: Walk, bitness: u32, code: &[u8], offset: usize) -> Trace {
     let mut trace = Trace::default();
     let Some(window) = code.get(offset..) else {
         return trace;
     };
-    let window = &window[..window.len().min(limit)];
+    let window = &window[..window.len().min(walk.window)];
+    let end = offset + window.len();
     let mut decoder = Decoder::with_ip(bitness, window, offset as u64, DecoderOptions::NONE);
     let mut factory = InstructionInfoFactory::new();
     let mut instruction = Instruction::default();
-    let mut state = State::entry(bitness);
+    let mut state = State::entry(bitness, walk.abi);
 
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
@@ -137,7 +185,21 @@ pub fn trace(bitness: u32, code: &[u8], offset: usize, limit: usize) -> Trace {
                 trace.returned = state.registers.get(&Register::RAX).copied();
                 break;
             }
-            FlowControl::UnconditionalBranch | FlowControl::IndirectBranch => break,
+            FlowControl::UnconditionalBranch => {
+                let target = forward_target(&instruction).filter(|&target| {
+                    walk.follow_forward_jumps
+                        && target > instruction.ip() as usize
+                        && target < end
+                });
+                match target {
+                    Some(target) => {
+                        decoder.set_ip(target as u64);
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            FlowControl::IndirectBranch => break,
             FlowControl::Call | FlowControl::IndirectCall => {
                 state.call(&instruction, &mut trace);
                 continue;
@@ -149,6 +211,16 @@ pub fn trace(bitness: u32, code: &[u8], offset: usize, limit: usize) -> Trace {
     trace
 }
 
+/// Code offset of an unconditional jump's target, when it is a plain relative or
+/// absolute near branch.
+fn forward_target(instruction: &Instruction) -> Option<usize> {
+    matches!(
+        instruction.op0_kind(),
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+    )
+    .then(|| instruction.near_branch_target() as usize)
+}
+
 enum Location {
     /// A stack slot, as an offset from the stack pointer at entry.
     Stack(i64),
@@ -158,6 +230,7 @@ enum Location {
 
 struct State {
     bitness: u32,
+    abi: Abi,
     registers: HashMap<Register, Value>,
     stack: HashMap<i64, Value>,
     /// Stack pointer relative to its value at entry, while it is known.
@@ -168,19 +241,30 @@ struct State {
 }
 
 impl State {
-    fn entry(bitness: u32) -> Self {
+    fn entry(bitness: u32, abi: Abi) -> Self {
         let mut registers = HashMap::new();
         let mut stack = HashMap::new();
         for position in 0..TRACKED_ARGUMENTS {
-            if bitness == 64 {
-                registers.insert(SYSV_ARGUMENTS[position as usize], Value::Arg(position));
-            } else {
+            if bitness != 64 {
                 // cdecl: the return address sits at entry esp, arguments above it.
                 stack.insert(4 + 4 * i64::from(position), Value::Arg(position));
+            } else if abi == Abi::SysV {
+                registers.insert(SYSV_ARGUMENTS[position as usize], Value::Arg(position));
+            } else if let Some(&register) = msabi::MSABI_ARGUMENTS.get(usize::from(position)) {
+                registers.insert(register, Value::Arg(position));
+                // The caller owns this register's home slot; reading it back
+                // yields the same value, so it is seeded with that argument.
+                stack.insert(
+                    msabi::HOME_SLOT + 8 * i64::from(position),
+                    Value::Arg(position),
+                );
+            } else if let Some(offset) = msabi::stack_argument_offset(position) {
+                stack.insert(offset, Value::Arg(position));
             }
         }
         Self {
             bitness,
+            abi,
             registers,
             stack,
             sp: Some(0),
@@ -192,6 +276,30 @@ impl State {
         i64::from(self.bitness / 8)
     }
 
+    /// Argument `position` as the callee of the pending call receives it.
+    ///
+    /// At the call site `sp` still points at the return address the `call` is
+    /// about to push, so every stacked argument sits above it: `sp + 4n` for
+    /// cdecl, and `sp + 0x28` upwards for the fifth MS-x64 argument, past the
+    /// callee's shadow space.
+    fn call_argument(&self, position: u8) -> Option<Value> {
+        if self.bitness != 64 {
+            return self
+                .sp
+                .and_then(|sp| self.stack.get(&(sp + 4 * i64::from(position))).copied());
+        }
+        match self.abi {
+            Abi::SysV => self.registers.get(&SYSV_ARGUMENTS[usize::from(position)]).copied(),
+            Abi::MsX64 => match msabi::MSABI_ARGUMENTS.get(usize::from(position)) {
+                Some(register) => self.registers.get(register).copied(),
+                None => self.sp.and_then(|sp| {
+                    let offset = msabi::stack_argument_offset(position)?;
+                    self.stack.get(&(sp + offset)).copied()
+                }),
+            },
+        }
+    }
+
     fn call(&mut self, instruction: &Instruction, trace: &mut Trace) {
         let target = matches!(
             instruction.op0_kind(),
@@ -200,22 +308,17 @@ impl State {
         .then(|| instruction.near_branch_target() as usize);
         let mut args = [None; CALL_ARGUMENTS];
         for (position, arg) in args.iter_mut().enumerate() {
-            *arg = if self.bitness == 64 {
-                self.registers.get(&SYSV_ARGUMENTS[position]).copied()
-            } else {
-                self.sp
-                    .and_then(|sp| self.stack.get(&(sp + 4 * position as i64)).copied())
-            };
+            *arg = self.call_argument(position as u8);
         }
         trace.calls.push(Call {
             ip: instruction.ip() as usize,
             target,
             args,
         });
-        let clobbered: &[Register] = if self.bitness == 64 {
-            &CALLER_SAVED_64
-        } else {
-            &CALLER_SAVED_32
+        let clobbered: &[Register] = match (self.bitness == 64, self.abi) {
+            (false, _) => &CALLER_SAVED_32,
+            (true, Abi::SysV) => &CALLER_SAVED_64,
+            (true, Abi::MsX64) => &msabi::VOLATILE,
         };
         for register in clobbered {
             self.registers.remove(register);

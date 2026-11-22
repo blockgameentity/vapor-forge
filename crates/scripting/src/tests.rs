@@ -1,4 +1,4 @@
-use vapor_forge_core::{AppId, DepotId, ManifestId};
+use vapor_forge_core::{AchievementIntent, AppId, DepotId, ManifestId};
 
 use crate::bindings::parse_hex_key;
 use crate::{
@@ -559,6 +559,81 @@ fn report_can_restrict_lua_network_hosts() {
         .as_ref()
         .unwrap_err()
         .contains("not allowed"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn setachievement_reaches_script_state_in_both_forms() {
+    let dir = std::env::temp_dir().join(format!("lua-achievement-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "setachievement(480, \"ACH_WIN\", true)\n",
+            "SETACHIEVEMENT(480, \"ACH_LOSE\", false)\n",
+            "setachievement(480, \"ACH_TIMED\", 1700000000)\n",
+            "setachievement(730, \"ACH_OTHER\", true)\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert!(report.files[0].result.is_ok());
+    let overrides = &report.state.achievement_overrides;
+    assert_eq!(overrides.len(), 2, "one map per app that was overridden");
+
+    let app = &overrides[&AppId(480)];
+    assert_eq!(app["ACH_WIN"], AchievementIntent::unlocked());
+    assert_eq!(app["ACH_LOSE"], AchievementIntent::locked());
+    assert_eq!(
+        app["ACH_TIMED"],
+        AchievementIntent::unlocked_at(1_700_000_000)
+    );
+    assert_eq!(
+        overrides[&AppId(730)]["ACH_OTHER"],
+        AchievementIntent::unlocked()
+    );
+
+    // The call log names the binding and what it recorded, like every other one.
+    let details = report
+        .calls
+        .iter()
+        .filter(|call| call.function == "setachievement")
+        .map(|call| call.detail.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(details.len(), 4);
+    assert!(details[2].contains("key=ACH_TIMED unlocked=true time=1700000000"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bad_setachievement_reports_the_line_and_keeps_the_rest_of_the_file() {
+    let dir = std::env::temp_dir().join(format!("lua-achievement-bad-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "setachievement(480, \"ACH_WIN\", true)\n",
+            "setachievement(480, \"ACH_WIN\", \"not a boolean\")\n",
+            "setachievement(0, \"ACH_WIN\", true)\n",
+            "setachievement(480, \"ACH_AFTER\", true)\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    let error = report.files[0]
+        .result
+        .as_ref()
+        .expect_err("a bad call is a script error");
+    assert!(error.contains("line 2"), "{error}");
+    assert!(error.contains("setachievement:"), "{error}");
+    // The statements after the bad ones still ran: one bad call costs its line.
+    let app = &report.state.achievement_overrides[&AppId(480)];
+    assert_eq!(app["ACH_WIN"], AchievementIntent::unlocked());
+    assert_eq!(app["ACH_AFTER"], AchievementIntent::unlocked());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

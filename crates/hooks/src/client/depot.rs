@@ -207,11 +207,39 @@ pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
         // SAFETY: `out` is the loader's live CUtlBuffer argument, and both
         // calls are the ones the loader itself makes on it.
         if unsafe { write_key(out, calls, &key) } {
+            consult_depotcache(depot_id);
             return true;
         }
     }
     // SAFETY: forwards Steam's untouched key request.
-    unsafe { original(unused, depot_id, out) }
+    let result = unsafe { original(unused, depot_id, out) };
+    consult_depotcache(depot_id);
+    result
+}
+/// Ask `features::depotcache` whether this depot's wanted manifest is already in
+/// `<steam>/depotcache`, so the install path's request-code round trip has
+/// nothing to fetch for it.
+///
+/// Purely a report and a fall-through: this host wires no manifest archive
+/// client, so a candidate the cache does not hold is reported as not archived and
+/// the caller returns Steam's own answer unchanged. Off unless `[manifest]
+/// providers` is configured. The wanted gid is the one a Lua `setManifestid`
+/// override pins, which is the same list the depot-injection path patches.
+fn consult_depotcache(depot_id: u32) {
+    use vapor_forge_config::DepotId;
+    let config = super::install::config();
+    if !super::depot_preseed::configured(&config) {
+        return;
+    }
+    let script_state = script_state();
+    let depot = DepotId(depot_id);
+    let wanted = script_state.manifests.get(&depot).map(|held| {
+        vapor_forge_features::depotcache::Candidate {
+            depot_id: depot,
+            manifest_id: held.gid,
+        }
+    });
+    let _ = super::depot_preseed::consult(&config, depot, wanted);
 }
 
 /// Fill `out` the way the loader does after a successful config-store read:

@@ -24,6 +24,13 @@ init = true                 # show a startup toast after SteamUI bridge is ready
 # Family sharing concurrent-play unlock.
 [apps.shared]
 enabled = true
+# Family-share correctness, both on by default because both fix a wrong label:
+# validate_lender re-checks a claimed lender before trusting a family label (an
+# app we ingested must never read back as "from family library"), and
+# clean_borrower_markers removes a borrower marker once an app is no longer
+# borrowed. Set either to false to restore the pre-fix behaviour.
+validate_lender = true
+clean_borrower_markers = true
 # include = [480, 730]      # only unlock these family-shared apps
 # exclude = [730]           # unlock all family-shared apps except these
 
@@ -53,32 +60,67 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
-# Manifest request-code providers for controlled apps, tried in order.
-# An entry is either a built-in name ("20770407", "manifestdex", "opensteamtool",
-# "wudrm", "steamrun") or a table describing your own endpoint, so a new source
-# can be added without waiting for a new build. Tables may span several lines:
+# Ticket sources asked in order: "local_cache", "credential_store", "registry".
+# The first source that has the ticket wins; every attempt is logged and the
+# winner is reported back to the caller. Leaving the list at its default keeps
+# the single source this build has always used, so nothing changes until a
+# second entry is added. Repeating a source, or emptying the list, is a load
+# error rather than something discovered when a game asks for a ticket.
+source_order = ["local_cache"]
+
+# Denuvo authorisation: "off" (default) hands the app one ticket, exactly as
+# before. "lease" gives the authorisation an acquisition time and an explicit
+# expiry; the caller renews it before it lapses, and a lapsed lease is reported
+# as expired so it can never be mistaken for a valid one. lease_secs is only
+# read in lease mode.
+denuvo_mode = "off"
+denuvo_lease_secs = 300
+
+# Structural Denuvo detection from PE section names, DLL names and flags. Off by
+# default. denuvo_override is a manual verdict that wins over detection (true
+# forces Denuvo, false forces not-Denuvo, absent lets detection decide); with
+# detection off and no override, no app is treated as Denuvo-protected.
+denuvo_detection = false
+# denuvo_override = true
+
+# Manifest request-code providers for controlled apps, in preference order.
+# The host tool (cheesetool) writes this list. Vapor Forge ships no provider
+# catalogue, no provider hostnames and no default list, and resolves no provider
+# names: every entry is a table describing one endpoint, so a new source needs no
+# new build. While the list is empty no request code is fetched at all; the
+# reason is logged and the request degrades instead. Tables may span several
+# lines:
 #
 #   providers = [
-#       "manifestdex",
 #       {
-#           name = "mirror",                    # shown in logs; must be unique
-#           url = "https://my.mirror/{gid}",    # {gid} required; {depotId} and
-#                                               # {appId} also substituted
-#           user_agent = "MyClient/1.0",        # optional
-#           min_interval_ms = 1000,             # optional; overrides the default below
+#           name = "example",                       # shown in logs; must be unique
+#           url = "https://host.example/manifest/{depotId}/{gid}",
+#           # {gid} is required; {depotId} (legacy {depot_id}) and {appId} are
+#           # also substituted
+#           user_agent = "MyClient/1.0",            # optional
+#           min_interval_ms = 1000,                 # optional; overrides the default below
 #       },
 #       {
 #           name = "jsonsrc",
-#           url = "https://x/{gid}",
-#           format = "json",                    # "plain" (default) or "json"
-#           json_field = "content",             # required when format = "json"
+#           url = "https://x.example/{gid}",
+#           format = "json",                        # "plain" (default) or "json"
+#           json_field = "content",                 # required when format = "json"
 #       },
 #   ]
 #
-# An entry that fails these rules is skipped and the rest of the chain still
-# runs; `vapor-forge-config-check` lists what would be skipped.
+# A bare provider name is a load error, naming the migration. An entry that
+# fails the rules above is skipped; `vapor-forge-config-check` lists what would
+# be skipped.
 [manifest]
-providers = ["20770407", "manifestdex", "opensteamtool", "wudrm", "steamrun"]
+providers = []
+# Try the next provider when one fails. The host tool that writes `providers`
+# (cheesetool) owns this flag and normally sets it true, so a depot one host
+# cannot serve falls through to the next enabled host; only hosts the user left
+# enabled are ever contacted, every attempt is logged at info level with the
+# provider name and outcome, and the provider that served each code is reported
+# back. A standalone install with no host keeps the conservative value: false
+# means only the first entry is contacted and a failure is final.
+failover = false
 timeout_connect_ms = 5000
 timeout_ms = 15000
 # Minimum gap between two requests to the same provider. These are small shared
@@ -88,6 +130,14 @@ min_interval_ms = 1000
 
 # Offline achievement schema support.
 [achievements]
+# Rebuild achievement replies from local definitions when the schema cache is
+# missing or unreadable. On by default, and safe to leave on: the reply is composed
+# as schema definitions, then Steam's own unlock map, then the `setachievement`
+# intent your Lua scripts declare. With no override the composed reply is byte for
+# byte what Steam sent, so nothing is swapped; with an override it is what makes a
+# controlled app's page show the achievement you asked for. Turn it off to leave
+# every reply on the schema path.
+local_rebuild = true
 offline_schema = false
 
 # Native library injection into launched games.

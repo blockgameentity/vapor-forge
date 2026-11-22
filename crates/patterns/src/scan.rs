@@ -65,11 +65,37 @@ impl<'a> From<&'a (String, RuntimePatternEntry)> for PatternRef<'a> {
 pub struct ModuleScanReport {
     pub module: String,
     pub path: PathBuf,
-    pub elf_class: ElfClass,
+    /// Container/bitness label of the scanned image (`ELF64`, `ELF32`, `PE64`, `PE32`).
+    pub image_kind: &'static str,
     pub text_file_off: u64,
     pub text_vaddr: u64,
     pub text_size: usize,
     pub entries: Vec<PatternScanEntry>,
+}
+
+/// One executable region of a module image, independent of container format.
+///
+/// The pattern engine below only ever sees this: an ELF `PT_LOAD` region and a
+/// PE executable section are both just bytes plus their address mapping.
+/// [`Container`] is carried for the decoders that care which of the two a
+/// region came from — the x86_64 call convention differs between them.
+#[derive(Clone, Copy, Debug)]
+pub struct CodeSegment<'a> {
+    pub bytes: &'a [u8],
+    pub file_offset: u64,
+    /// Virtual address (ELF) or section RVA (PE) of `bytes[0]`.
+    pub vaddr: u64,
+    pub bits: u8,
+    pub container: Container,
+}
+
+/// The image format a [`CodeSegment`] was cut from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Container {
+    /// An ELF `PT_LOAD` segment: x86_64 builds use the System V convention.
+    Elf,
+    /// A PE section: x86_64 builds use MS-x64.
+    Pe,
 }
 
 impl ModuleScanReport {
@@ -95,6 +121,15 @@ impl ModuleScanReport {
             .iter()
             .filter(|entry| entry.status != PatternScanStatus::Ok)
             .count()
+    }
+
+    /// Bitness derived from the container label (`ELF64`/`PE64` -> 64).
+    pub fn bits(&self) -> u8 {
+        if self.image_kind.ends_with("64") {
+            64
+        } else {
+            32
+        }
     }
 }
 
@@ -134,6 +169,9 @@ impl PatternScanStatus {
 
 /// Scan one library image with the pattern set that matches its
 /// architecture. `path` only selects the library family and labels the report.
+///
+/// ELF entry point; PE callers go through [`scan_code_segment`] with a segment
+/// borrowed from [`crate::pe_image::PeImage::code_segment`].
 pub fn scan_module(
     module: &str,
     path: &Path,
@@ -142,6 +180,32 @@ pub fn scan_module(
     accept: Option<CandidateCheck<'_>>,
 ) -> Result<ModuleScanReport, String> {
     let segment = executable_segment(data)?;
+    let code = CodeSegment {
+        bytes: segment.bytes,
+        file_offset: segment.file_offset,
+        vaddr: segment.vaddr,
+        bits: segment.elf_class.bits(),
+        container: Container::Elf,
+    };
+    let kind = match segment.elf_class {
+        ElfClass::Elf64 => "ELF64",
+        ElfClass::Elf32 => "ELF32",
+    };
+    scan_code_segment(module, path, &code, patterns, accept, kind)
+}
+
+/// Scan one executable segment with the pattern set that matches its module.
+///
+/// Shared by every container format: the segment carries the haystack, the
+/// address mapping and the bitness, so nothing below this point is ELF-aware.
+pub fn scan_code_segment(
+    module: &str,
+    path: &Path,
+    segment: &CodeSegment<'_>,
+    patterns: &[PatternRef<'_>],
+    accept: Option<CandidateCheck<'_>>,
+    image_kind: &'static str,
+) -> Result<ModuleScanReport, String> {
     let variants = patterns
         .iter()
         .copied()
@@ -152,18 +216,16 @@ pub fn scan_module(
     }
 
     let variants = select_variants_for_library_path(&variants, path);
+    let bitness = u32::from(segment.bits);
     let entries = group_variants(&variants)
         .into_iter()
-        .map(|group| {
-            let bitness = u32::from(segment.elf_class.bits());
-            scan_entry_group(segment.bytes, bitness, &group, accept)
-        })
+        .map(|group| scan_entry_group(segment.bytes, bitness, &group, accept))
         .collect();
 
     Ok(ModuleScanReport {
         module: module.to_owned(),
         path: path.to_owned(),
-        elf_class: segment.elf_class,
+        image_kind,
         text_file_off: segment.file_offset,
         text_vaddr: segment.vaddr,
         text_size: segment.bytes.len(),
@@ -673,7 +735,7 @@ mod tests {
         let report = ModuleScanReport {
             module: "steamclient".to_owned(),
             path: PathBuf::from("steamclient.so"),
-            elf_class: ElfClass::Elf64,
+            image_kind: "ELF64",
             text_file_off: 0,
             text_vaddr: 0,
             text_size: 0,

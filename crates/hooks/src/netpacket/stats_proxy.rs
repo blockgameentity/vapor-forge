@@ -600,6 +600,12 @@ fn inject_merged_stats_response(
     app_id: u32,
     response_generation: u64,
 ) {
+    // The one call into the local achievement rebuild on this path: it answers
+    // only when the reply carries no usable schema and `[achievements]
+    // local_rebuild` is on, and returns `None` otherwise so the reply keeps its
+    // previous bytes.
+    let local = crate::client::achievement::local_reply(app_id, full_schema);
+    let local = local.as_ref();
     let packet = match (kind, donor) {
         (
             PendingStatsRequestKind::Service {
@@ -613,9 +619,16 @@ fn inject_merged_stats_response(
                 donor.clone(),
                 full_schema,
                 backend,
+                local,
             )
             .or_else(|| {
-                crate::stats_merge::merge_service_stats_response(&request, donor, full_schema, None)
+                crate::stats_merge::merge_service_stats_response(
+                    &request,
+                    donor,
+                    full_schema,
+                    None,
+                    local,
+                )
             });
             let Some(body) = body else {
                 queue_local_response_for_generation(
@@ -638,9 +651,16 @@ fn inject_merged_stats_response(
                 donor.clone(),
                 full_schema,
                 backend,
+                local,
             )
             .or_else(|| {
-                crate::stats_merge::merge_legacy_stats_response(&request, donor, full_schema, None)
+                crate::stats_merge::merge_legacy_stats_response(
+                    &request,
+                    donor,
+                    full_schema,
+                    None,
+                    local,
+                )
             });
             let Some(body) = body else {
                 queue_local_response_for_generation(

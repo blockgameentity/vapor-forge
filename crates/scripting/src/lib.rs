@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+mod achievement_intent;
 mod bindings;
 mod executor;
 mod manifest_provider;
@@ -20,7 +21,7 @@ pub use registry::RegistryHandle;
 pub use report::{
     ScriptCallReport, ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport,
 };
-pub use vapor_forge_core::{ManifestOverride, ScriptState};
+pub use vapor_forge_core::{AchievementIntent, ManifestOverride, ScriptState};
 
 #[derive(Debug, Error)]
 pub enum ScriptError {
