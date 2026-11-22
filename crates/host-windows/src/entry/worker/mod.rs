@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use vapor_forge_config::RuntimeConfig;
 use vapor_forge_config::AppId;
 use vapor_forge_features::config_apply;
@@ -37,6 +37,7 @@ use crate::hooks::state::HostState;
 use crate::install::{DetourInstaller, RunReport};
 
 pub mod module;
+pub mod publish;
 
 /// One Steam module as the host found it: its file name, its load address in
 /// this process, and its bytes as shipped on disk.
@@ -112,47 +113,6 @@ impl HostOutcome {
 
     pub fn failed_modules(&self) -> usize {
         self.modules.iter().filter(|m| m.error.is_some()).count()
-    }
-}
-
-/// Decode the `CNetPacket` layout from this module's resolved symbols, once.
-///
-/// The state is published before the batch so hook bodies see the real config;
-/// the offsets only exist afterwards, so the layout is filled in here. A failure
-/// is a note, not an error: every message then records `NoLayout` and Steam keeps
-/// its own request-code round trip.
-fn publish_packet_layout(state: &HostState, report: &crate::install::RunReport, module: &[u8]) {
-    if state.layout().is_some() {
-        return;
-    }
-    let Some(plan) = report.plan.as_ref() else {
-        return;
-    };
-    let Ok(image) = vapor_forge_patterns::pe_image::PeImage::parse(module) else {
-        debug!("packet layout: module image could not be parsed");
-        return;
-    };
-    let Ok(segment) = image.code_segment() else {
-        debug!("packet layout: module has no executable segment");
-        return;
-    };
-    let Some(offsets) = crate::hooks::netpacket::layout::offsets(plan.resolved(), &segment) else {
-        debug!("packet layout: the corpus does not anchor the CNetPacket family");
-        return;
-    };
-    match crate::hooks::netpacket::layout::decode(&segment, offsets) {
-        Ok(layout) => {
-            info!(
-                data = layout.data,
-                size = layout.size,
-                "packet layout decoded; request-code serving is possible"
-            );
-            state.set_layout(layout);
-        }
-        Err(error) => warn!(
-            error = error.as_str(),
-            "packet layout could not be decoded; messages stay observation-only"
-        ),
     }
 }
 
@@ -246,7 +206,8 @@ pub fn run(
         }
         let outcome = module::run_module(loaded, corpus_root.as_deref(), installer);
         if let Some(report) = &outcome.report {
-            publish_packet_layout(&state, report, &loaded.file);
+            publish::packet_layout(&state, report, &loaded.file);
+            publish::reply_geometry(&state, report, &loaded.file);
             for (capability, reason) in report.gate.disabled() {
                 merged.disable(capability, reason.to_owned());
             }
@@ -256,6 +217,10 @@ pub fn run(
         }
         outcomes.push(outcome);
     }
+    // Settle `request-codes` on what was actually decoded, after every module has
+    // had its chance: a host that decoded no packet layout can never answer a code,
+    // and one that did keeps the capability for the moment a worker stores one.
+    crate::hooks::netpacket::availability::settle(&mut merged, state.layout());
     if corpus_root.is_none() {
         let reason = "no pattern corpus directory (win64/…) could be resolved next to the host";
         disable_all(&mut merged, reason);

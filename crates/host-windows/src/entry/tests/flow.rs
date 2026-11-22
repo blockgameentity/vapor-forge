@@ -226,8 +226,8 @@ fn the_config_flags_reach_the_hook_state() {
 /// This is the achievements flow in one place: `CAPIJobRequestUserStats::BInit` and
 /// `::YieldingMergeStats` are anchored in both live builds, and only the merge is
 /// listed in `install::deps` because only the merge has a body
-/// ([`hooks::achievements`], observation-only — it forwards the call and reports,
-/// `crate::abi::achievements` measures why the rebuild needs one more anchor). So
+/// ([`hooks::achievements`], which forwards the call and rewrites the reply body
+/// when the corpus decoder resolves where that body lives). So
 /// today the batch resolves the symbol and installs it, keeping `achievements`
 /// enabled; every other capability is untouched. The assertion is written against
 /// [`hooks::replacement_address`] so both states are covered: a bodyless stats symbol

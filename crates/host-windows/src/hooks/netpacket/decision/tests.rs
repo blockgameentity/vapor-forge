@@ -59,6 +59,11 @@ fn without_a_layout_even_a_cached_code_is_only_observed() {
 }
 
 #[test]
+fn a_served_message_has_a_reason_that_says_it_was_served() {
+    assert!(ServeBlocker::Served.reason().contains("was served"));
+}
+
+#[test]
 fn a_disabled_request_code_capability_outranks_the_layout_gap() {
     let inputs = Inputs {
         request_codes_enabled: false,
@@ -121,8 +126,8 @@ fn a_decoded_layout_without_a_target_or_a_code_still_only_observes() {
 
 #[test]
 fn an_unreadable_message_is_recorded_with_the_gaps_named() {
-    // What the Windows body produces today: no layout, no accessor, so no
-    // EMsg and no target — and a record that says exactly that.
+    // A host that decoded no layout: no EMsg accessor and no payload read, so no
+    // target — and a record that says exactly that.
     let Disposition::Observe(observation) = decide(&base()) else {
         panic!("an unreadable message is observed, not served");
     };
@@ -130,7 +135,10 @@ fn an_unreadable_message_is_recorded_with_the_gaps_named() {
     assert_eq!(observation.class, None);
     assert_eq!(observation.target, None);
     assert_eq!(observation.blocker, ServeBlocker::NoLayout);
-    assert!(observation.blocker.reason().contains("CNetPacket::Init"));
+    assert!(observation
+        .blocker
+        .reason()
+        .contains("no CNetPacket layout was decoded"));
 }
 
 #[test]

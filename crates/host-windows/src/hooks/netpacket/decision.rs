@@ -14,12 +14,12 @@
 //! otherwise                              -> Observe(blocker)     (record, fall through)
 //! ```
 //!
-//! The `Serve` row cannot fire today: no win64 corpus file anchors
-//! `CNetPacket::Init`, so no [`Layout`] exists and the payload is unreadable (see
-//! [`crate::abi::netpacket`]). It is kept because it is the row a body would take
-//! the day the anchor lands, and because
-//! [`ServeBlocker::NoLayout`] is the executable form of the capability gap: a
-//! cached code plus a decoded target still cannot be served.
+//! The `Serve` row is live now that `CNetPacket::{Alloc, Init, Release}` decode on
+//! MS-x64: a decoded [`Layout`] plus a target plus a cached code is what the body in
+//! [`super`] serves, with the packet's two slots swapped and restored around the
+//! original call. [`ServeBlocker::NoLayout`] stays as the executable form of the
+//! remaining gap: a host that decoded no layout can never serve, and
+//! [`super::availability`] disables `request-codes` for it.
 
 use crate::abi::netpacket::Layout;
 
@@ -45,7 +45,8 @@ pub struct CachedCode {
     pub provider: Option<&'static str>,
 }
 
-/// Why a cached code cannot be served for this message.
+/// What happened to the cached-code lookup for this message: the first reason it
+/// was not served, or [`Self::Served`] when it was.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServeBlocker {
     /// The `request-codes` capability is off: the host may look, not answer.
@@ -56,6 +57,9 @@ pub enum ServeBlocker {
     NoTarget,
     /// Nothing cached for this `(depot, gid)` yet.
     NoCachedCode,
+    /// Not a blocker: the code *was* served, and Steam's payload was swapped for the
+    /// duration of the dispatch and restored afterwards.
+    Served,
 }
 
 impl ServeBlocker {
@@ -66,11 +70,12 @@ impl ServeBlocker {
                 "the request-codes capability is disabled, so the host may observe but not answer"
             }
             Self::NoLayout => {
-                "no CNetPacket layout for this build (CNetPacket::Init is not in the win64 corpus), \
-                 so the packet payload cannot be read or replaced"
+                "no CNetPacket layout was decoded for this build, so the packet payload \
+                 cannot be read or replaced"
             }
             Self::NoTarget => "no (depot, gid) was readable for this message",
             Self::NoCachedCode => "no request code is cached for this (depot, gid)",
+            Self::Served => "a cached request code was served for this message",
         }
     }
 }

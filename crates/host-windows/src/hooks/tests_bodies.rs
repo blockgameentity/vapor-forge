@@ -25,8 +25,8 @@ const DLC_ENABLED: &str = "IClientAppManager::BIsDlcEnabled";
 const CALLBACK: &str = "CSteamEngine::SetAPICallResult";
 const CDKEY: &str = "IClientUser::RequiresLegacyCDKey";
 const LAUNCH_ENV: &str = "CUser::BuildSpawnEnvBlock";
-/// The observation-only stats-merge body. Its row here is the achievements flow
-/// proof: the body installs at its entry through the real registry and
+/// The stats-reply rewrite body. Its row here is the achievements flow proof: the
+/// body installs at its entry through the real registry and
 /// [`Capability::Achievements`] stays enabled because it did.
 const MERGE: &str = crate::abi::achievements::MERGE_SYMBOL;
 const NO_BODY: &str = "CUser::GetSteamID";
