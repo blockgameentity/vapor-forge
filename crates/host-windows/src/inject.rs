@@ -36,6 +36,11 @@ pub fn restore(address: usize, len: usize, protection: Protection) -> Result<(),
     imp::restore(address, len, protection)
 }
 
+/// Flush the CPU instruction cache after patching code.
+pub fn flush_instruction_cache(address: usize, len: usize) -> Result<(), HostError> {
+    imp::flush_instruction_cache(address, len)
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{HostError, Protection};
@@ -59,6 +64,12 @@ mod imp {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn FlushInstructionCache(
+            process: *mut core::ffi::c_void,
+            address: *const core::ffi::c_void,
+            len: usize,
+        ) -> i32;
         fn VirtualProtect(
             address: *mut core::ffi::c_void,
             size: usize,
@@ -131,6 +142,24 @@ mod imp {
         Ok(())
     }
 
+    pub fn flush_instruction_cache(address: usize, len: usize) -> Result<(), HostError> {
+        // SAFETY: the current process pseudo-handle needs no cleanup and the
+        // range was just patched by the caller.
+        let ok = unsafe {
+            FlushInstructionCache(
+                GetCurrentProcess(),
+                address as *const core::ffi::c_void,
+                len,
+            )
+        };
+        if ok == 0 {
+            return Err(HostError::Unsupported(format!(
+                "FlushInstructionCache failed for {address:#x}+{len}"
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn _assert_layout() {
         let _ = core::mem::size_of::<MemoryBasicInformation>();
@@ -164,6 +193,10 @@ mod imp {
     pub fn restore(_address: usize, _len: usize, _protection: Protection) -> Result<(), HostError> {
         unsupported()
     }
+
+    pub fn flush_instruction_cache(_address: usize, _len: usize) -> Result<(), HostError> {
+        unsupported()
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +214,10 @@ mod tests {
         ));
         assert!(matches!(
             make_writable(0x1000, 16),
+            Err(HostError::Unsupported(_))
+        ));
+        assert!(matches!(
+            flush_instruction_cache(0x1000, 12),
             Err(HostError::Unsupported(_))
         ));
     }
