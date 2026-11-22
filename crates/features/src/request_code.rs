@@ -297,7 +297,7 @@ pub fn should_intercept_with_ownership(
 }
 
 // ---------------------------------------------------------------------------
-// Built-in providers
+// Provider chain: response parsing, pacing and cooldown tuning
 // ---------------------------------------------------------------------------
 
 const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4096;
@@ -411,8 +411,8 @@ fn wait_for_slot(name: &str, min_interval: Duration) {
 enum ProviderOutcome {
     Code(u64),
     RateLimited(Duration),
-    /// The provider is answering, but not for this target — a pool that holds
-    /// no licence for the app says so per request (20770407 replies 401
+    /// The provider is answering, but not for this target — a provider that
+    /// looks up codes through licensed accounts says so per request (a 401
     /// `Unauthorized`). Nothing is wrong with the source, so it must NOT be
     /// put on cooldown: the next gid may well be one it can serve.
     Denied(u16),
@@ -493,9 +493,15 @@ pub enum ChainError {
         provider: String,
         status: AttemptStatus,
     },
-    /// Nothing is configured to ask.
-    #[error("no manifest request code provider is configured")]
-    NoProviders,
+    /// Nothing is configured to ask: `[manifest] providers` is empty.
+    ///
+    /// Distinct from [`ChainError::ChainFailed`] on purpose — no provider was
+    /// tried, so this is a configuration state, not a failed lookup, and it must
+    /// not read as "every provider failed".
+    #[error(
+        "no manifest provider configured: the host tool must write at least one [manifest] providers entry, and none is set"
+    )]
+    NoProviderConfigured,
     /// Failover is on and the whole chain came up empty.
     #[error("no provider served gid {gid}: {}", describe_attempts(.attempts))]
     ChainFailed {
@@ -657,7 +663,7 @@ fn run_provider_chain(
     attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
 ) -> Result<ChainSuccess, ChainError> {
     if providers.is_empty() {
-        return Err(ChainError::NoProviders);
+        return Err(ChainError::NoProviderConfigured);
     }
     if !failover {
         return run_configured_provider(state, context, providers, attempt);
@@ -1028,7 +1034,6 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
 mod tests {
     use super::*;
     use prost::Message;
-    use vapor_forge_config::{CustomManifestProvider, ManifestProvider};
 
     fn make_req_header(job_id: u64, method: &str) -> Vec<u8> {
         CMsgProtoBufHeader {
@@ -1294,83 +1299,59 @@ mod tests {
         assert_eq!(completed[0].code, 0);
     }
 
-    fn built_in(provider: ManifestProvider) -> ManifestSource {
-        ManifestSource::BuiltIn(provider)
-    }
-
-    fn custom(
+    fn provider(
         name: &str,
         format: ManifestResponseFormat,
         json_field: Option<&str>,
     ) -> ManifestSource {
-        ManifestSource::Custom(CustomManifestProvider {
+        ManifestSource {
             name: name.to_owned(),
-            url: format!("https://{name}.example/{{gid}}"),
+            url: format!("https://{name}.fixture.invalid/{{gid}}"),
             user_agent: None,
             format,
             json_field: json_field.map(str::to_owned),
             min_interval_ms: None,
-        })
+        }
     }
 
     #[test]
-    fn parses_built_in_provider_responses() {
+    fn parses_plain_provider_responses() {
+        let plain = provider("plain", ManifestResponseFormat::Plain, None);
+        assert_eq!(parse_provider_response(&plain, "123456").unwrap(), 123456);
+        assert_eq!(parse_provider_response(&plain, " 654321 ").unwrap(), 654321);
+        assert!(parse_provider_response(&plain, "42abc").is_err());
+    }
+
+    #[test]
+    fn parses_json_provider_responses() {
+        // A JSON endpoint may quote the code or leave it a number.
+        let json = provider("json", ManifestResponseFormat::Json, Some("content"));
         assert_eq!(
-            parse_provider_response(&built_in(ManifestProvider::ManifestDex), "123456").unwrap(),
-            123456
-        );
-        assert_eq!(
-            parse_provider_response(&built_in(ManifestProvider::OpenSteamTool), "123456").unwrap(),
-            123456
-        );
-        assert_eq!(
-            parse_provider_response(&built_in(ManifestProvider::Wudrm), " 654321 ").unwrap(),
-            654321
-        );
-        assert_eq!(
-            parse_provider_response(
-                &built_in(ManifestProvider::SteamRun),
-                r#"{"content":"9999999999"}"#,
-            )
-            .unwrap(),
+            parse_provider_response(&json, r#"{"content":"9999999999"}"#).unwrap(),
             9_999_999_999
         );
-        assert!(
-            parse_provider_response(&built_in(ManifestProvider::SteamRun), r#"{"other":"1"}"#)
-                .is_err()
+        assert_eq!(
+            parse_provider_response(&json, r#"{"content":777}"#).unwrap(),
+            777
         );
+        assert!(parse_provider_response(&json, r#"{"other":"1"}"#).is_err());
+        assert!(parse_provider_response(&json, r#"{"content":true}"#).is_err());
+
+        // Without a field name a JSON entry cannot be read at all.
+        let fieldless = provider("fieldless", ManifestResponseFormat::Json, None);
+        assert!(parse_provider_response(&fieldless, r#"{"content":1}"#).is_err());
     }
 
     #[test]
-    fn parses_custom_provider_responses() {
-        let plain = custom("plain", ManifestResponseFormat::Plain, None);
-        assert_eq!(parse_provider_response(&plain, " 42 ").unwrap(), 42);
-        assert!(parse_provider_response(&plain, "42abc").is_err());
-
-        // A custom JSON endpoint may quote the code or leave it a number.
-        let json = custom("json", ManifestResponseFormat::Json, Some("code"));
-        assert_eq!(
-            parse_provider_response(&json, r#"{"code":"777"}"#).unwrap(),
-            777
-        );
-        assert_eq!(
-            parse_provider_response(&json, r#"{"code":777}"#).unwrap(),
-            777
-        );
-        assert!(parse_provider_response(&json, r#"{"code":true}"#).is_err());
-        assert!(parse_provider_response(&json, r#"{"other":1}"#).is_err());
-    }
-
-    #[test]
-    fn malformed_custom_entries_are_rejected_before_any_request() {
-        let no_placeholder = ManifestSource::Custom(CustomManifestProvider {
+    fn malformed_provider_entries_are_rejected_before_any_request() {
+        let no_placeholder = ManifestSource {
             name: "mirror".to_owned(),
-            url: "https://my.mirror/latest".to_owned(),
+            url: "https://my.mirror.fixture.invalid/latest".to_owned(),
             user_agent: None,
             format: ManifestResponseFormat::Plain,
             json_field: None,
             min_interval_ms: None,
-        });
+        };
 
         // fetch_manifest_code refuses malformed entries before any request, so
         // the failure names the entry and — the point of the check — no HTTP
@@ -1403,48 +1384,91 @@ mod tests {
     }
 
     #[test]
-    fn resolves_every_placeholder_in_a_custom_url() {
-        let pool = ManifestSource::Custom(CustomManifestProvider {
+    fn resolves_every_placeholder_in_a_provider_url() {
+        let pool = ManifestSource {
             name: "pool".to_owned(),
             // Valve's own GetManifestRequestCode shape: depot, then manifest.
-            url: "https://example.test/manifest/{depotId}/{gid}".to_owned(),
+            url: "https://fixture.invalid/manifest/{depotId}/{gid}".to_owned(),
             user_agent: None,
             format: ManifestResponseFormat::Plain,
             json_field: None,
             min_interval_ms: None,
-        });
+        };
         assert_eq!(
             pool.resolve_url(730, 731, 555),
-            "https://example.test/manifest/731/555"
+            "https://fixture.invalid/manifest/731/555"
         );
         assert!(pool.rejection().is_none());
 
-        let with_app = ManifestSource::Custom(CustomManifestProvider {
+        let with_app = ManifestSource {
             name: "withapp".to_owned(),
-            url: "https://example.test/{appId}/{depotId}/{gid}".to_owned(),
+            url: "https://fixture.invalid/{appId}/{depotId}/{gid}".to_owned(),
             user_agent: None,
             format: ManifestResponseFormat::Plain,
             json_field: None,
             min_interval_ms: None,
-        });
+        };
         assert_eq!(
             with_app.resolve_url(730, 731, 555),
-            "https://example.test/730/731/555"
+            "https://fixture.invalid/730/731/555"
         );
 
-        // Built-ins that take only the gid leave the other placeholders inert.
+        // The legacy `{depot_id}` spelling still expands.
+        let legacy = ManifestSource {
+            name: "legacy".to_owned(),
+            url: "https://fixture.invalid/{depot_id}/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        };
         assert_eq!(
-            built_in(ManifestProvider::Wudrm).resolve_url(730, 731, 555),
-            "http://gmrc.wudrm.com/manifest/555"
+            legacy.resolve_url(730, 731, 555),
+            "https://fixture.invalid/731/555"
         );
-        // The built-in pool provider is itself depot-shaped.
+
+        // A gid-only entry leaves the other placeholders inert.
+        let gid_only = ManifestSource {
+            name: "gidonly".to_owned(),
+            url: "https://fixture.invalid/manifest/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        };
         assert_eq!(
-            built_in(ManifestProvider::Pool20770407).resolve_url(730, 731, 555),
-            "https://20770407.xyz/manifest/731/555"
+            gid_only.resolve_url(730, 731, 555),
+            "https://fixture.invalid/manifest/555"
         );
-        assert!(built_in(ManifestProvider::Pool20770407)
-            .user_agent()
-            .is_some_and(|ua| ua.starts_with("vapor-forge/")));
+    }
+
+    #[test]
+    fn a_table_entry_is_requested_with_its_url_as_written() {
+        // Nothing resolves provider names any more: the entry's own url is
+        // what goes on the wire, placeholders expanded as written.
+        let state = ProviderState::default();
+        let providers = vec![ManifestSource {
+            name: "pool".to_owned(),
+            url: "https://fixture.invalid/manifest/{depotId}/{gid}".to_owned(),
+            user_agent: Some("FixtureClient/1.0".to_owned()),
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        }];
+
+        let mut asked = Vec::new();
+        let result = run_provider_chain(&state, context(555), &providers, false, |provider| {
+            asked.push(provider.resolve_url(730, 731, 555));
+            ProviderOutcome::Code(42)
+        });
+
+        assert_eq!(asked, ["https://fixture.invalid/manifest/731/555"]);
+        assert_eq!(served_code(result), 42);
+        assert_eq!(
+            providers[0].user_agent(),
+            Some("FixtureClient/1.0"),
+            "the entry's own agent string reaches the request"
+        );
     }
 
     #[test]
@@ -1536,28 +1560,19 @@ mod tests {
         let mut cooldowns = HashMap::new();
         let now = Instant::now();
 
-        assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
-            None
-        );
+        assert_eq!(cooldown_remaining_in(&mut cooldowns, "alpha", now), None);
 
-        start_cooldown_in(&mut cooldowns, "manifestdex", now, Duration::from_secs(30));
+        start_cooldown_in(&mut cooldowns, "alpha", now, Duration::from_secs(30));
 
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
+            cooldown_remaining_in(&mut cooldowns, "alpha", now),
             Some(Duration::from_secs(30))
         );
         // Other providers stay usable.
-        assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, "opensteamtool", now),
-            None
-        );
+        assert_eq!(cooldown_remaining_in(&mut cooldowns, "beta", now), None);
 
         let later = now + Duration::from_secs(31);
-        assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, "manifestdex", later),
-            None
-        );
+        assert_eq!(cooldown_remaining_in(&mut cooldowns, "alpha", later), None);
         // The expired entry is dropped rather than left to accumulate.
         assert!(cooldowns.is_empty());
     }
@@ -1567,16 +1582,11 @@ mod tests {
         let mut cooldowns = HashMap::new();
         let now = Instant::now();
 
-        let applied = start_cooldown_in(
-            &mut cooldowns,
-            "manifestdex",
-            now,
-            Duration::from_secs(86_400),
-        );
+        let applied = start_cooldown_in(&mut cooldowns, "alpha", now, Duration::from_secs(86_400));
 
         assert_eq!(applied, MAX_RATE_LIMIT_COOLDOWN);
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
+            cooldown_remaining_in(&mut cooldowns, "alpha", now),
             Some(MAX_RATE_LIMIT_COOLDOWN)
         );
     }
@@ -1584,7 +1594,7 @@ mod tests {
     fn chain(names: &[&str]) -> Vec<ManifestSource> {
         names
             .iter()
-            .map(|name| custom(name, ManifestResponseFormat::Plain, None))
+            .map(|name| provider(name, ManifestResponseFormat::Plain, None))
             .collect()
     }
 
@@ -1874,7 +1884,24 @@ mod tests {
         let (result, asked) = run_scripted(&state, 1, &[], true, |_| ProviderOutcome::Code(1));
 
         assert!(asked.is_empty());
-        assert_eq!(result, Err(ChainError::NoProviders));
+        assert_eq!(result, Err(ChainError::NoProviderConfigured));
+        // The reason is actionable and distinguishes "nothing configured" from
+        // "everything failed".
+        let message = ChainError::NoProviderConfigured.to_string();
+        assert!(
+            message.contains("no manifest provider configured"),
+            "{message}"
+        );
+        assert!(message.contains("host tool"), "{message}");
+
+        // The real entry point stops before any request is built or sent, with
+        // failover on or off.
+        for failover in [false, true] {
+            assert_eq!(
+                fetch_manifest_code(context(1), &[], failover, 10, 10, 0),
+                Err(ChainError::NoProviderConfigured)
+            );
+        }
     }
 
     #[test]

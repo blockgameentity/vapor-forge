@@ -18,8 +18,8 @@ fn run() -> Result<(), String> {
     let config = toml::from_str::<RuntimeConfig>(&dry_run.synced)
         .map_err(|error| format!("synced config parse failed: {error}"))?;
 
-    // Custom manifest providers are hand-written, so surface what the runtime
-    // would skip instead of leaving the user to read the logs.
+    // Provider entries are written by the host tool, so surface what the
+    // runtime would skip instead of leaving the user to read the logs.
     let manifest_rejections = config.manifest.rejections();
 
     if args.format == OutputFormat::Json {

@@ -1,7 +1,7 @@
 use crate::template::{parse_commented_section_header, CommentedSectionHeader, TEMPLATE_EXAMPLES};
 use crate::{
-    AppCategory, AppId, CloudBackendMode, ManifestProvider, ManifestResponseFormat, ManifestSource,
-    RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE,
+    AppCategory, AppId, CloudBackendMode, ManifestResponseFormat, RuntimeConfig, TicketCacheMode,
+    CONFIG_TEMPLATE,
 };
 
 #[test]
@@ -116,48 +116,51 @@ fn template_parses_and_keeps_safe_defaults() {
     assert!(config.cloud.local.syncthing.folder_id.is_empty());
     assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
     assert!(!config.ticket.auto_delegate);
-    assert_eq!(
-        config.manifest.providers,
-        vec![
-            ManifestSource::BuiltIn(ManifestProvider::Pool20770407),
-            ManifestSource::BuiltIn(ManifestProvider::ManifestDex),
-            ManifestSource::BuiltIn(ManifestProvider::OpenSteamTool),
-            ManifestSource::BuiltIn(ManifestProvider::Wudrm),
-            ManifestSource::BuiltIn(ManifestProvider::SteamRun),
-        ]
-    );
+    // Vapor Forge ships no provider catalogue: the host tool writes this list.
+    assert!(config.manifest.providers.is_empty());
     assert_eq!(config.manifest.timeout_connect_ms, 5000);
     assert_eq!(config.manifest.timeout_ms, 15000);
     assert_eq!(config.manifest.min_interval_ms, 1000);
 }
 
 #[test]
+fn manifest_providers_default_to_empty() {
+    // An empty list is the shipped default: without a provider Vapor Forge does
+    // not fetch request codes, it reports why and degrades.
+    let config = toml::from_str::<RuntimeConfig>("[manifest]\nfailover = true\n")
+        .expect("a config without providers should parse");
+
+    assert!(config.manifest.providers.is_empty());
+    assert!(config.manifest.failover);
+}
+
+#[test]
 fn manifest_custom_provider_takes_valve_shaped_urls() {
-    // 20770407-style providers mint codes through licensed accounts and so
-    // take Valve's own (depot, manifest) shape rather than the gid alone.
+    // A provider that mints codes through licensed accounts takes Valve's own
+    // (depot, manifest) shape rather than the gid alone.
     let config = toml::from_str::<RuntimeConfig>(
         r#"
 [manifest]
 providers = [
-    { name = "pool", url = "https://example.test/manifest/{depotId}/{gid}", min_interval_ms = 2000 },
-    "manifestdex",
+    { name = "pool", url = "https://fixture.invalid/manifest/{depotId}/{gid}", min_interval_ms = 2000 },
+    { name = "mirror", url = "https://fixture.invalid/{gid}" },
 ]
 "#,
     )
-    .expect("a depot-shaped custom provider should parse");
+    .expect("a depot-shaped provider table should parse");
 
     let pool = &config.manifest.providers[0];
     assert!(pool.rejection().is_none());
     assert_eq!(
         pool.resolve_url(730, 731, 555),
-        "https://example.test/manifest/731/555"
+        "https://fixture.invalid/manifest/731/555"
     );
     assert_eq!(
         pool.min_interval(config.manifest.min_interval_ms),
         std::time::Duration::from_millis(2000)
     );
 
-    // Built-ins fall back to the section default.
+    // An entry without its own interval falls back to the section default.
     assert_eq!(
         config.manifest.providers[1].min_interval(config.manifest.min_interval_ms),
         std::time::Duration::from_millis(1000)
@@ -189,32 +192,40 @@ fn patterns_url_default_is_identical_in_both_compiled_copies() {
 }
 
 #[test]
-fn manifest_rejects_unknown_providers() {
-    let error =
-        toml::from_str::<RuntimeConfig>("[manifest]\nproviders = [\"opensteamtool\", \"unknown\"]")
-            .expect_err("unknown manifest provider should be rejected");
+fn manifest_rejects_bare_provider_names_with_the_migration() {
+    // Bare names addressed the built-in catalogue this build no longer ships.
+    // Silently ignoring them would leave the user with no provider and no hint.
+    let error = toml::from_str::<RuntimeConfig>("[manifest]\nproviders = [\"legacy-name\"]")
+        .expect_err("a bare provider name must be a load error");
+    let message = error.to_string();
 
-    assert!(error.to_string().contains("unknown variant `unknown`"));
+    assert!(message.contains("legacy-name"), "{message}");
+    assert!(message.contains("bare name"), "{message}");
+    assert!(message.contains("host tool"), "{message}");
+    assert!(message.contains("no built-in providers"), "{message}");
+    assert!(message.contains("name ="), "{message}");
+    assert!(message.contains("url ="), "{message}");
 }
 
 #[test]
-fn manifest_accepts_custom_providers_inline() {
+fn manifest_accepts_provider_tables_inline() {
     let config = toml::from_str::<RuntimeConfig>(
         r#"
 [manifest]
 providers = [
-    "manifestdex",
+    { name = "first", url = "https://fixture.invalid/{gid}", user_agent = "MyClient/1.0" },
     { name = "mirror", url = "https://my.mirror/{gid}", user_agent = "MyClient/1.0" },
-    { name = "jsonsrc", url = "https://json.example/{gid}", format = "json", json_field = "code" },
+    { name = "jsonsrc", url = "https://json.invalid/{gid}", format = "json", json_field = "code" },
 ]
 "#,
     )
-    .expect("custom providers should parse");
+    .expect("provider tables should parse");
 
     assert_eq!(config.manifest.providers.len(), 3);
+    assert_eq!(config.manifest.providers[0].name(), "first");
     assert_eq!(
-        config.manifest.providers[0],
-        ManifestSource::BuiltIn(ManifestProvider::ManifestDex)
+        config.manifest.providers[0].url_template(),
+        "https://fixture.invalid/{gid}"
     );
 
     let mirror = &config.manifest.providers[1];
@@ -231,15 +242,14 @@ providers = [
 }
 
 #[test]
-fn manifest_custom_providers_may_span_multiple_lines() {
+fn manifest_provider_tables_may_span_multiple_lines() {
     // Multi-line inline tables are a TOML 1.1 feature; the parser must keep
-    // accepting them, because the documented custom-provider form relies on
-    // one field per line staying readable and commentable.
+    // accepting them, because the documented provider form relies on one field
+    // per line staying readable and commentable.
     let config = toml::from_str::<RuntimeConfig>(
         r#"
 [manifest]
 providers = [
-    "manifestdex",
     {
         name = "mirror",
         url = "https://my.mirror/{gid}",
@@ -250,21 +260,21 @@ providers = [
     )
     .expect("multi-line inline tables should parse");
 
-    assert_eq!(config.manifest.providers.len(), 2);
-    assert_eq!(config.manifest.providers[1].name(), "mirror");
+    assert_eq!(config.manifest.providers.len(), 1);
+    assert_eq!(config.manifest.providers[0].name(), "mirror");
     assert_eq!(
-        config.manifest.providers[1].user_agent(),
+        config.manifest.providers[0].user_agent(),
         Some("MyClient/1.0")
     );
     assert!(config.manifest.rejections().is_empty());
 }
 
 #[test]
-fn manifest_custom_provider_rejects_unknown_keys() {
+fn manifest_provider_rejects_unknown_keys() {
     let error = toml::from_str::<RuntimeConfig>(
         r#"
 [manifest]
-providers = [{ name = "mirror", url = "https://x/{gid}", agent = "typo" }]
+providers = [{ name = "mirror", url = "https://x.invalid/{gid}", agent = "typo" }]
 "#,
     )
     .expect_err("an unknown key should be rejected");
@@ -273,16 +283,61 @@ providers = [{ name = "mirror", url = "https://x/{gid}", agent = "typo" }]
 }
 
 #[test]
-fn manifest_rejections_name_malformed_custom_entries() {
+fn manifest_provider_rejects_unknown_url_placeholder_at_load() {
+    // Nothing expands `{unknown}`, so it would be sent verbatim. Refusing it on
+    // load is better than issuing a nonsense request at fetch time.
+    let error = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [{ name = "mirror", url = "https://x.invalid/{gid}/{unknown}" }]
+"#,
+    )
+    .expect_err("an unknown placeholder must be a load error");
+    let message = error.to_string();
+
+    assert!(message.contains("{unknown}"), "{message}");
+    assert!(message.contains("allowed placeholders"), "{message}");
+
+    // Unterminated placeholders are refused for the same reason.
+    let error = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [{ name = "mirror", url = "https://x.invalid/{gid" }]
+"#,
+    )
+    .expect_err("an unterminated placeholder must be a load error");
+    assert!(error.to_string().contains("unterminated"), "{error}");
+}
+
+#[test]
+fn manifest_provider_accepts_legacy_depot_placeholder() {
+    let config = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [{ name = "legacy", url = "https://x.invalid/{depot_id}/{gid}" }]
+"#,
+    )
+    .expect("the legacy {depot_id} spelling should still parse");
+
+    let provider = &config.manifest.providers[0];
+    assert_eq!(
+        provider.resolve_url(730, 731, 555),
+        "https://x.invalid/731/555"
+    );
+    assert!(provider.rejection().is_none());
+}
+
+#[test]
+fn manifest_rejections_name_malformed_provider_entries() {
     let config = toml::from_str::<RuntimeConfig>(
         r#"
 [manifest]
 providers = [
     { name = "nogid", url = "https://my.mirror/latest" },
     { name = "badscheme", url = "ftp://my.mirror/{gid}" },
-    { name = "nofield", url = "https://x/{gid}", format = "json" },
-    "manifestdex",
-    { name = "manifestdex", url = "https://dup/{gid}" },
+    { name = "nofield", url = "https://x.invalid/{gid}", format = "json" },
+    { name = "mirror", url = "https://dup.invalid/{gid}" },
+    { name = "mirror", url = "https://dup2.invalid/{gid}" },
 ]
 "#,
     )

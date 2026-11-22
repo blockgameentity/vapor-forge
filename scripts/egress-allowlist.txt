@@ -9,10 +9,9 @@ https://partner.steamgames.com/        # documentation links
 # Pattern corpus sources, fetched at runtime and validated against the live module.
 https://raw.githubusercontent.com/Hintay/vapor-forge/
 https://github.com/Hintay/vapor-forge/
-# Third-party manifest-request-code providers, only ever queried by gid.
-https://20770407.xyz/
-http://gmrc.wudrm.com/
-https://manifest.steam.run/
+# Manifest request-code providers are not listed here: Vapor Forge ships no
+# provider hostnames at all. The host tool writes `[manifest] providers` into the
+# user's config, so the destination is user configuration, not a default.
 # Documentation / licence references.
 https://github.com/rust-lang/
 https://www.gnu.org/licenses/
