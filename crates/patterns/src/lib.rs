@@ -27,6 +27,12 @@ pub mod env_writer;
 pub mod full_semantic;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod http;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod msabi;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod probe_facts;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod probe_rank;
 pub mod semantic;
 pub mod vtable_scan;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
