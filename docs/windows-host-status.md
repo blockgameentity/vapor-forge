@@ -3,6 +3,8 @@
 First live run: see [`windows-live-test.md`](./windows-live-test.md) for the install
 layout, where the report bundle lands, and the assumption checklist.
 
+How the two hosts compare, capability by capability: [`vapor-forge-parity.md`](./vapor-forge-parity.md).
+
 Branch: `integration/windows-host` (merges `phase1/hook-install` and
 `gate0/behaviour-probes` on top of `phase3/depotcache-ci`). `main` untouched.
 
