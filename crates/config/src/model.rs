@@ -507,18 +507,168 @@ pub struct LibraryInjectEntry {
 /// - Forge source tickets: always memory-only.
 /// - Delegate captured tickets: always persisted to disk.
 /// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "TicketSectionRaw")]
 pub struct TicketSection {
     /// Persistence for non-delegate, non-derived tickets (Lua-provided or
     /// intercepted real tickets). Default: disk.
-    #[serde(default)]
     pub cache: TicketCacheMode,
     /// Automatically detect Denuvo-protected games (via PE section scanning
     /// in the vapor-forge-proton-inject helper) and enable delegate ticket mode for them.
     /// Requires library injection with a proton helper configured.
-    #[serde(default)]
     pub auto_delegate: bool,
+    /// Ticket sources to ask, in order. The first source that has the ticket
+    /// wins; the default is the single source this build has always used, so
+    /// leaving the key alone keeps the previous behaviour exactly.
+    pub source_order: Vec<TicketSourceKind>,
+    /// How a Denuvo app is authorised. `off` (default) keeps the historical
+    /// one-shot ticket; `lease` gives the authorisation an explicit validity
+    /// window that the caller has to renew.
+    pub denuvo_mode: DenuvoMode,
+    /// Manual Denuvo override: `true` treats every app as Denuvo-protected,
+    /// `false` as never, `None` (default) lets detection decide. It wins over
+    /// detection in both directions.
+    pub denuvo_override: Option<bool>,
+    /// Enable structural Denuvo detection (section names, DLL names, flags).
+    /// Off by default, so an app is only ever treated as Denuvo-protected when
+    /// `denuvo_override` says so.
+    pub denuvo_detection: bool,
+    /// Validity of one lease in seconds when `denuvo_mode = "lease"`.
+    pub denuvo_lease_secs: u64,
+}
+
+impl Default for TicketSection {
+    fn default() -> Self {
+        Self {
+            cache: TicketCacheMode::default(),
+            auto_delegate: false,
+            source_order: default_ticket_source_order(),
+            denuvo_mode: DenuvoMode::default(),
+            denuvo_override: None,
+            denuvo_detection: false,
+            denuvo_lease_secs: default_denuvo_lease_secs(),
+        }
+    }
+}
+
+/// A ticket source, as named in `[ticket] source_order`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketSourceKind {
+    /// The ticket this process already holds, or the one in the local ticket
+    /// cache (memory first, then disk). This is the only source used when
+    /// `source_order` is left at its default.
+    LocalCache,
+    /// A ticket kept in the platform credential store.
+    CredentialStore,
+    /// A ticket published in the Steam registry.
+    Registry,
+}
+
+impl TicketSourceKind {
+    pub const ALL: [Self; 3] = [Self::LocalCache, Self::CredentialStore, Self::Registry];
+
+    /// Config spelling, and the name used in logs and errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LocalCache => "local_cache",
+            Self::CredentialStore => "credential_store",
+            Self::Registry => "registry",
+        }
+    }
+}
+
+impl std::fmt::Display for TicketSourceKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// How a Denuvo app is authorised.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenuvoMode {
+    /// Historical behaviour: one ticket, acquired when the app asks for it.
+    #[default]
+    Off,
+    /// Lease/pulse authorisation: the authorisation has an acquisition time and
+    /// an explicit expiry, and the caller renews it.
+    Lease,
+}
+
+/// Wire form of [`TicketSection`]. Separate so the order can be validated while
+/// the config is parsed: a repeated (or empty) source list is a load error, not
+/// something the ticket path discovers later.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketSectionRaw {
+    #[serde(default)]
+    cache: TicketCacheMode,
+    #[serde(default)]
+    auto_delegate: bool,
+    #[serde(default = "default_ticket_source_order")]
+    source_order: Vec<TicketSourceKind>,
+    #[serde(default)]
+    denuvo_mode: DenuvoMode,
+    #[serde(default)]
+    denuvo_override: Option<bool>,
+    #[serde(default)]
+    denuvo_detection: bool,
+    #[serde(default = "default_denuvo_lease_secs")]
+    denuvo_lease_secs: u64,
+}
+
+impl TryFrom<TicketSectionRaw> for TicketSection {
+    type Error = String;
+
+    fn try_from(raw: TicketSectionRaw) -> Result<Self, String> {
+        let section = Self {
+            cache: raw.cache,
+            auto_delegate: raw.auto_delegate,
+            source_order: raw.source_order,
+            denuvo_mode: raw.denuvo_mode,
+            denuvo_override: raw.denuvo_override,
+            denuvo_detection: raw.denuvo_detection,
+            denuvo_lease_secs: raw.denuvo_lease_secs,
+        };
+        if let Some(problem) = section.source_order_problems().into_iter().next() {
+            return Err(problem);
+        }
+        Ok(section)
+    }
+}
+
+impl TicketSection {
+    /// Problems with the configured source order, empty when it is usable.
+    ///
+    /// The order is a chain, so an entry that appears twice would be asked
+    /// twice and an empty order would never answer at all. Both are reported
+    /// against the config, with the offending source named.
+    pub fn source_order_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.source_order.is_empty() {
+            problems.push(
+                "[ticket] source_order is empty: configure at least one ticket source".to_owned(),
+            );
+        }
+        let mut seen = HashSet::new();
+        for source in &self.source_order {
+            if !seen.insert(*source) {
+                problems.push(format!(
+                    "[ticket] source_order lists `{source}` more than once: each ticket source may appear at most once"
+                ));
+            }
+        }
+        problems
+    }
+}
+
+fn default_ticket_source_order() -> Vec<TicketSourceKind> {
+    vec![TicketSourceKind::LocalCache]
+}
+
+fn default_denuvo_lease_secs() -> u64 {
+    300
 }
 
 /// Persistence mode for non-delegate, non-derived tickets.
@@ -1053,5 +1203,90 @@ impl RuntimeConfig {
 
     pub fn cumulus_configured(&self) -> bool {
         self.cloud.backend == CloudBackendMode::Cumulus
+    }
+}
+
+#[cfg(test)]
+mod ticket_section_tests {
+    use super::*;
+
+    fn parse(text: &str) -> Result<TicketSection, String> {
+        toml::from_str::<TicketSection>(text).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn ticket_section_defaults_preserve_current_behaviour() {
+        let section = TicketSection::default();
+        assert_eq!(section.cache, TicketCacheMode::Disk);
+        assert!(!section.auto_delegate);
+        assert_eq!(section.source_order, vec![TicketSourceKind::LocalCache]);
+        assert_eq!(section.denuvo_mode, DenuvoMode::Off);
+        assert_eq!(section.denuvo_override, None);
+        assert!(!section.denuvo_detection);
+        assert!(section.source_order_problems().is_empty());
+
+        let parsed = parse("").expect("empty ticket table should parse");
+        assert_eq!(parsed.source_order, vec![TicketSourceKind::LocalCache]);
+        assert_eq!(parsed.denuvo_lease_secs, 300);
+    }
+
+    #[test]
+    fn ticket_section_parses_the_new_flags() {
+        let section = parse(
+            r#"
+            source_order = ["local_cache", "credential_store", "registry"]
+            denuvo_mode = "lease"
+            denuvo_override = false
+            denuvo_detection = true
+            denuvo_lease_secs = 90
+            "#,
+        )
+        .expect("flags should parse");
+
+        assert_eq!(
+            section.source_order,
+            vec![
+                TicketSourceKind::LocalCache,
+                TicketSourceKind::CredentialStore,
+                TicketSourceKind::Registry,
+            ]
+        );
+        assert_eq!(section.denuvo_mode, DenuvoMode::Lease);
+        assert_eq!(section.denuvo_override, Some(false));
+        assert!(section.denuvo_detection);
+        assert_eq!(section.denuvo_lease_secs, 90);
+    }
+
+    #[test]
+    fn every_ticket_source_round_trips_through_its_config_name() {
+        for kind in TicketSourceKind::ALL {
+            let text = format!("source_order = [\"{}\"]", kind.name());
+            let section = parse(&text).expect("each source name must parse");
+            assert_eq!(section.source_order, vec![kind]);
+        }
+    }
+
+    #[test]
+    fn repeated_ticket_source_is_rejected_while_parsing() {
+        let error = parse(r#"source_order = ["local_cache", "registry", "local_cache"]"#)
+            .expect_err("a repeated source must be rejected at load time");
+        assert!(error.contains("local_cache"), "unclear error: {error}");
+        assert!(error.contains("more than once"), "unclear error: {error}");
+    }
+
+    #[test]
+    fn empty_ticket_source_order_is_rejected_while_parsing() {
+        let error = parse("source_order = []").expect_err("an empty order must be rejected");
+        assert!(error.contains("empty"), "unclear error: {error}");
+    }
+
+    #[test]
+    fn unknown_ticket_source_is_rejected() {
+        let error = parse(r#"source_order = ["carrier_pigeon"]"#)
+            .expect_err("an unknown source must be rejected");
+        assert!(
+            error.contains("carrier_pigeon") || error.contains("unknown variant"),
+            "unclear error: {error}"
+        );
     }
 }
