@@ -1133,7 +1133,8 @@ from exactly two functions, both serialisers: the window-state writer at
 
 **Verdict: no candidate.** `SteamUI`'s corpus stays at 7 public / 5 publicbeta
 patterns; the reverse bridge has no Windows anchor and the capability stays
-blocked.
+blocked. **Superseded by the sixth pass** (§3): the registrar is `CHTMLWindow`
+slot 6, `0x20d430` / `0x218ef0`, anchored at the end of this file.
 
 ## Corpus entries added and verified
 
@@ -1214,7 +1215,7 @@ route.
 | `CNetPacket::Alloc` | **confirmed** | `0xd3fe90` / `0xd6bcd0` | **added** |
 | `CNetPacket::Release` | **confirmed** | `0xead4d0` / `0xebf2c0` | **added** |
 | `CUser::GetSteamID` | **candidate (strong)** for the slot, **refuted** as an anchor | slot 10, `0xcfed0` / `0xd0470` | none |
-| `RegisterJsMethod` | **no candidate** | — (`SteamUI.dll`) | none |
+| `RegisterJsMethod` | **no candidate** | — (`SteamUI.dll`) | none (anchored in the sixth pass: `0x20d430` / `0x218ef0`) |
 
 ## What was measured
 
@@ -1360,6 +1361,10 @@ controls the `m_cRef = 1` tail.
 in `rax`. `Release(this)` is `void`.
 
 ### 1.5 Can `patterns::cnet_packet::decode_init` consume these bodies today? No
+
+> **Superseded by the sixth pass** (§1): the port below was made, and the
+> decoder now produces exactly the table at the end of this section. What follows
+> is the measurement that motivated it, kept as written.
 
 Measured, not argued: the shipped decoders were run against the three Windows
 bodies with `bitness = 64` and the images' own `.text` (a throwaway example, since
@@ -1525,7 +1530,9 @@ that references it, `0x20c0b0`, is `CHTMLWindow` slot 1 and logs it at line `0x1
 of its own translation unit.
 
 **Verdict: no candidate.** `SteamUI`'s corpus is unchanged (7 public / 5 beta
-patterns). **What would change it:** a `CUtlString`-keyed insert in either class
+patterns). **Superseded by the sixth pass** (§3), which anchors this body from
+`CHTMLWindow`'s registration map: `0x20d430` / `0x218ef0`, gate `verified` in both
+builds. **What would change it:** a `CUtlString`-keyed insert in either class
 whose value stores a `CSmartPtr<CJSCallbackFunc>` plus a flags byte; that shape is
 what to search for if a future build keeps its log strings, and the two map type
 names above are the handle. **What would overturn the negative:** the JS context
@@ -1563,7 +1570,9 @@ pattern = "40 56 48 83 EC 20 83 69 1C 01 48 8B F1 0F 85 ED"
 publicbeta patterns resolve, and 27 / 26 of them pass the body gate; the only
 rejection in either run is the pre-existing `GetPipeClient: unmapped` (unchanged
 from the first pass). Both
-`SteamUI` corpora are untouched and still verify.
+`SteamUI` corpora are untouched and still verify. (The sixth pass adds one
+`SteamUI` pattern to each build, so those runs are now 8 public / 6 publicbeta — all
+`verified`.)
 
 **Naming note for the host:** `CNetPacket::Init`, `CNetPacket::Alloc` and
 `CNetPacket::Release` are the three names `crates/hooks/src/client/network.rs`
@@ -1598,3 +1607,177 @@ layout, both outside this corpus-only branch.
   `0xcfed0` and `0x210800` are static identifications with their strings, offsets,
   callees and argument stores quoted; each section's "what a live client would
   show" is the check that would turn them into fact.
+
+# Sixth pass: the MS-x64 decoder, and the two negatives re-asked
+
+Three questions, one change of layer: port the packet decoder to the Windows ABI
+(§1.5 described the change; this pass made it), then re-ask `GetSteamID` and
+`RegisterJsMethod` from angles the fifth pass did not take. The first two stay as
+they were, the third **overturns**: `RegisterJsMethod` is now an entry.
+
+## 1. `cnet_packet` decodes the Windows bodies
+
+The change in §1.5 is in, and no longer a description: `arg_flow` takes the
+integer-argument convention as a parameter (`Abi::SysV` / `Abi::MsX64`, with the
+MS-x64 volatile set — `rsi`/`rdi` callee-saved — and the first stacked argument at
+entry `[rsp+0x28]`, past the shadow space), `CodeSegment` carries the container, and
+`cnet_packet` gained `decode_*_in(abi, …)` plus `decode_api_segment(&CodeSegment, …)`
+which picks the convention from the container. `decode_init`, `decode_alloc`,
+`decode_release` and `decode_api` keep their signatures and their System V
+behaviour, so the Linux callers are untouched.
+
+Two facts about `Alloc` were not in the §1.5 sketch and are why it needed a window
+of its own: the MS-x64 body opens with `DCHECK`s whose failure paths sit between
+the entry and the allocator call (0xe1 bytes to the `ret` in public, 0x106 in beta,
+against the 0x80 the SysV walk uses), and the beta build steps over a
+`lock`-prefixed counter with `jmp` at +0x35, which a walk that stops at the first
+unconditional jump never gets past. `Abi::MsX64` therefore walks 0x180 bytes and
+follows forward jumps; the SysV walk is unchanged.
+
+Decoded, from a `CodeSegment` of each image, with the corpus patterns resolved
+first (1 match each, at the RVAs the fifth pass measured):
+
+| | public | publicbeta | measured (`§1.2`/`§1.3`) |
+| --- | --- | --- | --- |
+| `CNetPacket::Init` | `0xead290` | `0xebf080` | same |
+| `CNetPacket::Alloc` | `0xd3fe90` | `0xd6bcd0` | same |
+| `CNetPacket::Release` | `0xead4d0` | `0xebf2c0` | same |
+| `conn_id` | `0x00` | `0x00` | `0x00` |
+| `data` (`pubData`) | `0x10` | `0x10` | `0x10` |
+| `size` (`cubData`) | `0x18` | `0x18` | `0x18` |
+| `owned_data` | `0x20` | `0x20` | `0x20` |
+| `refcount` (`m_cRef`) | `0x1c` | `0x1c` | `0x1c` |
+| `object_size` | `0x58` | `0x58` | `0x58` |
+
+The decoder agrees with the hand measurement on every field, in both builds, and
+`crates/host-windows/src/abi/netpacket.rs::Layout::new(0x10, 0x18)` accepts the
+result. The golden test that asserts this table runs only when
+`VAPOR_FORGE_TEST_STEAMCLIENT` points at a `steamclient64.dll`; unset, it skips. Its
+corpus lookup is by the image's sha256, so a build without a corpus file fails
+loudly rather than decoding a different function.
+
+## 2. `CUser::GetSteamID` — the ranking, measured over all 260/261 slots
+
+Fifth pass refused the entry on slot 10 (an out-parameter accessor) and noted slot
+11 (`mov rax,[rcx-0x1ce8]; ret`) as the shape `SteamIdOverride` wants. This pass
+ranked the *whole* table instead of the two derived slots: all slots of the
+`CUser` table (`0x139e830`, 260 slots public; `0x13d3b08`, 261 beta — 150/151 of
+them `.pdata` functions), each body disassembled from its entry, scoring "no call,
+loads 8 bytes from a member of `rcx`, returns it in `rax`, body < 40 bytes".
+
+| slot | public | publicbeta | body | gate |
+| --- | --- | --- | --- | --- |
+| 10 | `0xcfed0` | `0xd0470` | `mov rax,[rcx-0x1c6e]; mov [rdx],rax; mov rax,rdx; ret` | `unmapped` |
+| 11 | `0xa08cb0` | `0xa31200` | `mov rax,[rcx-0x1ce8]; ret` | `unmapped` |
+| 57 | `0xa28ce0` | `0xa52c50` | `mov rax,[rcx-0x1b50]; ret` | `unmapped` |
+| 213 | `0xa0c1f0` | `0xa34880` | `mov rax,[rcx+0x4790]; mov eax,[rax+0x20]; ret` | `unmapped` |
+| 214 | `0x9fe340` | `0xa26110` | `mov rax,[rcx+0x4790]; movzx eax,byte [rax+0x28]; ret` | `unmapped` |
+| 250 | `0x562cc0` | `0x57f710` | `mov rax,[rcx+0x4b98]; ret` | `unmapped` |
+
+Six slots have the shape, at the same indices in both builds — and **all six are
+leaf functions with no unwind record**, so `.pdata` does not cover them and
+`pdata::body::verify` answers `unmapped` for every one. The gate cannot represent a
+leaf body at all, so no slot of this table is a corpus entry whatever its shape is;
+that is a property of the gate, not of these six. The corpus check agrees: the
+8-byte pattern for slot 11 (`48 8B 81 18 E3 FF FF C3`) resolves **uniquely** on
+public and is then rejected `unmapped`, which is exactly the fifth pass's verdict
+reached from the other end.
+
+One more measurement closes the "maybe the positive-offset form exists" question
+that fifth pass answered only for `+0xA8`: `mov rax,[rcx+0x20A]; ret`
+(`48 8B 81 0A 02 00 00 C3`) — the account-id field, reached from a `CUser *`
+instead of through the `IClientUser` subobject — occurs **0 times in both builds**.
+So the id is exposed as a body only through slot 10's out-parameter thunk.
+
+**Verdict: still no entry, and now for a measured reason that covers the table
+rather than a slot.** `SteamIdOverride` on Windows needs `crates/host-windows` to
+read `CUser`'s field some other way; the anchor question cannot be answered by this
+corpus on either build.
+
+## 3. `RegisterJsMethod` — anchored, from the registration map back to its caller
+
+Fifth pass searched for the string and stopped: neither image has
+`RegisterJsMethod` or `RegisterJSMethod`. Working back from the *container* instead
+finds it. Both builds agree at every step.
+
+**The string that exists is a log tag, not the method.** The only `RegisterJS…`
+byte sequence in either image is inside `CreateSharedJSContext:RegisterJSMethods`
+(`0xdea140` public / `0xe24ee8` beta, `SteamUI.dll`). It has exactly one reference,
+at `0x687322` / `0x6a31e7`, and that reference is a severity-5 argument to the same
+logging thunk the sibling tag `CreateSharedJSContext:BuildStartURL` uses — a
+`DCHECK` message, which is why searching for it never yields a function.
+
+**The containers are real and their type names pin the value.** `.data` carries
+`JSMethodRegistration_t@CHTMLWindow`, the map
+`CUtlHashMap<CUtlString, JSMethodRegistration_t@CHTMLWindow, CDefEquals<CUtlString>,
+HashFunctor<CUtlString>, StringView>`, the interface `IJSMethodCallHandler`, and
+five `CJSMethodCallHandler<…>` instantiations. Following MSVC RTTI through the
+32-bit-RVA `COL` layout gives vtables for the handler classes and for
+`CHTMLWindow` (`0xcebed0` + `0xcec028` public, 42 + 64 slots; `0xd234a0` +
+`0xd235f8` beta), and **no** `COL` for the map type or for
+`JSMethodRegistration_t` — those are the containers, and neither has a vtable,
+which is the fifth pass's finding restated from the RTTI side.
+
+**The registrar is `CHTMLWindow`'s slot 6, and it is virtual.** Each site that
+constructs a `CJSMethodCallHandler<CHTMLWindow, …>` (public `0x2076f5`,
+`0x20c547`) then registers it with the same virtual call:
+
+```
+mov  rdx,<name string>        ; "Browser.RegisterForOpenNewTab", "Browser.RegisterForGestureEvents"
+mov  r9d,0x2                  ; flags
+mov  r8,<new handler>         ; the CSmartPtr just built
+mov  rcx,<CHTMLWindow *>      ; this
+mov  rax,[rcx]
+call qword ptr [rax+0x30]     ; slot 6
+```
+
+Slot 6 is `0x20d430` (public) / `0x218ef0` (beta), both `.pdata` functions of
+exactly **830 bytes**, and their bodies are the same hash-map insert: bucket count
+`-1` from `[map+0x10]`, bucket array `[map]`, `0xffffffff` empty sentinel, node pool
+`[map+0x30]` with node stride `0x28`, key hash by `call 0xc54ea0` then the mix at
+`0x8841f0` (seed `0x417`), key compare through `0xc54e20` against the empty
+`CUtlString` sentinel, and on insert `mov [node+0x8],handler` /
+`mov [node+0x10],flags`. The map is at `this+0xa0` in public, `this+0x98` in beta.
+Four arguments — `(this, name, handler, i32 flags)` — which is byte-for-byte the
+Linux detour's `RegisterJsMethodFn`.
+
+| | public | publicbeta |
+| --- | --- | --- |
+| `CHTMLWindow` slot 6 | `0x20d430` | `0x218ef0` |
+| `.pdata` extent | 830 B | 830 B |
+| gate | `verified` | `verified` |
+| corpus match count | 1 | 1 |
+| map member | `this+0xa0` | `this+0x98` |
+
+Both corpus files gained one entry; each build's pattern carries its own map
+displacement (the only byte that differs), which is the same policy the
+`CNetPacket::Alloc` pair already follows:
+
+```
+[steamui."RegisterJsMethod"]
+pattern = "48 89 5C 24 18 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40 4C 8D B1 A0 00 00 00 41 8B F9 41 83 7E 44 00 4D 8B E0"   # public
+pattern = "48 89 5C 24 18 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40 4C 8D B1 98 00 00 00 41 8B F9 41 83 7E 44 00 4D 8B E0"   # publicbeta
+```
+
+`vapor-forge-pattern-mine --verify` on the two `steamui` corpus files: 8 public
+patterns and 6 publicbeta patterns resolve, every one `verified`.
+
+**What is measured and what is inferred.** Measured: the slot, the RTTI chain, the
+map insert, the `(name, handler, flags)` call with a `CUtlString`/`char *` key at
+two construction sites, the extent and the gate verdict, in both builds. Inferred:
+the `RegisterJsMethod` *name* for that body — neither image carries it, and the
+inference rests on the shape (a named registration into
+`CUtlHashMap<CUtlString, JSMethodRegistration_t>`) plus the argument list the Linux
+detour already documents. What would overturn it: a caller passing that slot
+something other than `(name, handler, flags)`, or a second string-keyed map with
+the same insert shape. What a live client would show: a breakpoint on
+`0x20d430` firing with `rdx` = `"Browser.*"` during `CreateSharedJSContext`.
+
+## What the two host-side decisions still need
+
+Nothing here changes `crates/host-windows`: `CUser::GetSteamID` is still
+`replacement_address(..).is_none()` (no anchor is possible through this gate), and
+`RegisterJsMethod` now resolves through the corpus, so the host's
+`replacement_address("RegisterJsMethod").is_none()` assertion and the
+`ConflictUiBridge` availability reason in `crates/host-windows/src/hooks/mod.rs`
+are upstream's to update — this branch is corpus-only.

@@ -614,6 +614,7 @@ mod tests {
             file_offset: 0,
             vaddr: 0x1000,
             bits: 64,
+            container: vapor_forge_patterns::scan::Container::Pe,
         };
         assert!(matches!(
             mine(&segment, &[pattern("DE AD BE EF")], 32),
