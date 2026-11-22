@@ -190,6 +190,11 @@ mod tests {
     fn our_own_injection_is_never_left_labelled_family_shared() {
         let app = AppId(731);
         let state = state_with(config_with(&[app.0]), Vec::new());
+        // The name of this test is the precondition: the app really is in pkg0
+        // because of us. Without this the decision sees `injected_by_us == false`
+        // and `provenance` answers from the observed license bits instead, which
+        // is a different row of the table (`a_controlled_app_is_granted_ownership…`).
+        state.package().record_injected(&[app]);
         apps::record_actual_ownership(app, true);
         apps::record_family_shared(app, true);
         // No lender is recorded, so the provenance fix classifies this as our
@@ -207,6 +212,7 @@ mod tests {
             !record.is_family_shared(),
             "an ingested title never reads as borrowed"
         );
+        state.package().record_injected(&[]);
         apps::record_family_shared(app, false);
         apps::record_actual_ownership(app, false);
     }

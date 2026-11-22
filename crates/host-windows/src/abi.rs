@@ -29,6 +29,7 @@
 
 pub mod cloud;
 pub mod depot;
+pub mod netpacket;
 pub mod ownership;
 pub mod package;
 pub mod ticket;

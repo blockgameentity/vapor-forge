@@ -16,6 +16,7 @@
 //! | [`depot`] | `GetDecryptionKey` | yes / yes |
 //! | [`ticket`] | `CUser::GetAppTicket` | **no / no** — body written, cannot install |
 //! | [`cloud_http`] | `CloseAppCloud` | yes / yes |
+//! | [`netpacket`] | `CCMInterface::RecvPkt` | yes / yes |
 //! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
 //!
 //! The rows that carry an anchor gap are listed rather than hidden: `install::deps`
@@ -46,6 +47,7 @@ pub mod dlc;
 pub mod family_play;
 pub mod launch_env;
 pub mod legacy_cdkey;
+pub mod netpacket;
 pub mod original;
 pub mod ownership;
 pub mod package;
@@ -91,6 +93,7 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (ui::overview::SYMBOL, ui::overview::address),
     (ui::snapshot::SYMBOL, ui::snapshot::address),
     (ui::change::SYMBOL, ui::change::address),
+    (netpacket::SYMBOL, netpacket::address),
 ];
 
 /// The resolved symbol → body table, as the installer and the plan filter need it.
@@ -136,6 +139,18 @@ mod tests {
                 "{symbol} has a body but is not in REPLACEMENTS"
             );
         }
+    }
+
+    #[test]
+    fn the_dispatch_body_is_registered_under_the_real_symbol() {
+        // `res/patterns/win64/VTABLE-REPORT.md` §3 refutes `CNetPacket::Dispatch`
+        // as a name: the dispatch is `CCMInterface` slot 3.
+        assert_eq!(netpacket::SYMBOL, "CCMInterface::RecvPkt");
+        assert_eq!(
+            replacement_address("CCMInterface::RecvPkt"),
+            Some(netpacket::address())
+        );
+        assert!(replacement_address("CNetPacket::Dispatch").is_none());
     }
 
     #[test]

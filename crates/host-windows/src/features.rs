@@ -43,7 +43,7 @@ mod settings;
 #[cfg(test)]
 mod tests;
 
-pub use achievements::AchievementSettings;
+pub use achievements::{decide_rebuild, AchievementSettings, RebuildPlan, RebuildRequest};
 pub use cloud::{plan_cloud, CloudBackend, CloudDecision, CloudMode, CloudPlan, CloudSettings};
 pub use depotcache::{
     preseed_wanted, DepotCacheEntry, DepotCachePorts, DepotCacheReport, DepotCacheSettings,

@@ -38,7 +38,13 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     ("IPCProcessMessage", &[Capability::CmInterception]),
     ("BBuildAndAsyncSendFrame", &[Capability::CmInterception]),
     ("GetPipeClient", &[Capability::CmInterception]),
-    ("CNetPacket::Dispatch", &[Capability::CmInterception]),
+    // The dispatch site the capability actually needs. The previous name here was
+    // `CNetPacket::Dispatch`, which `VTABLE-REPORT.md` §3 refutes: the packet
+    // classes have no dispatch slot and the table lives at `CCMInterface` slot 3.
+    (
+        "CCMInterface::RecvPkt",
+        &[Capability::CmInterception, Capability::RequestCodes],
+    ),
     // SteamUI. Each body owns exactly one capability, so a missing library
     // anchor costs one library feature rather than the whole batch.
     ("ShouldShowAppInLibrary", &[Capability::LibraryUi]),
@@ -80,6 +86,19 @@ mod tests {
     #[test]
     fn unknown_symbols_have_no_dependency() {
         assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
+    }
+
+    #[test]
+    fn the_dispatch_site_gates_interception_and_request_codes() {
+        // The body reads the packet and, when the layout exists, answers a
+        // request code: both capabilities depend on the same symbol. The refuted
+        // name must not be mapped, or a corpus that never resolves it would look
+        // like a dependency the install pass can satisfy.
+        assert_eq!(
+            capabilities_for_symbol("CCMInterface::RecvPkt"),
+            &[Capability::CmInterception, Capability::RequestCodes]
+        );
+        assert!(capabilities_for_symbol("CNetPacket::Dispatch").is_empty());
     }
 
     #[test]

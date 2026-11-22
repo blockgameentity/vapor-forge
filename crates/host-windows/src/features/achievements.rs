@@ -10,9 +10,18 @@
 //! was unreachable: the flag stayed off no matter what the user configured.
 //! [`apply`] is now the only place the host writes it, and only when the
 //! `achievements` capability is enabled.
+//!
+//! [`rebuild`] is the other half: the decision that would answer a stats reply with
+//! a locally rebuilt payload. It is decision-only — the win64 corpus anchors no
+//! stats symbol, so there is nothing to install a body at — and it calls the
+//! feature's own `rebuild_local_achievements_if_enabled` rather than a copy of it.
 
 use crate::features::report::FeatureState;
 use vapor_forge_features::achievements::{local_rebuild_enabled, set_local_rebuild};
+
+pub mod rebuild;
+
+pub use rebuild::{counts as rebuild_counts, decide as decide_rebuild, RebuildPlan, RebuildRequest};
 
 /// The flag the host resolved from config.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -26,6 +26,7 @@ use vapor_forge_features::ticket::TicketCache;
 use crate::capability::{Capability, Gate};
 use crate::features::{CloudPlan, IdentitySettings};
 use crate::hooks::depot_store::DepotPlan;
+use crate::hooks::netpacket::ledger::Ledger as NetPacketLedger;
 
 /// Everything a hook body may consult. Immutable except for the gate and the
 /// interior state of the feature objects.
@@ -61,6 +62,12 @@ pub struct HostState {
     depot_keys: HashMap<DepotId, Vec<u8>>,
     /// The per-game SteamID overrides, config and script state merged.
     identity: IdentitySettings,
+    /// What the CM dispatch hook saw, bounded and read-only once recorded.
+    ///
+    /// A hook body runs on Steam's networking thread, so the record is a fixed
+    /// ring behind one mutex rather than anything that grows with traffic; see
+    /// [`crate::hooks::netpacket::ledger`].
+    netpacket: NetPacketLedger,
 }
 
 impl HostState {
@@ -85,6 +92,7 @@ impl HostState {
             cloud: CloudPlan::default(),
             depot_keys: HashMap::new(),
             identity: IdentitySettings::default(),
+            netpacket: NetPacketLedger::new(),
         }
     }
 
@@ -180,6 +188,11 @@ impl HostState {
     /// The resolved per-game SteamID overrides.
     pub fn identity_settings(&self) -> &IdentitySettings {
         &self.identity
+    }
+
+    /// What the CM dispatch hook recorded, for diagnostics.
+    pub fn netpacket(&self) -> &NetPacketLedger {
+        &self.netpacket
     }
 
     /// The Denuvo lease this process holds, if `[ticket] denuvo_mode` asked for

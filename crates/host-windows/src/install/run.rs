@@ -94,6 +94,11 @@ pub fn run(
         }
     };
     let outcome = install_plan(&plan, module_base, installer, &mut gate);
+    // The dispatch body is installable, but answering a request code needs a
+    // packet layout this corpus does not anchor. Say so once, here, off the hook
+    // path: a body cannot report a capability, and a report that kept
+    // `request-codes` enabled would claim a round trip the host cannot serve.
+    crate::hooks::netpacket::availability::apply(&mut gate);
     RunReport {
         fingerprint,
         plan: Some(plan),
