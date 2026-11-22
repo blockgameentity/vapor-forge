@@ -7,6 +7,12 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 
 | area | state | where |
 | --- | --- | --- |
+| `.pdata` — one definition, anchor body gate | done | `crates/patterns/src/pdata*`, `--strict` anchor check in the miner |
+| `hook-engine` builds for Windows (VirtualProtect backend) | done | `crates/hook-engine/src/protect*` |
+| trampoline patch writer (instruction-boundary, relocatable-only) | done | `crates/host-windows/src/install/patch.rs` + `installer.rs` |
+| provider failover opt-in, dependency-aware depot closure | done | `crates/features/src/{request_code,manifest}*`, `crates/config` |
+| achievement rebuild from local definitions | done | `crates/features/src/achievements*` |
+| vtable enumerator + slot evidence | done, **1 candidate only** | `crates/patterns/src/vtable_pe*`, `res/patterns/win64/VTABLE-REPORT.md` |
 | PE scanning (container-agnostic engine) | done | `crates/patterns/src/pe_image.rs`, `scan.rs` (`CodeSegment`, `scan_code_segment`) |
 | `.pdata` function table, anchors, cross-build shape match | done | `crates/patterns/src/bin/vapor-forge-pe-functions.rs` |
 | corpus miner (hints → unique wildcard sigs, `--verify`) | done | `crates/patterns/src/bin/vapor-forge-pattern-mine.rs` |
@@ -21,7 +27,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 ## Verification (all run on Linux, no Windows box)
 
 ```sh
-cargo test --workspace                                  # 946 passed, 0 failed
+cargo test --workspace                                  # 1017 passed, 0 failed
 cargo clippy --workspace --all-targets -- -D warnings    # clean
 cargo check --workspace --all-targets                    # clean
 cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok
@@ -33,16 +39,20 @@ scripts/check-egress.sh                                  # ok
 
 ## Known limits
 
-- The Win32 detour writer patches a 12-byte absolute jump with **no trampoline**,
-  so a replacement cannot call the original yet, and it does not verify that the
-  patch stays inside the target function.
-- `hook-engine` does **not** build for Windows (`libc::mprotect`, `sysconf`,
-  `PROT_*` unconditionally; `pic_thunk.rs` is 32-bit ELF repair). The
-  `DetourInstaller` trait is the seam; the engine needs a page-protection
-  abstraction and real trampolines.
+- **Nothing has run inside a live Windows Steam client.** Every behavioural claim
+  below the planner is fake-installer or synthetic-PE tested; cross-compilation
+  proves types, not behaviour.
+- `hook-engine` builds for Windows now, but its `retour`-based writer still
+  targets the ELF layouts the Linux host needs. The `DetourInstaller` trait is
+  the seam that the real Windows writer uses; unifying the two is future work.
+- Of the four underived symbols, only `CUser::GetSubscribedApps` has a candidate
+  (CUser vtable slot 183, **unconfirmed**). The other three have none
+  (`res/patterns/win64/VTABLE-REPORT.md`).
+- Phases 4 and 5 are untouched: Denuvo/ticket/family-share semantics, cloud and
+  identity parity on Windows, and the Millennium UI unification.
 - Capabilities whose symbol is simply absent from a present corpus stay enabled;
   only unresolved/failed symbols disable dependents.
 - No Windows runtime test: cross-compilation and fake-installer tests only.
 - Windows corpus covers 14/26 (steamclient) and 7/10 (steamui) symbols on public.
   The remainder were never published as hints; behavioural probing did not
-  identify them (`PROBE-REPORT.md`).
+  identify them (`PROBE-REPORT.md`), and vtable anchoring found one candidate.
