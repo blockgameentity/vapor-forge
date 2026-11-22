@@ -69,7 +69,7 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
     }
     let Some(geometry) = state.reply_geometry() else {
         return Prepared {
-            observation: observation(eresult, gate, ReplyOutcome::NoGeometry(geometry::PENDING)),
+            observation: observation(eresult, gate, ReplyOutcome::NoGeometry(geometry::NO_GEOMETRY)),
             swap: None,
         };
     };
@@ -102,7 +102,8 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
     let app_id = match reply::app_id(&shape) {
         Ok(app_id) => app_id,
         Err(blocker) => {
-            remember_schema(state, &shape, 0);
+            // No app means no key to remember the schema under: a reply that names
+            // no app teaches this host nothing.
             return Prepared {
                 observation: observation(
                     eresult,
@@ -169,9 +170,7 @@ pub unsafe fn prepare(state: &HostState, this: *mut c_void, eresult: i32) -> Pre
 
 fn remember_schema(state: &HostState, shape: &Shape, app_id: u32) {
     if let Some(schema) = reply::schema(shape) {
-        if app_id != 0 {
-            state.achievement_schemas().remember(app_id, schema);
-        }
+        state.achievement_schemas().remember(app_id, schema);
     }
 }
 
@@ -220,12 +219,6 @@ pub fn describe(reply: &ReplyOutcome) -> String {
         }
         ReplyOutcome::Served { bytes } => format!("served a rebuilt reply of {bytes} bytes"),
     }
-}
-
-/// Kept public so a caller can tell a rewrite from a pass without matching every
-/// variant.
-pub fn rewrote(reply: &ReplyOutcome) -> bool {
-    matches!(reply, ReplyOutcome::Served { .. })
 }
 
 #[cfg(test)]

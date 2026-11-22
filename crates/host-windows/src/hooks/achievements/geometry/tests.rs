@@ -74,10 +74,29 @@ fn a_decoder_that_reports_a_pair_is_used_as_data() {
 }
 
 #[test]
-fn the_pending_decoder_says_so_instead_of_inventing_an_offset() {
-    assert_eq!(CorpusDecoder.decode(&segment(64), 0x40), Err(PENDING));
-    assert!(PENDING.contains("decode_job_reply"));
+fn the_corpus_decoder_refuses_nonsense_instructions_instead_of_inventing_an_offset() {
+    // 0x90 is `nop`: no `this` tracking, no reply load, so the patterns decoder
+    // refuses it by name rather than returning a made-up pair.
+    let reason = CorpusDecoder.decode(&segment(64), 0x40).unwrap_err();
+    assert!(!reason.is_empty(), "a refusal must carry its reason");
+    assert!(NO_GEOMETRY.contains("left exactly as Steam sent it"));
     let decoded = plan(Vec::new());
     let reason = decode_plan(&decoded, &[0x90; 4]).unwrap_err();
     assert!(reason.contains("could not be parsed"), "{reason}");
+}
+
+#[test]
+fn the_corpus_decoders_pair_is_converted_into_this_crates_geometry() {
+    // The two structs are the same shape by contract; the conversion is the only
+    // place the patterns crate's type meets this one.
+    let their = vapor_forge_patterns::job_fields::JobReply {
+        reply_field: 0x1b0,
+        body: 0x18,
+    };
+    let ours = JobReply {
+        reply_field: their.reply_field,
+        body: their.body,
+    };
+    assert_eq!(JobReply::new(ours.reply_field, ours.body), Some(ours));
+    assert_eq!(ours.size_offset(), 0x18 + core::mem::size_of::<usize>());
 }

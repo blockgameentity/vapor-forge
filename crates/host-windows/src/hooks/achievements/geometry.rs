@@ -20,13 +20,14 @@
 //! buffer-carrying object — which is why the length offset is derived as
 //! `size_of::<usize>()` from the pointer slot rather than named here.
 //!
-//! # Until the decoder lands
+//! # Who decodes, and when
 //!
-//! [`decode_plan`] reports [`PENDING`] and every reply rewrite therefore falls
-//! through with that reason logged. The merge of
-//! `patterns::job_fields` is a one-line change in [`CorpusDecoder::decode`], and
-//! nothing else in this crate has to move: the entry point the worker calls, the
-//! validation and the swap all take the decoder's output as data.
+//! [`CorpusDecoder`] calls `patterns::job_fields::decode_job_reply` with
+//! `CAPIJobRequestUserStats::BInit`'s offset in the module's code segment; the
+//! worker runs it once per module after the install batch and publishes the result
+//! in the host state. A decode that fails, or a pair [`JobReply::new`] refuses,
+//! leaves the state empty and every merge records [`NO_GEOMETRY`] with the worker's
+//! own reason in the log — never a guessed offset.
 
 use vapor_forge_patterns::scan::CodeSegment;
 
@@ -75,10 +76,12 @@ impl JobReply {
     }
 }
 
-/// Why no geometry was decoded.
-pub const PENDING: &str = "the stats-reply decoder (patterns::job_fields::decode_job_reply) is not in \
-     this build yet, so the reply body's two offsets are unknown and the reply is left as Steam \
-     sent it";
+/// Why a merge records no geometry: the worker decoded none for this build.
+///
+/// The worker logs the decoder's own reason (an unanchored `BInit`, an ambiguous
+/// reply field, a body outside the walk window), so this is the per-merge line.
+pub const NO_GEOMETRY: &str = "no stats-reply geometry was decoded for this Steam build, so the \
+     reply body's two offsets are unknown and the reply is left exactly as Steam sent it";
 
 /// A decoder that reads the reply geometry out of a module's code.
 ///
@@ -95,21 +98,28 @@ pub trait ReplyDecoder {
     ) -> Result<JobReply, &'static str>;
 }
 
-/// The decoder this build has: the corpus one when it is merged, [`PENDING`]
-/// before that.
+/// The decoder this build has: the corpus one, which reads the target's own code.
+///
+/// `patterns::job_fields::decode_job_reply` is the whole decode — it walks
+/// `CAPIJobRequestUserStats::BInit` (and the parser it hands `this` to), tracks
+/// which register carries `this`, takes the pointer load off it and requires the
+/// next use of that pointer to be the body `lea`. Nothing about the shape is
+/// repeated here: this impl converts their pair into this crate's and lets
+/// [`JobReply::new`] reject an unusable one.
 pub struct CorpusDecoder;
 
 impl ReplyDecoder for CorpusDecoder {
     fn decode(
         &self,
-        _segment: &CodeSegment<'_>,
-        _binit_offset: usize,
+        segment: &CodeSegment<'_>,
+        binit_offset: usize,
     ) -> Result<JobReply, &'static str> {
-        // The merge replaces this line with the corpus decode:
-        //
-        //     vapor_forge_patterns::job_fields::decode_job_reply(segment, binit_offset)
-        //         .and_then(|reply| JobReply::new(reply.reply_field, reply.body).ok_or(...))
-        Err(PENDING)
+        let reply =
+            vapor_forge_patterns::job_fields::decode_job_reply(segment, binit_offset)?;
+        Ok(JobReply {
+            reply_field: reply.reply_field,
+            body: reply.body,
+        })
     }
 }
 

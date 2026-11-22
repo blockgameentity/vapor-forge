@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use vapor_forge_config::RuntimeConfig;
 use vapor_forge_config::AppId;
 use vapor_forge_features::config_apply;
@@ -37,6 +37,7 @@ use crate::hooks::state::HostState;
 use crate::install::{DetourInstaller, RunReport};
 
 pub mod module;
+pub mod publish;
 
 /// One Steam module as the host found it: its file name, its load address in
 /// this process, and its bytes as shipped on disk.
@@ -112,65 +113,6 @@ impl HostOutcome {
 
     pub fn failed_modules(&self) -> usize {
         self.modules.iter().filter(|m| m.error.is_some()).count()
-    }
-}
-
-/// Decode the `CNetPacket` layout from this module's resolved symbols, once.
-///
-/// The state is published before the batch so hook bodies see the real config;
-/// the offsets only exist afterwards, so the layout is filled in here. A failure
-/// is a note, not an error: every message then records `NoLayout` and Steam keeps
-/// its own request-code round trip.
-fn publish_packet_layout(state: &HostState, report: &crate::install::RunReport, module: &[u8]) {
-    if state.layout().is_some() {
-        return;
-    }
-    let Some(plan) = report.plan.as_ref() else {
-        return;
-    };
-    match crate::hooks::netpacket::layout::decode_plan(plan, module) {
-        Ok(layout) => {
-            info!(
-                data = layout.data,
-                size = layout.size,
-                "packet layout decoded; request-code serving is possible"
-            );
-            state.set_layout(layout);
-        }
-        Err(error) => warn!(
-            error = error.as_str(),
-            "packet layout could not be decoded; messages are observed, never served"
-        ),
-    }
-}
-
-/// Decode the stats-reply geometry from this module's resolved symbols, once.
-///
-/// The sibling of [`publish_packet_layout`], and for the same reason: the geometry
-/// is a decode of the target's own code (`CAPIJobRequestUserStats::BInit`), it
-/// exists only after the install batch resolved the symbols, and a failure must
-/// leave the reply untouched rather than guess an offset. See
-/// [`crate::hooks::achievements::geometry`].
-fn publish_reply_geometry(state: &HostState, report: &crate::install::RunReport, module: &[u8]) {
-    if state.reply_geometry().is_some() {
-        return;
-    }
-    let Some(plan) = report.plan.as_ref() else {
-        return;
-    };
-    match crate::hooks::achievements::geometry::decode_plan(plan, module) {
-        Ok(reply) => {
-            info!(
-                reply_field = reply.reply_field,
-                body = reply.body,
-                "stats reply geometry decoded; the merge body can rewrite a reply"
-            );
-            state.set_reply_geometry(reply);
-        }
-        Err(reason) => debug!(
-            reason,
-            "stats reply geometry not decoded; the merge body stays observation-only"
-        ),
     }
 }
 
@@ -264,8 +206,8 @@ pub fn run(
         }
         let outcome = module::run_module(loaded, corpus_root.as_deref(), installer);
         if let Some(report) = &outcome.report {
-            publish_packet_layout(&state, report, &loaded.file);
-            publish_reply_geometry(&state, report, &loaded.file);
+            publish::packet_layout(&state, report, &loaded.file);
+            publish::reply_geometry(&state, report, &loaded.file);
             for (capability, reason) in report.gate.disabled() {
                 merged.disable(capability, reason.to_owned());
             }

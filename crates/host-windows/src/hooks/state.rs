@@ -24,7 +24,7 @@ use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
 use vapor_forge_features::ticket::TicketCache;
 
 use crate::abi::netpacket::Layout;
-use crate::capability::{Capability, Gate};
+use crate::capability::Gate;
 use crate::features::achievements::AchievementSettings;
 use crate::features::{CloudPlan, IdentitySettings};
 use crate::hooks::achievements::cache::SchemaCache as AchievementSchemaCache;
@@ -32,6 +32,8 @@ use crate::hooks::achievements::geometry::JobReply;
 use crate::hooks::depot_store::DepotPlan;
 use crate::hooks::netpacket::cache::CodeCache as RequestCodeCache;
 use crate::hooks::netpacket::ledger::Ledger as NetPacketLedger;
+
+pub mod access;
 
 /// Everything a hook body may consult. Immutable except for the gate and the
 /// interior state of the feature objects.
@@ -228,107 +230,6 @@ impl HostState {
     pub fn with_achievement_settings(mut self, achievements: AchievementSettings) -> Self {
         self.achievements = achievements;
         self
-    }
-
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.config
-    }
-
-    pub fn package(&self) -> &PackageState {
-        &self.package
-    }
-
-    pub fn family_settings(&self) -> FamilySettings {
-        self.family
-    }
-
-    /// The current account's Steam account id, or 0 when it is not known.
-    ///
-    /// The Windows host has no measured way to read it yet, so it is always 0.
-    /// `features::family::provenance::lender_account` treats 0 as "unknown", not
-    /// as a lender, so a family label is never invented from it.
-    pub fn self_account_id(&self) -> u32 {
-        0
-    }
-
-    pub fn controlled_apps(&self) -> &[AppId] {
-        &self.controlled
-    }
-
-    pub fn ticket_cache(&self) -> &TicketCache {
-        &self.ticket_cache
-    }
-
-    pub fn lua_tickets(&self) -> &HashMap<AppId, Vec<u8>> {
-        &self.lua_tickets
-    }
-
-    pub fn depot(&self) -> &DepotPlan {
-        &self.depot
-    }
-
-    /// The cloud plan resolved at start-up.
-    pub fn cloud(&self) -> &CloudPlan {
-        &self.cloud
-    }
-
-    /// The Lua-registered depot decryption keys.
-    pub fn depot_keys(&self) -> &HashMap<DepotId, Vec<u8>> {
-        &self.depot_keys
-    }
-
-    /// The resolved per-game SteamID overrides.
-    pub fn identity_settings(&self) -> &IdentitySettings {
-        &self.identity
-    }
-
-    /// The resolved `[achievements]` settings.
-    pub fn achievement_settings(&self) -> &AchievementSettings {
-        &self.achievements
-    }
-
-    /// What the CM dispatch hook recorded, for diagnostics.
-    pub fn netpacket(&self) -> &NetPacketLedger {
-        &self.netpacket
-    }
-
-    /// The Denuvo lease this process holds, if `[ticket] denuvo_mode` asked for
-    /// one.
-    pub fn authorisation(&self) -> Option<AuthorisationWindow> {
-        self.authorisation
-    }
-
-    /// Whether `capability` survived the install pass.
-    pub fn allows(&self, capability: Capability) -> bool {
-        self.gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_enabled(capability)
-    }
-
-    /// Snapshot of the gate, for the one feature pass that runs after install.
-    pub fn gate(&self) -> Gate {
-        self.gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// The install pass's reason, when `capability` was disabled by it.
-    pub fn disabled_reason(&self, capability: Capability) -> Option<String> {
-        self.gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .reason(capability)
-            .map(str::to_owned)
-    }
-
-    /// Replace the gate with the install pass's result.
-    pub fn set_gate(&self, gate: Gate) {
-        *self
-            .gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = gate;
     }
 }
 
