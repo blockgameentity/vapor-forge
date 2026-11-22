@@ -26,7 +26,7 @@ vapor-forge-core = { path = "../runtime-core" }
 vapor-forge-features = { path = "../features" }
 vapor-forge-scripting = { path = "../scripting" }
 iced-x86.workspace = true
-vapor-forge-patterns = { path = "../patterns", default-features = false }
+vapor-forge-patterns = { path = "../patterns", default-features = false, features = ["runtime-semantic"] }
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

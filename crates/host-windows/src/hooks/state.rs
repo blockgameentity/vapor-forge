@@ -23,6 +23,7 @@ use vapor_forge_features::package::PackageState;
 use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
 use vapor_forge_features::ticket::TicketCache;
 
+use crate::abi::netpacket::Layout;
 use crate::capability::{Capability, Gate};
 use crate::features::achievements::AchievementSettings;
 use crate::features::{CloudPlan, IdentitySettings};
@@ -76,6 +77,14 @@ pub struct HostState {
     /// ring behind one mutex rather than anything that grows with traffic; see
     /// [`crate::hooks::netpacket::ledger`].
     netpacket: NetPacketLedger,
+    /// The decoded `CNetPacket` field layout.
+    ///
+    /// Written once, after the install pass has resolved the three corpus
+    /// symbols — the state itself is published before any entry is patched, so
+    /// this is interior state like the gate. `None` means "no layout for this
+    /// build", which is what a message records as
+    /// [`crate::hooks::netpacket::decision::ServeBlocker::NoLayout`].
+    layout: RwLock<Option<Layout>>,
 }
 
 impl HostState {
@@ -102,7 +111,22 @@ impl HostState {
             identity: IdentitySettings::default(),
             achievements: AchievementSettings::default(),
             netpacket: NetPacketLedger::new(),
+            layout: RwLock::new(None),
         }
+    }
+
+    /// Publish the decoded packet layout. Idempotent: the first decode wins, so
+    /// a second module's pass cannot replace a layout a hook already read.
+    pub fn set_layout(&self, layout: Layout) {
+        let mut current = self.layout.write().unwrap_or_else(|error| error.into_inner());
+        if current.is_none() {
+            *current = Some(layout);
+        }
+    }
+
+    /// The packet layout this process decoded, if any.
+    pub fn layout(&self) -> Option<Layout> {
+        *self.layout.read().unwrap_or_else(|error| error.into_inner())
     }
 
     /// Attach the tickets the Lua scripts declared.

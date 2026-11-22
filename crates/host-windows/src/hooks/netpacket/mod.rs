@@ -71,6 +71,7 @@
 
 pub mod availability;
 pub mod classify;
+pub mod layout;
 pub mod decision;
 pub mod ledger;
 pub mod lookup;
@@ -125,7 +126,7 @@ fn observe(packet_is_null: bool) {
     let inputs = Inputs {
         cm_enabled: true,
         request_codes_enabled: state.allows(Capability::RequestCodes),
-        layout: None,
+        layout: state.layout(),
         emsg: None,
         target: None,
         cached: None,
