@@ -1,18 +1,25 @@
 //! Windows host for Vapor Forge.
 //!
-//! Phase 1 scope: module identity, capability gating and proxy export
-//! generation. Nothing here changes Steam's behaviour yet — the host only
-//! observes, decides which capabilities are available, and reports. That is
-//! deliberate: the degradation contract ("disable the failing capability with a
-//! reason, never brick the client") has to exist before any hook is installed.
+//! The host observes, decides which capabilities and host-agnostic features are
+//! available, and reports. That is deliberate: the degradation contract ("disable
+//! the failing capability with a reason, never brick the client") has to exist
+//! before any hook is installed.
+//!
+//! [`features`] is where parity with the Linux host lives: cloud redirection,
+//! per-game identity, depotcache pre-seed and the local achievement rebuild are
+//! driven from the host's resolved settings, each behind a trait so the decisions
+//! are testable without a live client. [`lifecycle`] composes the install pass and
+//! the feature pass into one report.
 //!
 //! The Windows-specific FFI is confined to [`inject`]; every other module is
 //! plain logic and is unit-tested on the build host, so the crate builds and
 //! tests on Linux as well as on `x86_64-pc-windows-gnu`.
 
 pub mod capability;
+pub mod features;
 pub mod inject;
 pub mod install;
+pub mod lifecycle;
 pub mod module;
 pub mod proxy;
 

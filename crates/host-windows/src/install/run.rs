@@ -3,12 +3,18 @@
 use std::path::Path;
 
 use crate::capability::{Capability, Gate};
+use crate::features::FeatureReport;
 use crate::module::ModuleIdentity;
 
 use super::installer::{DetourInstaller, Installed};
 use super::{corpus, install_plan, plan_batch, BatchPlan, Failure};
 
-/// Human-facing summary of one hook batch.
+/// Human-facing summary of one host run.
+///
+/// The install half is always present; `features` is filled in by
+/// [`crate::lifecycle::run_host`] (or by a caller that attached a
+/// [`FeatureReport`] itself), because the feature decisions need settings this
+/// install-only entry point does not take.
 #[derive(Clone, Debug)]
 pub struct RunReport {
     pub fingerprint: String,
@@ -16,11 +22,19 @@ pub struct RunReport {
     pub gate: Gate,
     pub installed: Vec<Installed>,
     pub failures: Vec<Failure>,
+    pub features: Option<FeatureReport>,
 }
 
 impl RunReport {
+    /// Attach the resolved features, so the report says which are active and why
+    /// the others are not.
+    pub fn with_features(mut self, features: FeatureReport) -> Self {
+        self.features = Some(features);
+        self
+    }
+
     /// Installed symbols, then disabled capabilities and why (via
-    /// [`Gate::report`]).
+    /// [`Gate::report`]), then the host features.
     pub fn report(&self) -> String {
         let mut out = format!(
             "Windows hook installation for {}:\n\n  installed: {}\n",
@@ -38,6 +52,10 @@ impl RunReport {
         }
         out.push('\n');
         out.push_str(&self.gate.report());
+        if let Some(features) = &self.features {
+            out.push('\n');
+            out.push_str(&features.report());
+        }
         out
     }
 }
@@ -71,6 +89,7 @@ pub fn run(
                 gate,
                 installed: Vec::new(),
                 failures: Vec::new(),
+                features: None,
             };
         }
     };
@@ -81,6 +100,7 @@ pub fn run(
         gate,
         installed: outcome.installed,
         failures: outcome.failures,
+        features: None,
     }
 }
 

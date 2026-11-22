@@ -9,6 +9,11 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 | --- | --- | --- |
 | `.pdata` — one definition, anchor body gate | done — canonical extents: 52,946 / 53,430 (steamclient public/beta), 40,826 / 41,159 (steamui) | `crates/patterns/src/pdata*`, `--strict` anchor check in the miner |
 | `hook-engine` builds for Windows (VirtualProtect backend) | done | `crates/hook-engine/src/protect*` |
+| Windows detour writer inside the engine (`writer::*`, prepare/enable/disable, restore on drop) | done; one planner, host re-exports it | `crates/hook-engine/src/writer*`, `crates/host-windows/src/install/patch.rs` |
+| tickets: ordered sources, authorisation window, Denuvo detection + override | done, flag-gated | `crates/features/src/ticket/*` |
+| family share: provenance, idempotent marker removal, concurrent-play decision | done, flag-gated | `crates/features/src/family/*` |
+| host features parity (cloud, identity, depotcache, achievements flag) | done | `crates/host-windows/src/features/*`, `lifecycle` |
+| UI split (render vs decide) documented | done | `[CT] docs/ui-split.md` |
 | trampoline patch writer (instruction-boundary, relocatable-only) | done | `crates/host-windows/src/install/patch.rs` + `installer.rs` |
 | provider failover opt-in, dependency-aware depot closure | done | `crates/features/src/{request_code,manifest}*`, `crates/config` |
 | achievement rebuild from local definitions | done | `crates/features/src/achievements*` |
@@ -27,7 +32,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 ## Verification (all run on Linux, no Windows box)
 
 ```sh
-cargo test --workspace                                  # 1016 passed, 0 failed
+cargo test --workspace                                  # 1134 passed, 0 failed
 cargo clippy --workspace --all-targets -- -D warnings    # clean
 cargo check --workspace --all-targets                    # clean
 cargo build -p vapor-forge-host-windows --target x86_64-pc-windows-gnu   # ok
@@ -42,14 +47,15 @@ scripts/check-egress.sh                                  # ok
 - **Nothing has run inside a live Windows Steam client.** Every behavioural claim
   below the planner is fake-installer or synthetic-PE tested; cross-compilation
   proves types, not behaviour.
-- `hook-engine` builds for Windows now, but its `retour`-based writer still
-  targets the ELF layouts the Linux host needs. The `DetourInstaller` trait is
-  the seam that the real Windows writer uses; unifying the two is future work.
+- `hook-engine` now owns one patch planner used by both hosts and a Windows
+  writer with a prepare/enable/disable state machine; what is still unproven is
+  any of it running in a real Windows Steam process.
 - Of the four underived symbols, only `CUser::GetSubscribedApps` has a candidate
   (CUser vtable slot 183, **unconfirmed**). The other three have none
   (`res/patterns/win64/VTABLE-REPORT.md`).
-- Phases 4 and 5 are untouched: Denuvo/ticket/family-share semantics, cloud and
-  identity parity on Windows, and the Millennium UI unification.
+- Phases 4 and 5 exist as gated semantics and host wiring; the Millennium UI
+  migration itself is documented (`[CT] docs/ui-split.md`) but not performed, so
+  the two UI stacks still coexist.
 - Capabilities whose symbol is simply absent from a present corpus stay enabled;
   only unresolved/failed symbols disable dependents.
 - No Windows runtime test: cross-compilation and fake-installer tests only.
