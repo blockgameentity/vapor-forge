@@ -27,7 +27,10 @@ use crate::abi::netpacket::Layout;
 use crate::capability::{Capability, Gate};
 use crate::features::achievements::AchievementSettings;
 use crate::features::{CloudPlan, IdentitySettings};
+use crate::hooks::achievements::cache::SchemaCache as AchievementSchemaCache;
+use crate::hooks::achievements::geometry::JobReply;
 use crate::hooks::depot_store::DepotPlan;
+use crate::hooks::netpacket::cache::CodeCache as RequestCodeCache;
 use crate::hooks::netpacket::ledger::Ledger as NetPacketLedger;
 
 /// Everything a hook body may consult. Immutable except for the gate and the
@@ -85,6 +88,25 @@ pub struct HostState {
     /// build", which is what a message records as
     /// [`crate::hooks::netpacket::decision::ServeBlocker::NoLayout`].
     layout: RwLock<Option<Layout>>,
+    /// The manifest request codes this process holds, keyed by `(depot, gid)`.
+    ///
+    /// The dispatch body reads it on Steam's networking thread, so it is a bounded
+    /// table behind one mutex and never dials: a provider fetch belongs on a
+    /// worker, and this host has none yet (see
+    /// [`crate::hooks::netpacket::cache`]).
+    request_codes: RequestCodeCache,
+    /// The stats-reply geometry the corpus decoder resolved, if it has landed.
+    ///
+    /// Written once per module after the install batch, like [`Self::layout`],
+    /// and read by the stats-merge body to find `*(this + reply_field) + body`.
+    reply: RwLock<Option<JobReply>>,
+    /// The stats schemas replies have carried, per app.
+    ///
+    /// The local achievement rebuild answers a reply that carries *no* schema, so
+    /// the definitions come from a schema observed earlier; the same table exists on
+    /// the Linux host (`client::achievement_local`). Bounded and lock-released on
+    /// every access (see [`crate::hooks::achievements::cache`]).
+    achievement_schemas: AchievementSchemaCache,
 }
 
 impl HostState {
@@ -112,6 +134,9 @@ impl HostState {
             achievements: AchievementSettings::default(),
             netpacket: NetPacketLedger::new(),
             layout: RwLock::new(None),
+            request_codes: RequestCodeCache::new(),
+            reply: RwLock::new(None),
+            achievement_schemas: AchievementSchemaCache::new(),
         }
     }
 
@@ -127,6 +152,30 @@ impl HostState {
     /// The packet layout this process decoded, if any.
     pub fn layout(&self) -> Option<Layout> {
         *self.layout.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The request codes this process holds.
+    pub fn request_codes(&self) -> &RequestCodeCache {
+        &self.request_codes
+    }
+
+    /// Publish the decoded stats-reply geometry. First decode wins, like
+    /// [`Self::set_layout`].
+    pub fn set_reply_geometry(&self, reply: JobReply) {
+        let mut current = self.reply.write().unwrap_or_else(|error| error.into_inner());
+        if current.is_none() {
+            *current = Some(reply);
+        }
+    }
+
+    /// The stats-reply geometry, when a decoder resolved it for this build.
+    pub fn reply_geometry(&self) -> Option<JobReply> {
+        *self.reply.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The stats schemas replies have carried, per app.
+    pub fn achievement_schemas(&self) -> &AchievementSchemaCache {
+        &self.achievement_schemas
     }
 
     /// Attach the tickets the Lua scripts declared.

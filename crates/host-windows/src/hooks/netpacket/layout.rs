@@ -48,6 +48,24 @@ pub fn decode(segment: &CodeSegment<'_>, offsets: [usize; 3]) -> Result<Layout, 
         .ok_or_else(|| format!("decoded layout is unusable: {api:?}"))
 }
 
+/// Decode one module's layout from its resolved corpus symbols and its bytes.
+///
+/// The whole decode, in one place, because two callers need it and they must not
+/// disagree: the worker publishes the layout for the hook bodies, and the
+/// single-module [`crate::install::run`] entry point needs it only to settle the
+/// `request-codes` capability. `Err` is a reason, never a panic — the caller
+/// either reports it or settles the capability with it.
+pub fn decode_plan(plan: &crate::install::BatchPlan, image: &[u8]) -> Result<Layout, String> {
+    let image = vapor_forge_patterns::pe_image::PeImage::parse(image)
+        .map_err(|error| format!("module image could not be parsed: {error}"))?;
+    let segment = image
+        .code_segment()
+        .map_err(|error| format!("module has no executable segment: {error}"))?;
+    let offsets = offsets(plan.resolved(), &segment)
+        .ok_or_else(|| "the corpus does not anchor the CNetPacket family".to_owned())?;
+    decode(&segment, offsets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +105,19 @@ mod tests {
         };
         let error = decode(&segment, [0, 1, 2]).expect_err("nonsense cannot decode");
         assert!(error.contains("packet decode failed"), "{error}");
+    }
+
+    #[test]
+    fn a_module_that_is_not_a_pe_image_is_reported_rather_than_decoded() {
+        let plan = crate::install::BatchPlan {
+            module: "steamclient".to_owned(),
+            code_vaddr: 0x1000,
+            symbols: vec![crate::install::SymbolPlan::Resolved {
+                name: "CNetPacket::Init".to_owned(),
+                offset: 0x10,
+            }],
+        };
+        let error = decode_plan(&plan, b"not a pe image").unwrap_err();
+        assert!(error.contains("could not be parsed"), "{error}");
     }
 }

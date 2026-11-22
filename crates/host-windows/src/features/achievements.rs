@@ -14,10 +14,11 @@
 //! [`rebuild`] is the other half: the decision that would answer a stats reply with
 //! a locally rebuilt payload. Both win64 stats-job sites are anchored
 //! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`), the merge now
-//! carries an **observation-only** body ([`crate::hooks::achievements`]) that
-//! forwards the call and reports what the decision answers, and
-//! `crate::abi::achievements` measures why the rebuild itself needs one more anchor
-//! (the response parser) before any body can serve it.
+//! carries the body ([`crate::hooks::achievements`]) that forwards the call and
+//! rewrites the reply body from a rebuilt payload. Whether it can rewrite depends on
+//! one corpus decode (`patterns::job_fields`, wired through
+//! [`crate::hooks::achievements::geometry`]); until that lands the body records the
+//! gap and forwards Steam's reply unchanged.
 
 use crate::features::report::FeatureState;
 use vapor_forge_features::achievements::{local_rebuild_enabled, set_local_rebuild};

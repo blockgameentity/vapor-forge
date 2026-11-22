@@ -27,6 +27,14 @@ vapor-forge-features = { path = "../features" }
 vapor-forge-scripting = { path = "../scripting" }
 iced-x86.workspace = true
 vapor-forge-patterns = { path = "../patterns", default-features = false, features = ["runtime-semantic"] }
+# The wire shapes the two serving bodies rewrite: the manifest request-code
+# request/response and the two stats replies. `prost` is the workspace pin the
+# protocol crate already uses, and the protocol crate is a workspace member
+# already in this crate's graph through `vapor-forge-features` — the two bodies
+# decode and re-encode Steam's own bodies, so they need the generated shapes
+# rather than a hand-rolled codec.
+vapor-forge-steam-protocol = { path = "../steam-protocol" }
+prost.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -128,19 +128,7 @@ fn publish_packet_layout(state: &HostState, report: &crate::install::RunReport, 
     let Some(plan) = report.plan.as_ref() else {
         return;
     };
-    let Ok(image) = vapor_forge_patterns::pe_image::PeImage::parse(module) else {
-        debug!("packet layout: module image could not be parsed");
-        return;
-    };
-    let Ok(segment) = image.code_segment() else {
-        debug!("packet layout: module has no executable segment");
-        return;
-    };
-    let Some(offsets) = crate::hooks::netpacket::layout::offsets(plan.resolved(), &segment) else {
-        debug!("packet layout: the corpus does not anchor the CNetPacket family");
-        return;
-    };
-    match crate::hooks::netpacket::layout::decode(&segment, offsets) {
+    match crate::hooks::netpacket::layout::decode_plan(plan, module) {
         Ok(layout) => {
             info!(
                 data = layout.data,
@@ -151,7 +139,37 @@ fn publish_packet_layout(state: &HostState, report: &crate::install::RunReport, 
         }
         Err(error) => warn!(
             error = error.as_str(),
-            "packet layout could not be decoded; messages stay observation-only"
+            "packet layout could not be decoded; messages are observed, never served"
+        ),
+    }
+}
+
+/// Decode the stats-reply geometry from this module's resolved symbols, once.
+///
+/// The sibling of [`publish_packet_layout`], and for the same reason: the geometry
+/// is a decode of the target's own code (`CAPIJobRequestUserStats::BInit`), it
+/// exists only after the install batch resolved the symbols, and a failure must
+/// leave the reply untouched rather than guess an offset. See
+/// [`crate::hooks::achievements::geometry`].
+fn publish_reply_geometry(state: &HostState, report: &crate::install::RunReport, module: &[u8]) {
+    if state.reply_geometry().is_some() {
+        return;
+    }
+    let Some(plan) = report.plan.as_ref() else {
+        return;
+    };
+    match crate::hooks::achievements::geometry::decode_plan(plan, module) {
+        Ok(reply) => {
+            info!(
+                reply_field = reply.reply_field,
+                body = reply.body,
+                "stats reply geometry decoded; the merge body can rewrite a reply"
+            );
+            state.set_reply_geometry(reply);
+        }
+        Err(reason) => debug!(
+            reason,
+            "stats reply geometry not decoded; the merge body stays observation-only"
         ),
     }
 }
@@ -247,6 +265,7 @@ pub fn run(
         let outcome = module::run_module(loaded, corpus_root.as_deref(), installer);
         if let Some(report) = &outcome.report {
             publish_packet_layout(&state, report, &loaded.file);
+            publish_reply_geometry(&state, report, &loaded.file);
             for (capability, reason) in report.gate.disabled() {
                 merged.disable(capability, reason.to_owned());
             }
@@ -256,6 +275,10 @@ pub fn run(
         }
         outcomes.push(outcome);
     }
+    // Settle `request-codes` on what was actually decoded, after every module has
+    // had its chance: a host that decoded no packet layout can never answer a code,
+    // and one that did keeps the capability for the moment a worker stores one.
+    crate::hooks::netpacket::availability::settle(&mut merged, state.layout());
     if corpus_root.is_none() {
         let reason = "no pattern corpus directory (win64/…) could be resolved next to the host";
         disable_all(&mut merged, reason);
