@@ -89,8 +89,16 @@ The **stats path turned out to be a job chain, not a per-stat writer**:
 can install. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
-**C. The achievements rebuild has no independent source yet — and cheesetool is not
-it.** CT owns manifests, depot keys, Lua, Hubcap and LuaTools auth; it holds no
+**C. Achievements: the source is the user, not a data feed.** The rebuild used to
+re-derive Steam's own values (definitions from the schema, unlocks from the reply),
+which is why it was inert. It now composes **definitions (schema) → Steam's own
+unlock map → Lua intent on top**, where intent comes from the new binding
+`setachievement(appid, key, true|false|unixTime)`. That is the same authoring
+surface OST/HYJ use, needs no external data, and makes
+`[achievements] local_rebuild = true` safe: with no override the composed map equals
+Steam's and the reply is left byte-identical.
+
+**C2. cheeseetool is not the source.** CT owns manifests, depot keys, Lua, Hubcap and LuaTools auth; it holds no
 achievement schema and fetches none (checked: no `GetSchemaForGame`, no schema
 store, nothing under `src/` or `cheesetool-sourcer`). Making it the source would
 mean either handing it the same `appcache/stats/UserGameStatsSchema_*.bin` files VF
