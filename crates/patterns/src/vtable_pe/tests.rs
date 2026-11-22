@@ -21,7 +21,7 @@ pub fn va(rva: u32) -> u64 {
 
 /// Minimal PE32+ image with three sections. `pdata` entries are
 /// `(begin, end)`; an empty list still produces the section, but a zero-size
-/// exception directory (see [`Functions::read`]).
+/// exception directory (see [`crate::pdata::parse`]).
 pub fn synthetic_pe(text: &[u8], rdata: &[u8], pdata: &[(u32, u32)]) -> Vec<u8> {
     const PE_OFF: usize = 0x80;
     const OPTIONAL_SIZE: usize = 0xF0;
@@ -131,7 +131,7 @@ fn enumerates_a_valid_three_slot_table() {
     put_qword(&mut rdata, 0x20, va(0x1030));
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
 
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
     assert_eq!(enumeration.tables.len(), 1);
@@ -169,7 +169,7 @@ fn rejects_a_table_containing_an_out_of_text_pointer() {
     put_qword(&mut rdata, 0x28, va(0x1030));
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
     // The two pointers after the data pointer are a real table; the single
     // pointer before it is not.
@@ -196,7 +196,7 @@ fn duplicate_tables_sharing_a_pointer_are_both_enumerated() {
     put_u32(&mut rdata, 0x30, 0); // not a COL signature
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
 
     let bases: Vec<u32> = enumeration.tables.iter().map(|t| t.base_rva).collect();
@@ -217,7 +217,7 @@ fn rejects_a_table_whose_length_is_implausible() {
     }
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
     assert!(enumeration.tables.is_empty());
     assert_eq!(
@@ -237,7 +237,7 @@ fn rejects_a_single_pointer_run_and_ignores_data_pointers() {
     put_qword(&mut rdata, 0x10, 0); // null: not a pointer at all
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
     assert!(enumeration.tables.is_empty());
     assert_eq!(
@@ -263,7 +263,7 @@ fn reads_the_rtti_class_from_the_qword_before_the_table() {
     put_qword(&mut rdata, 0x58, va(0x1020));
     let bytes = synthetic_pe(&[0x90; 0x40], &rdata, &entries_1010_1020_1030());
     let image = parse(&bytes);
-    let functions = Functions::read(&image, &bytes).expect("pdata");
+    let functions = crate::pdata::parse(&image, &bytes).expect("pdata");
     let enumeration = enumerate(&image, &bytes, &functions).expect("enumerate");
 
     let table = enumeration

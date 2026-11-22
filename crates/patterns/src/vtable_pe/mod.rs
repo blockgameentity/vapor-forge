@@ -24,12 +24,10 @@
 use crate::pe_image::PeImage;
 
 pub mod cross_build;
-pub mod functions;
 pub mod rtti;
 pub mod scan;
 pub mod structure;
 
-pub use functions::Functions;
 pub use scan::enumerate;
 
 /// A run of fewer consecutive function pointers than this is not a table.
