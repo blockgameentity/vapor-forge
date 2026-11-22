@@ -10,6 +10,7 @@ use vapor_forge_patterns::registry::PatternRegistry;
 use vapor_forge_patterns::work_item_site::WorkItemSite;
 use vapor_forge_steam_native_abi::cnet_packet;
 
+use super::cxx_rtti::{CxxVtable, TypeInfo};
 use crate::netpacket::SendFrameDecision;
 use crate::pattern_resolver::CodeRegion;
 use vapor_forge_hook_engine::original::detour_or_return;
@@ -173,69 +174,77 @@ pub(crate) fn native_packet_functions_ready() -> bool {
         && PACKET_RELEASE_ADDR.load(Ordering::Acquire) != 0
 }
 
+const WORK_ITEM_SITE_NAME: &str = "CWebSocketConnection::PostDelayedCloseWorkItem";
+
 /// Read back the three build-specific values injection needs from Steam's own
 /// bare-`CWorkItem` post, and admit them only if they are consistent with the
 /// separately resolved enqueue function and with steamclient's own mappings.
+///
+/// Some builds' shapes of this site are short enough to match several places,
+/// so every match is decoded and checked; exactly one has to pass.
 fn resolve_work_item_site(
     registry: &PatternRegistry,
     code: &CodeRegion,
     add_work_item: Option<usize>,
 ) {
-    let Some(site) = super::install::resolve_address_from_registry(
-        registry,
-        code,
-        "CWebSocketConnection::PostDelayedCloseWorkItem",
-    ) else {
-        warn!("native-inject: work item post site is unresolved, dispatch stays off");
+    let Some(add_work_item) = add_work_item else {
+        warn!("native-inject: AddWorkItem is unresolved, dispatch stays off");
         return;
     };
-    let decoded = match vapor_forge_patterns::work_item_site::decode(
-        usize::BITS,
-        code.base,
-        code.bytes,
-        site,
-    ) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            warn!(error, "native-inject: work item post site did not decode");
-            return;
-        }
+    let candidates = work_item_site_candidates(registry, code);
+    if candidates.is_empty() {
+        warn!("native-inject: work item post site is unresolved, dispatch stays off");
+        return;
+    }
+    // Both decoded addresses are read or stored as pointers, so a decode that
+    // drifted into .text or out of the module has to be rejected before
+    // anything dereferences it. That is the failure a pinned RVA produced
+    // before these values were inferred. The pool slot lives in .bss, so the
+    // check has to reach past the module's named segments.
+    let data = vapor_forge_memory::find_proc_self_module_data("steamclient.so", MAX_MAPS_ENTRIES)
+        .unwrap_or_default();
+    let is_data = |address: usize| {
+        address % std::mem::align_of::<usize>() == 0
+            && data
+                .iter()
+                .any(|range| (range.base.0..range.end.0).contains(&address))
     };
-    if Some(decoded.add_work_item) != add_work_item {
+    let mut accepted = candidates.iter().filter_map(|&site| {
+        let offset = site.checked_sub(code.base)?;
+        vapor_forge_patterns::full_semantic::validate_live_pattern(
+            "steamclient",
+            std::mem::size_of::<usize>(),
+            WORK_ITEM_SITE_NAME,
+            code.bytes,
+            offset,
+        )
+        .ok()?;
+        let decoded =
+            vapor_forge_patterns::work_item_site::decode(usize::BITS, code.base, code.bytes, site)
+                .ok()?;
+        (decoded.add_work_item == add_work_item
+            && is_data(decoded.pool_slot)
+            && is_data(decoded.timer_vtable))
+        .then_some((site, decoded))
+    });
+    let Some((site, decoded)) = accepted.next() else {
         warn!(
-            decoded = format_args!("0x{:x}", decoded.add_work_item),
-            resolved = %format_resolved_addr(add_work_item),
-            "native-inject: the site's enqueue call disagrees with the resolved AddWorkItem"
+            candidates = candidates.len(),
+            "native-inject: no work item post site decoded consistently, dispatch stays off"
+        );
+        return;
+    };
+    let extra = accepted.count();
+    if extra != 0 {
+        warn!(
+            candidates = candidates.len(),
+            accepted = extra + 1,
+            "native-inject: work item post site is ambiguous, dispatch stays off"
         );
         return;
     }
-    // Both are read or stored as pointers, so a decode that drifted into .text
-    // or out of the module has to be rejected before anything dereferences it.
-    // That is the failure a pinned RVA produced before these values were
-    // inferred. The pool slot lives in .bss, so the check has to reach past the
-    // module's named segments.
-    let data = vapor_forge_memory::find_proc_self_module_data("steamclient.so", MAX_MAPS_ENTRIES)
-        .unwrap_or_default();
-    for (label, address) in [
-        ("pool slot", decoded.pool_slot),
-        ("timer vtable", decoded.timer_vtable),
-    ] {
-        let aligned = address % std::mem::align_of::<usize>() == 0;
-        if !aligned
-            || !data
-                .iter()
-                .any(|range| (range.base.0..range.end.0).contains(&address))
-        {
-            warn!(
-                label,
-                aligned,
-                address = format_args!("0x{address:x}"),
-                "native-inject: decoded address is not steamclient data"
-            );
-            return;
-        }
-    }
     info!(
+        candidates = candidates.len(),
         site = format_args!("0x{site:x}"),
         pool_slot = format_args!("0x{:x}", decoded.pool_slot),
         timer_vtable = format_args!("0x{:x}", decoded.timer_vtable),
@@ -246,6 +255,41 @@ fn resolve_work_item_site(
         "native-inject: work item post site decoded"
     );
     let _ = WORK_ITEM_SITE.set(decoded);
+}
+
+/// Every address the site's pattern shapes for this build match, before any
+/// semantic or decode check.
+fn work_item_site_candidates(registry: &PatternRegistry, code: &CodeRegion) -> Vec<usize> {
+    use vapor_forge_patterns::registry::FollowMode;
+
+    let Some(entry) = registry.get(WORK_ITEM_SITE_NAME) else {
+        warn!(hook = WORK_ITEM_SITE_NAME, "pattern not found in registry");
+        return Vec::new();
+    };
+    for variant in entry.variants() {
+        if variant.follow() != FollowMode::None {
+            warn!(
+                hook = WORK_ITEM_SITE_NAME,
+                "work item post site patterns must match the site directly"
+            );
+            continue;
+        }
+        let pattern = match vapor_forge_patterns::Pattern::parse(variant.pattern()) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                warn!(hook = WORK_ITEM_SITE_NAME, %error, "pattern parse failed");
+                continue;
+            }
+        };
+        let matches = pattern.find_all(code.bytes);
+        if !matches.is_empty() {
+            return matches
+                .into_iter()
+                .map(|offset| code.base + offset)
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn format_resolved_addr(addr: Option<usize>) -> String {
@@ -1047,17 +1091,22 @@ fn schedule_injection_drain() {
     }
 }
 
-static NATIVE_INJECT_VTABLE: NativeProbeWorkItemVtable = NativeProbeWorkItemVtable {
-    destroy: native_inject_noop,
-    deleting_destroy: native_inject_deleting_destroy,
-    pre_destroy: native_inject_true,
-    work_item_name: native_inject_work_item_name,
-    thread_process_name: native_inject_thread_process_name,
-    aux: native_inject_true,
-    execute: native_inject_execute,
-    slot_7: native_inject_noop,
-    slot_8: native_inject_true,
-};
+static NATIVE_INJECT_TYPE: TypeInfo = TypeInfo::new(c"N10VaporForge23NativeInjectionWorkItemE");
+
+static NATIVE_INJECT_VTABLE: CxxVtable<NativeProbeWorkItemVtable> = CxxVtable::new(
+    &NATIVE_INJECT_TYPE,
+    NativeProbeWorkItemVtable {
+        destroy: native_inject_noop,
+        deleting_destroy: native_inject_deleting_destroy,
+        pre_destroy: native_inject_true,
+        work_item_name: native_inject_work_item_name,
+        thread_process_name: native_inject_thread_process_name,
+        aux: native_inject_true,
+        execute: native_inject_execute,
+        slot_7: native_inject_noop,
+        slot_8: native_inject_true,
+    },
+);
 
 static NATIVE_INJECT_WORK_ITEM_NAME: &[u8] = b"VaporNativeInjectionWorkItem\0";
 static NATIVE_INJECT_THREAD_PROCESS_NAME: &[u8] = b"VaporNativeInjectionWorkItem::ThreadProcess\0";
@@ -1090,7 +1139,7 @@ impl NativeWorkItem {
         // was checked against item_size when the site decoded.
         unsafe {
             base.cast::<usize>()
-                .write_unaligned(&NATIVE_INJECT_VTABLE as *const _ as usize);
+                .write_unaligned(NATIVE_INJECT_VTABLE.address_point() as usize);
             base.add(site.refcount_offset)
                 .cast::<u32>()
                 .write_unaligned(1);

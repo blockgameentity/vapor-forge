@@ -8,6 +8,7 @@ pub(crate) mod client_id;
 pub(crate) mod cloud;
 pub(crate) mod cloud_http;
 pub(crate) mod current_app;
+pub(crate) mod cxx_rtti;
 pub(crate) mod depot;
 pub(crate) mod dlc;
 pub(crate) mod env;
@@ -36,6 +37,7 @@ pub(crate) fn reset_account_state() {
     steam_context::invalidate_identity();
     package::reset_account_state();
     install::reset_account_state();
+    crate::ui::install::reset_account_state();
     vapor_forge_features::apps::reset_account_state();
     playtime_downlink::reset_account_state();
     vapor_forge_features::rich_presence::reset_account_state();

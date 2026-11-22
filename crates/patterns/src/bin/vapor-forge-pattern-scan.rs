@@ -773,6 +773,7 @@ mod tests {
         code[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
 
+    /// The i686 header and body streaming consumers for one handler slot.
     fn place_http_download_consumer32(code: &mut [u8], offset: usize) {
         place_asm32(code, offset, |a| {
             a.mov(eax, dword_ptr(edx + 0x50))?;
@@ -783,19 +784,56 @@ mod tests {
             a.push(dword_ptr(ebx + 0x38))?;
             a.push(edx)?;
             a.push(eax)?;
-            a.call(dword_ptr(ecx + 0x18))
+            a.call(dword_ptr(ecx + 0x18))?;
+            a.ret()?;
+            a.mov(eax, dword_ptr(edx + 0x50))?;
+            a.mov(eax, dword_ptr(eax + 0x94))?;
+            a.test(eax, eax)?;
+            a.mov(ecx, dword_ptr(eax))?;
+            a.push(dword_ptr(ebp - 0x4c))?;
+            a.push(edx)?;
+            a.push(eax)?;
+            a.call(dword_ptr(ecx + 0x1c))?;
+            a.ret()
         });
     }
 
+    /// The x86_64 header and body streaming consumers and the request
+    /// constructor that clears the matching tail, as `http::decode_request64`
+    /// requires them.
     fn place_http_download_consumer64(code: &mut [u8], offset: usize) {
         place_asm64(code, offset, |a| {
+            let mut buffer_ctor = a.create_label();
+            let mut string_ctor = a.create_label();
             a.mov(rax, qword_ptr(rsi + 0x68))?;
             a.mov(rdi, qword_ptr(rax + 0xe0))?;
             a.test(rdi, rdi)?;
             a.mov(rax, qword_ptr(rsi + 0x70))?;
             a.mov(rdx, qword_ptr(rax + 0x50))?;
             a.mov(rax, qword_ptr(rdi))?;
-            a.call(qword_ptr(rax + 0x30))
+            a.call(qword_ptr(rax + 0x30))?;
+            a.ret()?;
+            a.mov(rax, qword_ptr(rsi + 0x68))?;
+            a.mov(rdi, qword_ptr(rax + 0xe0))?;
+            a.test(rdi, rdi)?;
+            a.mov(rax, qword_ptr(rdi))?;
+            a.mov(rdx, rbx)?;
+            a.call(qword_ptr(rax + 0x38))?;
+            a.ret()?;
+            a.lea(r13, ptr(rbx + 0x98))?;
+            a.pxor(xmm0, xmm0)?;
+            a.mov(rdi, r13)?;
+            a.movups(xmmword_ptr(rbx + 0x80), xmm0)?;
+            a.call(buffer_ctor)?;
+            a.lea(rdi, ptr(rbx + 0x88))?;
+            a.call(string_ctor)?;
+            a.ret()?;
+            a.set_label(&mut buffer_ctor)?;
+            a.mov(qword_ptr(rdi), 0)?;
+            a.movups(xmmword_ptr(rdi + 8), xmm0)?;
+            a.ret()?;
+            a.set_label(&mut string_ctor)?;
+            a.ret()
         });
     }
 
@@ -927,6 +965,216 @@ mod tests {
 
         assert!(http_request_job_start32_evidence(&code, start)
             .is_some_and(|evidence| evidence.is_complete()));
+    }
+
+    #[test]
+    fn http_consumer32_accepts_inline_headers_but_requires_the_same_handle() {
+        let consumers = |response_handle| {
+            let mut code = vec![0x90; 0x100];
+            place_asm32(&mut code, 0, |a| {
+                a.mov(eax, dword_ptr(edx + 0x50))?;
+                a.mov(eax, dword_ptr(eax + 0xa0))?;
+                a.mov(edi, dword_ptr(response_handle + 0x54))?;
+                a.mov(ebx, dword_ptr(eax))?;
+                a.lea(ecx, dword_ptr(edi + 0x38))?;
+                a.push(ecx)?;
+                a.push(edx)?;
+                a.push(eax)?;
+                a.call(dword_ptr(ebx + 0x18))?;
+                a.ret()?;
+                a.mov(eax, dword_ptr(edx + 0x50))?;
+                a.mov(eax, dword_ptr(eax + 0xa0))?;
+                a.mov(ecx, dword_ptr(eax))?;
+                a.push(dword_ptr(ebp - 0x4c))?;
+                a.push(edx)?;
+                a.push(eax)?;
+                a.call(dword_ptr(ecx + 0x1c))
+            });
+            code
+        };
+        assert_eq!(
+            vapor_forge_patterns::http::decode_request32(&consumers(edx))
+                .map(|layout| layout.download_handler),
+            Ok(0xa0)
+        );
+        assert!(vapor_forge_patterns::http::decode_request32(&consumers(esi)).is_err());
+    }
+
+    #[test]
+    fn package_tree32_requires_linked_root_and_nodes() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0, |a| {
+            a.mov(eax, dword_ptr(edx + 0xfc8))?;
+            a.cmp(eax, -1)?;
+            a.je(0x60)?;
+            a.mov(edi, dword_ptr(edx + 0xfdc))
+        });
+        assert!(has_x86_package_tree_lookup(&code));
+
+        place_asm32(&mut code, 11, |a| a.mov(edi, dword_ptr(esi + 0xfdc)));
+        assert!(!has_x86_package_tree_lookup(&code));
+    }
+
+    #[test]
+    fn diagnostic_flag32_tracks_the_loaded_pointer_until_its_test() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0, |a| {
+            a.mov(eax, dword_ptr(eax + 0xc44))?;
+            a.mov(eax, dword_ptr(eax))?;
+            a.test(esi, esi)?;
+            a.sete(cl)?;
+            a.test(eax, eax)
+        });
+        assert!(has_x86_diagnostic_flag_read(&code));
+
+        place_asm32(&mut code, 8, |a| a.xor(eax, eax));
+        assert!(!has_x86_diagnostic_flag_read(&code));
+    }
+
+    /// An i686 `CNetPacket::Alloc` body: lock the pool, fetch the allocator
+    /// either through a call or from a GOT-relative global, allocate and
+    /// construct. Addresses and immediates are placeholders.
+    fn packet_allocator32(allocator_from_global: bool, size: i32) -> Vec<u8> {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut pc_thunk = a.create_label();
+        let mut lock = a.create_label();
+        let mut allocator = a.create_label();
+        let mut construct = a.create_label();
+        a.push(esi).unwrap();
+        a.push(ebx).unwrap();
+        a.call(pc_thunk).unwrap();
+        a.add(ebx, 0x10_0000).unwrap();
+        a.sub(esp, 0x10).unwrap();
+        a.lea(eax, ptr(ebx + 0x2000)).unwrap();
+        a.push(eax).unwrap();
+        a.call(lock).unwrap();
+        if allocator_from_global {
+            a.mov(eax, dword_ptr(ebx + 0x800)).unwrap();
+            a.pop(edx).unwrap();
+            a.pop(ecx).unwrap();
+            a.mov(eax, dword_ptr(eax)).unwrap();
+            a.lea(ecx, ptr(ebx - 0x3000)).unwrap();
+        } else {
+            a.add(esp, 0x10).unwrap();
+            a.call(allocator).unwrap();
+            a.lea(ecx, ptr(ebx - 0x3000)).unwrap();
+            a.sub(esp, 8).unwrap();
+        }
+        a.mov(edx, dword_ptr(eax)).unwrap();
+        a.push(1).unwrap();
+        a.push(0).unwrap();
+        a.push(0x400).unwrap();
+        a.push(ecx).unwrap();
+        a.push(size).unwrap();
+        a.push(eax).unwrap();
+        a.call(dword_ptr(edx + 0x14)).unwrap();
+        a.add(esp, 0x14).unwrap();
+        a.push(eax).unwrap();
+        a.mov(esi, eax).unwrap();
+        a.call(construct).unwrap();
+        a.add(esp, 0x14).unwrap();
+        a.mov(eax, esi).unwrap();
+        a.pop(ebx).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+        for label in [&mut pc_thunk, &mut lock, &mut allocator, &mut construct] {
+            a.set_label(label).unwrap();
+            a.ret().unwrap();
+        }
+        a.assemble(0).unwrap()
+    }
+
+    #[test]
+    fn packet_allocator32_matches_both_allocator_lookup_forms() {
+        let patterns =
+            parse_toml_patterns(include_str!("../../../../res/patterns/x86.toml")).unwrap();
+        let entry = patterns
+            .iter()
+            .find(|(name, _)| name == "CNetPacket::Alloc")
+            .unwrap();
+        for (from_global, size) in [(false, 0x20), (true, 0x3c)] {
+            let mut code = vec![0x90; 0x20];
+            code.extend(packet_allocator32(from_global, size));
+            let result =
+                resolve_entry_group_with(&code, 32, &[PatternRef::from(entry)], None).unwrap();
+            assert_eq!(result.target_offset, 0x20);
+            assert_eq!(result.match_count, 1);
+        }
+    }
+
+    #[test]
+    fn steamui_run_frame64_requires_the_controller_tick() {
+        let mut code = vec![0x90; 0x120];
+        place_asm64(&mut code, 0x10, |a| {
+            let mut clock = a.create_label();
+            a.push(r15)?;
+            a.push(rbx)?;
+            a.sub(rsp, 0x38)?;
+            a.mov(rbx, rdi)?;
+            a.call(clock)?;
+            a.pxor(xmm1, xmm1)?;
+            a.pxor(xmm2, xmm2)?;
+            a.cvtsd2ss(xmm0, xmm0)?;
+            a.cvtss2sd(xmm2, xmm0)?;
+            a.cvtss2sd(xmm1, dword_ptr(rbx + 0x8a4))?;
+            a.comisd(xmm2, xmm1)?;
+            a.cvtss2sd(xmm1, dword_ptr(rbx + 0x10b0))?;
+            a.comisd(xmm2, xmm1)?;
+            a.ret()?;
+            a.set_label(&mut clock)?;
+            a.ret()
+        });
+        assert!(steamui_run_frame64_evidence(&code, 0x10).is_some_and(|e| e.is_complete()));
+
+        // The application's own tick keeps `this` elsewhere and compares a
+        // frame local instead of controller timestamps.
+        let mut other = vec![0x90; 0x120];
+        place_asm64(&mut other, 0x10, |a| {
+            a.push(rbp)?;
+            a.mov(rbp, rsp)?;
+            a.mov(rbx, rdi)?;
+            a.mov(rax, qword_ptr(rbx))?;
+            a.call(qword_ptr(rax + 0x28))?;
+            a.movsd_2(qword_ptr(rbp - 0x1238), xmm0)?;
+            a.comisd(xmm0, qword_ptr(rbp - 0x1238))?;
+            a.ret()
+        });
+        assert!(!steamui_run_frame64_evidence(&other, 0x10).is_some_and(|e| e.is_complete()));
+    }
+
+    #[test]
+    fn build_depot_dependency32_rejects_the_small_app_manager_virtual() {
+        // The steamrt spill of the eight arguments; the rest of the body is
+        // not modelled, so only the argument-form item is checked.
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0, |a| {
+            a.push(ebp)?;
+            a.mov(ebp, esp)?;
+            a.push(edi)?;
+            a.push(esi)?;
+            a.push(ebx)?;
+            a.sub(esp, 0x22Cu32)?;
+            a.mov(eax, dword_ptr(ebp + 0x08))?;
+            a.mov(esi, dword_ptr(ebp + 0x10))?;
+            a.mov(eax, dword_ptr(ebp + 0x14))?;
+            a.mov(eax, dword_ptr(ebp + 0x24))
+        });
+        let arg_form = |code: &[u8]| {
+            build_depot_dependency32_evidence(code, 0)
+                .is_some_and(|e| !e.missing.contains(&"known depot dependency arg form"))
+        };
+        assert!(arg_form(&code));
+
+        let mut small = vec![0x90; 0x80];
+        place_asm32(&mut small, 0, |a| {
+            a.push(ebp)?;
+            a.mov(ebp, esp)?;
+            a.sub(esp, 0x6Cu32)?;
+            a.mov(eax, dword_ptr(ebp + 0x08))?;
+            a.mov(ebx, dword_ptr(ebp + 0x10))?;
+            a.mov(esi, dword_ptr(ebp + 0x0C))
+        });
+        assert!(!arg_form(&small));
     }
 
     #[test]
@@ -1215,7 +1463,7 @@ mod tests {
             layout,
             AppOverviewChangeLayout {
                 app_overview_off: 0x10,
-                removed_appid_off: 0x1c,
+                removed_appid_off: 0x20,
             }
         );
     }
@@ -1235,9 +1483,21 @@ mod tests {
             layout,
             AppOverviewChangeLayout {
                 app_overview_off: 0x18,
-                removed_appid_off: 0x28,
+                removed_appid_off: 0x30,
             }
         );
+    }
+
+    #[test]
+    fn overview_change64_accepts_swapped_registers_but_not_unrelated_flags() {
+        let mut code = vec![0x90; 0x180];
+        place_asm64(&mut code, 0x20, |a| a.lea(rdi, qword_ptr(rbp + 0x18)));
+        place_asm64(&mut code, 0x30, |a| a.mov(byte_ptr(rbp + 0x40), 1));
+        place_asm64(&mut code, 0x40, |a| a.or(dword_ptr(rbp + 0x10), 1));
+        assert!(validate_build_complete_app_overview_change64(&code, 0).is_some());
+
+        place_asm64(&mut code, 0x40, |a| a.or(dword_ptr(rbx + 0x10), 1));
+        assert!(validate_build_complete_app_overview_change64(&code, 0).is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use tracing::{debug, error, info, warn};
@@ -9,11 +10,12 @@ use vapor_forge_features::package::ReloadDiff;
 use vapor_forge_patterns::registry::PatternRegistry;
 use vapor_forge_steam_native_abi::{
     package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
-    ProcessPendingLicenseUpdatesFn,
+    RemoveSiteLicensesFn,
 };
 use vapor_forge_steam_protocol::LicensedPackage;
 
 use crate::pattern_resolver::CodeRegion;
+use vapor_forge_patterns::appinfo_cache::{AppInfoLookup, TreeLayout};
 use vapor_forge_patterns::engine_work_item_site::EngineWorkItemSite;
 
 // ---------------------------------------------------------------------------
@@ -38,7 +40,7 @@ static WORK_ITEM_NAME: &[u8] = b"VaporPackageUpdate\0";
 // ---------------------------------------------------------------------------
 
 static mut FN_MARK_LICENSE: Option<MarkLicenseAsChangedFn> = None;
-static mut FN_PROCESS_UPDATES: Option<ProcessPendingLicenseUpdatesFn> = None;
+static mut FN_REMOVE_SITE_LICENSES: Option<RemoveSiteLicensesFn> = None;
 static mut FN_GROW: Option<CUtlMemoryGrowFn> = None;
 static mut FN_GET_PKG_INFO: Option<GetPackageInfoArchFn> = None;
 
@@ -54,6 +56,27 @@ static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Captured pkg0 PackageInfo pointer.
 static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// App-info cache lookup decoded from the license cache rebuild.
+static APPINFO_LOOKUP: OnceLock<AppInfoLookup> = OnceLock::new();
+/// Injected IDs moved from a pkg0's app list to its depot list, keyed by that
+/// pkg0's address. An account reset may keep the same pkg0 and its entries;
+/// entries for any other pkg0 are dropped when a new one is captured. Unloading
+/// an app removes the depot entry only when it was appended here.
+static MOVED_TO_DEPOTS: Mutex<BTreeMap<(usize, u32), DepotOrigin>> = Mutex::new(BTreeMap::new());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DepotOrigin {
+    Native,
+    Appended,
+}
+
+/// A pass moving unknown app IDs is queued on the engine thread.
+static RECLASSIFY_POSTED: AtomicBool = AtomicBool::new(false);
+/// Upper bound on red-black tree descent; the cache holds far fewer than 2^32 apps.
+const MAX_TREE_DEPTH: usize = 64;
+/// The Steam client app, whose app info is cached for every signed-in account.
+const STEAM_CLIENT_APP: u32 = 7;
 
 struct PendingUpdate {
     controlled: Vec<AppId>,
@@ -125,6 +148,8 @@ static UPDATE_DISPATCH: Mutex<UpdateDispatch> = Mutex::new(UpdateDispatch {
 
 struct InjectionResult {
     appended: Vec<AppId>,
+    /// IDs an earlier pass of this process already moved to pkg0's depots.
+    adopted: Vec<AppId>,
     complete: bool,
 }
 
@@ -132,7 +157,7 @@ pub(crate) struct SteamPackageAccess {
     pkg0: NonNull<u8>,
     cuser: NonNull<c_void>,
     mark_license: MarkLicenseAsChangedFn,
-    process_updates: ProcessPendingLicenseUpdatesFn,
+    remove_site_licenses: RemoveSiteLicensesFn,
     grow: CUtlMemoryGrowFn,
 }
 
@@ -145,10 +170,10 @@ impl SteamPackageAccess {
         }
         // SAFETY: initialization writes each slot before hooks are enabled and
         // never mutates it afterward.
-        let (mark_license, process_updates, grow) = unsafe {
+        let (mark_license, remove_site_licenses, grow) = unsafe {
             (
                 (*std::ptr::addr_of!(FN_MARK_LICENSE))?,
-                (*std::ptr::addr_of!(FN_PROCESS_UPDATES))?,
+                (*std::ptr::addr_of!(FN_REMOVE_SITE_LICENSES))?,
                 (*std::ptr::addr_of!(FN_GROW))?,
             )
         };
@@ -156,7 +181,7 @@ impl SteamPackageAccess {
             pkg0,
             cuser,
             mark_license,
-            process_updates,
+            remove_site_licenses,
             grow,
         })
     }
@@ -168,11 +193,19 @@ impl SteamPackageAccess {
     }
 
     fn publish_package_change(&self) {
+        // Marking pkg0 makes the changed-license set non-empty, so Steam's
+        // site-license sweep rebuilds the license cache and sends the license
+        // update notices without waiting for appinfo of every licensed ID.
         // SAFETY: the capability holds the current CUser and the
         // architecture-matched functions resolved before work is posted.
-        unsafe {
+        let rebuilt = unsafe {
             (self.mark_license)(self.cuser.as_ptr(), 0, true);
-            (self.process_updates)(self.cuser.as_ptr());
+            (self.remove_site_licenses)(self.cuser.as_ptr())
+        };
+        if rebuilt {
+            debug!("package: license cache rebuilt");
+        } else {
+            warn!("package: Steam did not rebuild the license cache");
         }
     }
 
@@ -181,11 +214,13 @@ impl SteamPackageAccess {
             debug!("package: no apps to inject");
             return InjectionResult {
                 appended: Vec::new(),
+                adopted: Vec::new(),
                 complete: true,
             };
         }
 
         let mut appended = Vec::new();
+        let mut adopted = Vec::new();
         let mut complete = true;
         for &app_id in app_ids {
             let raw_id = app_id.0;
@@ -193,7 +228,16 @@ impl SteamPackageAccess {
             if unsafe { self.app_ids().contains(&raw_id) } {
                 continue;
             }
+            if moved_to_depots().contains_key(&(self.pkg0.as_ptr() as usize, raw_id))
+                // SAFETY: as above, for the depot vector.
+                && unsafe { self.depot_ids().contains(&raw_id) }
+            {
+                crate::ui::install::forget_removal(app_id);
+                adopted.push(app_id);
+                continue;
+            }
             if self.append(raw_id) {
+                crate::ui::install::forget_removal(app_id);
                 appended.push(app_id);
             } else {
                 complete = false;
@@ -209,27 +253,71 @@ impl SteamPackageAccess {
                 "package: app IDs appended to pkg0"
             );
         }
-        InjectionResult { appended, complete }
+        InjectionResult {
+            appended,
+            adopted,
+            complete,
+        }
+    }
+
+    fn depot_ids(&mut self) -> &mut vapor_forge_steam_native_abi::CUtlVector<u32> {
+        // SAFETY: construction is restricted to the live Steam callback after
+        // pkg0 validation, and the returned borrow cannot outlive this access.
+        unsafe { &mut *package_info::depot_id_vec(self.pkg0.as_ptr()) }
     }
 
     fn append(&mut self, value: u32) -> bool {
-        // SAFETY: this capability owns the only mutable pkg0 access for the callback.
-        if unsafe { self.app_ids().try_append(value) } {
-            return true;
-        }
-
         let grow = self.grow;
-        let vec = self.app_ids();
-        // SAFETY: `vec` is Steam's live CUtlVector and `grow` is the matching
-        // CUtlMemory implementation resolved before hook activation.
-        unsafe {
-            grow(
-                &mut vec.m_memory as *mut vapor_forge_steam_native_abi::CUtlMemory<u32>
-                    as *mut c_void,
-                GROW_BATCH,
-            );
-            vec.try_append(value)
+        append_grown(self.app_ids(), grow, value)
+    }
+
+    fn append_depot(&mut self, value: u32) -> bool {
+        let grow = self.grow;
+        append_grown(self.depot_ids(), grow, value)
+    }
+
+    /// Move injected IDs the app-info cache marks unknown from the app list to
+    /// the depot list. Steam requests app info for every app-list ID and waits
+    /// for it before processing license updates, while depot-list IDs still
+    /// grant depot ownership through the license cache.
+    fn move_unknown_to_depots(&mut self, cache: &AppInfoCache, injected: impl Fn(u32) -> bool) {
+        let candidates: Vec<u32> = {
+            let apps = self.app_ids();
+            (0..apps.len())
+                // SAFETY: index is below the live vector length.
+                .map(|index| unsafe { *apps.get(index) })
+                // SAFETY: the cache was validated for this engine thread pass.
+                .filter(|&id| injected(id) && unsafe { cache.is_unknown(id) })
+                .collect()
+        };
+        let mut moved = Vec::new();
+        for id in candidates {
+            // SAFETY: the capability guarantees a live readable pkg0 vector.
+            let listed = unsafe { self.depot_ids().contains(&id) };
+            if !listed && !self.append_depot(id) {
+                error!(app_id = id, "package: failed to append to pkg0 depots");
+                continue;
+            }
+            // SAFETY: the capability guarantees a live writable pkg0 vector.
+            if unsafe { self.app_ids().find_and_fast_remove(&id) } {
+                let key = (self.pkg0.as_ptr() as usize, id);
+                if listed {
+                    moved_to_depots().entry(key).or_insert(DepotOrigin::Native);
+                } else {
+                    moved_to_depots().insert(key, DepotOrigin::Appended);
+                }
+                moved.push(id);
+            }
         }
+        if moved.is_empty() {
+            return;
+        }
+        self.publish_package_change();
+        info!(
+            moved = moved.len(),
+            sample = ?moved.iter().take(16).collect::<Vec<_>>(),
+            "package: app IDs Steam reports unknown moved to pkg0 depots"
+        );
     }
 
     fn apply_reload_diff(&mut self, diff: &ReloadDiff) -> ReloadDiff {
@@ -240,8 +328,14 @@ impl SteamPackageAccess {
 
         for &app_id in &diff.removals {
             let raw_id = app_id.0;
-            // SAFETY: the capability guarantees a live writable pkg0 vector.
-            if unsafe { self.app_ids().find_and_fast_remove(&raw_id) } {
+            // SAFETY: the capability guarantees live writable pkg0 vectors.
+            let removed = unsafe { self.app_ids().find_and_fast_remove(&raw_id) };
+            let origin = moved_to_depots().remove(&(self.pkg0.as_ptr() as usize, raw_id));
+            if origin == Some(DepotOrigin::Appended) {
+                // SAFETY: the capability guarantees a live writable pkg0 vector.
+                unsafe { self.depot_ids().find_and_fast_remove(&raw_id) };
+            }
+            if removed || origin.is_some() {
                 debug!(app_id = raw_id, "package: removed from pkg0");
                 crate::ui::install::queue_removal(app_id);
                 applied.removals.push(app_id);
@@ -250,12 +344,17 @@ impl SteamPackageAccess {
 
         for &app_id in &diff.additions {
             let raw_id = app_id.0;
-            // SAFETY: the capability guarantees a live readable pkg0 vector.
-            if unsafe { self.app_ids().contains(&raw_id) } {
+            // SAFETY: the capability guarantees live readable pkg0 vectors.
+            let present = unsafe { self.app_ids().contains(&raw_id) }
+                || (moved_to_depots().contains_key(&(self.pkg0.as_ptr() as usize, raw_id))
+                    // SAFETY: as above.
+                    && unsafe { self.depot_ids().contains(&raw_id) });
+            if present {
                 debug!(app_id = raw_id, "package: already in pkg0, skipping");
                 continue;
             }
             if self.append(raw_id) {
+                crate::ui::install::forget_removal(app_id);
                 debug!(app_id = raw_id, "package: added to pkg0");
                 applied.additions.push(app_id);
             } else {
@@ -272,6 +371,120 @@ impl SteamPackageAccess {
             self.publish_package_change();
         }
         applied
+    }
+}
+
+fn append_grown(
+    vec: &mut vapor_forge_steam_native_abi::CUtlVector<u32>,
+    grow: CUtlMemoryGrowFn,
+    value: u32,
+) -> bool {
+    // SAFETY: the caller holds the only mutable pkg0 access for the callback.
+    if unsafe { vec.try_append(value) } {
+        return true;
+    }
+    // SAFETY: `vec` is Steam's live CUtlVector<u32> and `grow` is the matching
+    // CUtlMemory implementation resolved before hook activation.
+    unsafe {
+        grow(
+            &mut vec.m_memory as *mut vapor_forge_steam_native_abi::CUtlMemory<u32> as *mut c_void,
+            GROW_BATCH,
+        );
+        vec.try_append(value)
+    }
+}
+
+fn moved_to_depots() -> std::sync::MutexGuard<'static, BTreeMap<(usize, u32), DepotOrigin>> {
+    MOVED_TO_DEPOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Steam's app-info cache in the current engine object.
+struct AppInfoCache {
+    base: *const u8,
+    tree: TreeLayout,
+    unknown_flag: usize,
+    nodes: *const u8,
+    /// Node indices below this stay inside the readable memory of the node
+    /// array, whatever the tree links say.
+    node_limit: usize,
+}
+
+impl AppInfoCache {
+    /// The cache addressed through the decoded engine slot, admitted only if
+    /// it finds the Steam client app's record.
+    fn current() -> Option<Self> {
+        let lookup = APPINFO_LOOKUP.get()?;
+        let site = ENGINE_WORK_ITEM_SITE.get()?;
+        // SAFETY: the slot is aligned, mapped steamclient data admitted at install.
+        let engine = unsafe { (site.engine_slot as *const *const u8).read_volatile() };
+        if engine.is_null() {
+            return None;
+        }
+        // SAFETY: the rebuild addresses the cache at this engine offset.
+        let base = unsafe { engine.add(lookup.cache_offset) };
+        let tree = lookup.tree;
+        // SAFETY: the decoded node array pointer belongs to the live cache.
+        let nodes = unsafe { base.add(tree.nodes).cast::<*const u8>().read_unaligned() };
+        if nodes.is_null() || tree.stride == 0 {
+            return None;
+        }
+        let readable_end = vapor_forge_memory::current_process_readable_end(nodes as usize)
+            .ok()
+            .flatten()?;
+        let cache = Self {
+            base,
+            tree,
+            unknown_flag: lookup.unknown_flag,
+            nodes,
+            node_limit: (readable_end - nodes as usize) / tree.stride,
+        };
+        // SAFETY: read on the engine thread that owns the cache.
+        unsafe { cache.record(STEAM_CLIENT_APP) }.map(|_| cache)
+    }
+
+    /// The record GetAppInfo's tree search finds, without its data checks.
+    ///
+    /// # Safety
+    /// Must run on the engine thread, with `self` from [`Self::current`].
+    unsafe fn record(&self, app_id: u32) -> Option<*const u8> {
+        let tree = self.tree;
+        // SAFETY: the decoded root field belongs to the live cache.
+        let mut index = unsafe { self.base.add(tree.root).cast::<i32>().read_unaligned() };
+        for _ in 0..MAX_TREE_DEPTH {
+            let index_value = usize::try_from(index)
+                .ok()
+                .filter(|&value| value < self.node_limit)?;
+            // SAFETY: the index is below node_limit, so the node lies inside
+            // the node array's readable memory.
+            let node = unsafe { self.nodes.add(index_value * tree.stride) };
+            // SAFETY: the decoded key field lies inside the node.
+            let key = unsafe { node.add(tree.key).cast::<u32>().read_unaligned() };
+            let child = if app_id < key {
+                TreeLayout::LEFT
+            } else if key < app_id {
+                TreeLayout::RIGHT
+            } else {
+                // SAFETY: the decoded value field lies inside the node.
+                let record = unsafe { node.add(tree.value).cast::<*const u8>().read_unaligned() };
+                return (!record.is_null()).then_some(record);
+            };
+            // SAFETY: the child links lie inside the node.
+            index = unsafe { node.add(child).cast::<i32>().read_unaligned() };
+        }
+        None
+    }
+
+    /// Whether the server reported `app_id` unknown in an app-info response.
+    ///
+    /// # Safety
+    /// As for [`Self::record`].
+    unsafe fn is_unknown(&self, app_id: u32) -> bool {
+        // SAFETY: inherited from this function's contract.
+        unsafe { self.record(app_id) }
+            // SAFETY: the decoded flag lies inside the record GetAppInfo checks.
+            .is_some_and(|record| unsafe { record.add(self.unknown_flag).read() } != 0)
     }
 }
 
@@ -293,13 +506,13 @@ pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
                 )));
         }
     }
-    if let Some(addr) = resolve_raw_address(registry, code, "CUser::ProcessPendingLicenseUpdates") {
+    if let Some(addr) = resolve_raw_address(registry, code, "CUser::RemoveSiteLicenses") {
         // SAFETY: the registry entry identifies this concrete Steam function ABI.
         unsafe {
-            std::ptr::addr_of_mut!(FN_PROCESS_UPDATES).write(Some(std::mem::transmute::<
-                usize,
-                ProcessPendingLicenseUpdatesFn,
-            >(addr)));
+            std::ptr::addr_of_mut!(FN_REMOVE_SITE_LICENSES)
+                .write(Some(std::mem::transmute::<usize, RemoveSiteLicensesFn>(
+                    addr,
+                )));
         }
     }
     // x86_64 resolves this through the CUtlVector<u32> append helper callsite used
@@ -323,6 +536,51 @@ pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
         }
     }
     resolve_engine_work_item_site(code);
+    resolve_appinfo_lookup(code);
+}
+
+fn resolve_appinfo_lookup(code: &CodeRegion) {
+    // SAFETY: written above during install and read-only afterward.
+    let Some(remove) = (unsafe { *std::ptr::addr_of!(FN_REMOVE_SITE_LICENSES) }) else {
+        return;
+    };
+    let Some(site) = ENGINE_WORK_ITEM_SITE.get() else {
+        return;
+    };
+    let lookup = match vapor_forge_patterns::appinfo_cache::decode(
+        usize::BITS,
+        code.base,
+        code.bytes,
+        remove as usize,
+    ) {
+        Ok(lookup) => lookup,
+        Err(error) => {
+            warn!(
+                error,
+                "package: app-info lookup did not decode, unknown app IDs stay in pkg0 apps"
+            );
+            return;
+        }
+    };
+    if lookup
+        .engine_slot
+        .is_some_and(|slot| slot != site.engine_slot)
+    {
+        warn!(
+            rebuild_slot = format_args!("0x{:x}", lookup.engine_slot.unwrap_or_default()),
+            engine_slot = format_args!("0x{:x}", site.engine_slot),
+            "package: app-info cache is not addressed through the engine slot"
+        );
+        return;
+    }
+    info!(
+        get_app_info = format_args!("0x{:x}", lookup.get_app_info),
+        cache_offset = format_args!("0x{:x}", lookup.cache_offset),
+        tree = ?lookup.tree,
+        unknown_flag = format_args!("0x{:x}", lookup.unknown_flag),
+        "package: app-info lookup decoded"
+    );
+    let _ = APPINFO_LOOKUP.set(lookup);
 }
 
 fn resolve_engine_work_item_site(code: &CodeRegion) {
@@ -447,7 +705,7 @@ pub fn all_functions_resolved() -> bool {
     // SAFETY: these are only written once during do_install, read-only after.
     unsafe {
         let common = (*std::ptr::addr_of!(FN_MARK_LICENSE)).is_some()
-            && (*std::ptr::addr_of!(FN_PROCESS_UPDATES)).is_some()
+            && (*std::ptr::addr_of!(FN_REMOVE_SITE_LICENSES)).is_some()
             && (*std::ptr::addr_of!(FN_GROW)).is_some()
             && ENGINE_WORK_ITEM_SITE.get().is_some();
 
@@ -495,6 +753,7 @@ pub(crate) fn reset_account_state() {
     }
     CPKG_INFO_PTR.store(0, Ordering::Release);
     PKG0_PTR.store(0, Ordering::Release);
+    RECLASSIFY_POSTED.store(false, Ordering::Release);
     let mut dispatch = UPDATE_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -742,7 +1001,7 @@ fn try_post_update() {
     if !should_post {
         return;
     }
-    if post_engine_work_item(generation) {
+    if post_engine_work_item(generation, package_update_invoker) {
         debug!(generation, "package: update work item posted");
         return;
     }
@@ -814,6 +1073,7 @@ fn run_update_work_item(generation: u64) {
             let plan = package_state.compute_injection(&without_family_shared(&controlled));
             let injection = access.inject(&plan.app_ids);
             package_state.record_injected(&injection.appended);
+            package_state.record_injected(&injection.adopted);
             if !injection.complete {
                 return false;
             }
@@ -862,16 +1122,22 @@ fn complete_update_work_item(generation: u64) {
     try_post_update();
 }
 
-fn post_engine_work_item(generation: u64) -> bool {
+type WorkItemInvoker = unsafe extern "C" fn(*const c_void);
+
+fn post_engine_work_item(generation: u64, invoker: WorkItemInvoker) -> bool {
     let Some(site) = ENGINE_WORK_ITEM_SITE.get().copied() else {
         return false;
     };
     // SAFETY: the discovered site was validated against multiple native
     // producers and its global slot was checked against steamclient data.
-    unsafe { post_engine_work_item_unchecked(site, generation) }
+    unsafe { post_engine_work_item_unchecked(site, generation, invoker) }
 }
 
-unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: u64) -> bool {
+unsafe fn post_engine_work_item_unchecked(
+    site: EngineWorkItemSite,
+    generation: u64,
+    invoker: WorkItemInvoker,
+) -> bool {
     let pointer_size = std::mem::size_of::<usize>();
     if site.item_size != pointer_size * 5 {
         return false;
@@ -898,7 +1164,7 @@ unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: 
         false
     } else {
         // SAFETY: queue_offset identifies the native CUtlVector<void *> header.
-        unsafe { append_engine_work_item(site, engine, generation) }
+        unsafe { append_engine_work_item(site, engine, generation, invoker) }
     };
     // SAFETY: this call balances the successful lock above.
     let unlock_result = unsafe { libc::pthread_mutex_unlock(mutex) };
@@ -912,6 +1178,7 @@ unsafe fn append_engine_work_item(
     site: EngineWorkItemSite,
     engine: *mut u8,
     generation: u64,
+    invoker: WorkItemInvoker,
 ) -> bool {
     let pointer_size = std::mem::size_of::<usize>();
     // SAFETY: caller holds the decoded queue mutex and engine is current.
@@ -967,7 +1234,7 @@ unsafe fn append_engine_work_item(
             .write(package_update_manager as *const () as usize);
         item.add(pointer_size * 4)
             .cast::<usize>()
-            .write(package_update_invoker as *const () as usize);
+            .write(invoker as *const () as usize);
     }
     // SAFETY: capacity exceeds count and caller holds the native queue mutex.
     unsafe {
@@ -984,6 +1251,75 @@ unsafe extern "C" fn package_update_invoker(storage: *const c_void) {
     // SAFETY: Steam passes the two-word callable storage beginning at item + 1 pointer.
     let generation = unsafe { storage.cast::<u64>().read_unaligned() };
     run_update_work_item(generation);
+}
+
+unsafe extern "C" fn package_reclassify_invoker(storage: *const c_void) {
+    if storage.is_null() {
+        return;
+    }
+    // SAFETY: Steam passes the two-word callable storage beginning at item + 1 pointer.
+    let generation = unsafe { storage.cast::<u64>().read_unaligned() };
+    run_reclassify_work_item(generation);
+}
+
+/// Steam finished an app-info update. Queue a pass that moves injected IDs
+/// the server reported unknown into pkg0's depot list.
+pub(crate) fn note_app_info_update() {
+    let generation = vapor_forge_features::identity::generation();
+    if generation == 0
+        || !crate::client::install::PKG0_INJECTED.load(Ordering::Acquire)
+        || APPINFO_LOOKUP.get().is_none()
+        || RECLASSIFY_POSTED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    if !post_engine_work_item(generation, package_reclassify_invoker) {
+        RECLASSIFY_POSTED.store(false, Ordering::Release);
+        warn!(generation, "package: unknown app pass could not be posted");
+    }
+}
+
+fn run_reclassify_work_item(generation: u64) {
+    RECLASSIFY_POSTED.store(false, Ordering::Release);
+    if generation != vapor_forge_features::identity::generation() {
+        return;
+    }
+    let Some(captured) = super::steam_context::capture() else {
+        return;
+    };
+    if captured.identity_generation != generation {
+        return;
+    }
+    let _ = super::steam_context::checked_call(captured, || {
+        let _cuser_guard = CUSER_GUARD
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if CUSER_GENERATION.load(Ordering::Acquire) != generation
+            || !crate::client::install::PKG0_INJECTED.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let cuser = CUSER_PTR.load(Ordering::Acquire) as *mut c_void;
+        let Some(mut access) = SteamPackageAccess::from_current(cuser) else {
+            return false;
+        };
+        let Some(cache) = AppInfoCache::current() else {
+            warn_once_unvalidated_cache();
+            return false;
+        };
+        let package_state = crate::client::install::package_state();
+        access.move_unknown_to_depots(&cache, |id| package_state.is_injected_into_pkg0(AppId(id)));
+        true
+    });
+}
+
+fn warn_once_unvalidated_cache() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "package: app-info cache has no Steam client record, unknown app IDs stay in pkg0 apps"
+        );
+    }
 }
 
 unsafe extern "C" fn package_update_manager(
@@ -1039,6 +1375,7 @@ pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
         return;
     }
 
+    moved_to_depots().retain(|&(pkg0, _), _| pkg0 == pkg_ptr as usize);
     PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
     info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
     queue_initial_injection();
@@ -1083,7 +1420,12 @@ mod tests {
         let generation = 0x1234_5678_9abc_def0;
         // SAFETY: queue has one writable slot and no concurrent readers.
         assert!(unsafe {
-            append_engine_work_item(site, (&mut queue as *mut CUtlVector<_>).cast(), generation)
+            append_engine_work_item(
+                site,
+                (&mut queue as *mut CUtlVector<_>).cast(),
+                generation,
+                package_update_invoker,
+            )
         });
         assert_eq!(REQUESTED_SIZE.load(Ordering::Relaxed), site.item_size);
         assert_eq!(queue.m_size, 1);
@@ -1131,7 +1473,12 @@ mod tests {
             };
             // SAFETY: the header is live; invalid states must be rejected before allocation.
             assert!(!unsafe {
-                append_engine_work_item(site, (&mut queue as *mut CUtlVector<_>).cast(), 7)
+                append_engine_work_item(
+                    site,
+                    (&mut queue as *mut CUtlVector<_>).cast(),
+                    7,
+                    package_update_invoker,
+                )
             });
         }
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);

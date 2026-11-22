@@ -154,6 +154,14 @@ pub mod package_info {
         // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { core::ptr::addr_of_mut!((*pkg).app_id_vec) }
     }
+
+    /// # Safety
+    /// pkg must point to a valid PackageInfo struct in Steam memory.
+    pub unsafe fn depot_id_vec(pkg: *mut u8) -> *mut CUtlVector<u32> {
+        let pkg = pkg.cast::<PackageInfoPrefix>();
+        // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
+        unsafe { core::ptr::addr_of_mut!((*pkg).depot_id_vec) }
+    }
 }
 
 pub mod cnet_packet {
@@ -263,12 +271,13 @@ pub mod steamui {
         _arena_or_elements: SteamPtr<u32>,
     }
 
+    /// Message header: vptr, internal metadata, has-bits and cached size.
     #[repr(C)]
     pub struct CAppOverviewChange {
         #[cfg(target_pointer_width = "32")]
-        _prefix: [u32; 3],
-        #[cfg(target_pointer_width = "64")]
         _prefix: [u32; 4],
+        #[cfg(target_pointer_width = "64")]
+        _prefix: [u32; 6],
         _app_overview: RepeatedPtrFieldOpaque,
         removed_appid: RepeatedFieldU32Opaque,
     }
@@ -326,7 +335,7 @@ pub mod steamui {
 
     #[cfg(target_pointer_width = "32")]
     const _: () = {
-        assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x1c);
+        assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x20);
         assert!(core::mem::size_of::<CSteamApp>() == 0x40);
         assert!(CSteamApp::VFPTR_OFFSET == 0x00);
         assert!(CSteamApp::GAME_ID_OFFSET == 0x04);
@@ -348,7 +357,7 @@ pub mod steamui {
     #[cfg(target_pointer_width = "64")]
     const _: () = {
         // 64-bit SteamUI uses wider pointers inside protobuf repeated fields.
-        assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x28);
+        assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x30);
         assert!(core::mem::size_of::<CSteamApp>() == 0x44);
         assert!(CSteamApp::VFPTR_OFFSET == 0x00);
         assert!(CSteamApp::GAME_ID_OFFSET == 0x08);
@@ -396,7 +405,7 @@ pub mod steamui {
         #[cfg(target_pointer_width = "32")]
         #[test]
         fn app_overview_change_removed_appid_offset() {
-            assert_eq!(CAppOverviewChange::REMOVED_APPID_OFFSET, 0x1c);
+            assert_eq!(CAppOverviewChange::REMOVED_APPID_OFFSET, 0x20);
         }
 
         #[cfg(target_pointer_width = "32")]
@@ -462,7 +471,9 @@ pub struct DepotEntry {
 pub type GetPackageInfoFn = unsafe extern "C" fn(*mut c_void, u32, u64) -> *mut u8;
 pub type GetPackageInfoArchFn = GetPackageInfoFn;
 pub type MarkLicenseAsChangedFn = unsafe extern "C" fn(*mut c_void, u32, bool);
-pub type ProcessPendingLicenseUpdatesFn = unsafe extern "C" fn(*mut c_void) -> bool;
+/// Removes site licenses and, when any license is marked as changed, rebuilds
+/// the license cache and sends license update notices. Returns whether it did.
+pub type RemoveSiteLicensesFn = unsafe extern "C" fn(*mut c_void) -> bool;
 pub type CUtlMemoryGrowFn = unsafe extern "C" fn(*mut c_void, i32);
 
 /// Mirrors `EAppReleaseState` from `steamclientpublic.h`.
