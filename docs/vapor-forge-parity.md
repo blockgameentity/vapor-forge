@@ -33,7 +33,7 @@ signature that resolves on the current public build.
 | CallbackEvents | `client/{user,internal_callbacks,callback_notify,client_id,steam_context}.rs` | — | — |
 | Ownership | `client/ownership.rs` | ✅ `CUser::CheckAppOwnership` | ✅ public + beta |
 | PackageInjection | `client/package.rs`, `install/package_info.rs` | ✅ `CPackageInfo::GetPackageInfo` | ✅ |
-| TicketOverrides | `client/{ticket,eticket,user}.rs` | ✅ body, **cannot install** | ❌ `CUser::GetAppTicket` unanchored |
+| TicketOverrides | `client/{ticket,eticket,user}.rs` | ✅ `CUser::GetAppTicket` | ✅ public + beta (mined from the CUser vtable, 2026-11-22) |
 | DepotInjection | `client/depot.rs` | ✅ `GetDecryptionKey` | ✅ |
 | ShaderCacheControl | `client/shader.rs` | — | ✅ `CShaderCacheManager::…` (steamclient, unanchored in win64 corpus) |
 | FamilyLockBypass | `client/family_lock.rs` | ⚠️ decision only, no body consults it | n/a |
@@ -49,11 +49,12 @@ signature that resolves on the current public build.
 | OverviewMetadata | `ui/library.rs` | ✅ via the overview bodies | ✅ |
 | LibrarySnapshot | `ui/library.rs` | ✅ via the snapshot body | ✅ |
 | ConflictUiBridge | `ui/reverse_bridge.rs` | — | — |
-| Achievements | `client/{achievement,user_stats}.rs` | ❌ body absent | ❌ stats path unanchored |
+| Achievements | `client/{achievement,user_stats}.rs` | ❌ body absent | ❌ stats path unanchored (class fully named, target shape absent) |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 8 of 21 capabilities have a body**; 6 of those are installable
-today (ticket is written but unanchored). Linux implements ~19.
+Counts: **Windows 8 of 21 capabilities have a body, 7 of them installable**;
+Linux implements ~19. Ticket moved from "written but unanchored" to installable
+when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
 Corpus coverage: Linux ships **34** symbols, Windows **23** (union of public +
 publicbeta). Windows bodies exist for 8, of which 7 resolve.
@@ -66,11 +67,12 @@ implements it: `ShaderCacheControl`, `DlcOverrides`, `CallbackEvents`,
 `LaunchEnvironment`. Linux has a working reference for each. This is mechanical
 work — one body plus its decide function and tests per capability.
 
-**B. No anchor (corpus).** Body or not, the symbol was never published as a hint
-and shape-based derivation found nothing: `CUser::GetAppTicket`,
+**B. No anchor (corpus).** Body or not, shape-based derivation found nothing for:
 `CNetPacket` dispatch, the stats path, `CUser::GetSubscribedApps` (one unconfirmed
-vtable candidate, slot 183), `CUser::BuildSpawnEnvBlock`. These block
-TicketOverrides, CmInterception and Achievements on Windows. Vtable anchoring is
+vtable candidate, slot 183) and `CUser::BuildSpawnEnvBlock`. These block
+CmInterception, Achievements and the request-code skip on Windows. `GetAppTicket`
+was the one that succeeded — slot-anchored in both builds — which is the evidence
+that vtable passes produce anchors where prologue hunting does not. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
 **C. Unverified ABI.** Everything below the planner assumes MS-x64 argument
