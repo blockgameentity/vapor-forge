@@ -50,12 +50,14 @@ use crate::pe_image::PeImage;
 
 pub mod body;
 pub mod fold;
+pub mod leaf;
 
 pub use body::{
-    analyze, analyze_in, apply_verdict, body_summary, is_thunk, verify, AnchorVerdict, Body,
-    RejectedAnchor, THUNK_MAX_BYTES,
+    analyze, analyze_in, apply_verdict, body_summary, is_thunk, verify, verify_with, AnchorVerdict,
+    Body, RejectedAnchor, THUNK_MAX_BYTES,
 };
 pub use fold::fold;
+pub use leaf::{AnchorEvidence, LEAF_SCAN_BYTES, PATCH_BYTES};
 
 /// `IMAGE_DIRECTORY_ENTRY_EXCEPTION`: `.pdata` on PE32+ images.
 pub const EXCEPTION_DIRECTORY: usize = 3;
@@ -259,6 +261,9 @@ pub fn parse(image: &PeImage<'_>, data: &[u8]) -> Result<Pdata, PdataError> {
     });
     Ok(Pdata { functions, metrics })
 }
+
+#[cfg(test)]
+mod synthetic;
 
 #[cfg(test)]
 mod tests;

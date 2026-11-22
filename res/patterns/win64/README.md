@@ -67,10 +67,38 @@ extents shorter than `0x18` removed by the probe's sweep filter.
 `vapor-forge-pattern-mine --verify <corpus>` now agree on identity: an RVA is a
 **function entry** iff it equals a merged extent's `begin`. The anchor gate
 additionally requires the entry's body to contain a `RET` or end in a tail jump
-(ignoring `nop`/`int3` padding); a mid-function hit, a fragment, an extent with no
-terminator and an RVA outside `.pdata` are all rejected. `vapor-forge-pattern-mine`
-applies it by default when mining and when verifying; `--allow-unverified-anchors`
-opts out.
+(ignoring `nop`/`int3` padding); a mid-function hit, a fragment and an extent with
+no terminator are all rejected. `vapor-forge-pattern-mine` applies it by default
+when mining and when verifying; `--allow-unverified-anchors` opts out.
+
+### Leaf functions (the gate's one relaxation)
+
+A **leaf** — a function that calls nothing — needs no unwinding, so MSVC emits no
+`RUNTIME_FUNCTION` for it and `.pdata` cannot name it. Rejecting every address
+outside the table therefore rejected real, patchable code: `CUser::GetSteamID` is
+a 13-byte leaf in both `steamclient64.dll` builds (see
+[`VTABLE-REPORT.md` §10](./VTABLE-REPORT.md#10-the-leaf-gate-and-cusergetsteamid)).
+
+An address outside `.pdata` is accepted only on all of:
+
+1. the signature that produced it matched **exactly once** in the executable
+   section (the matcher's own uniqueness check; `AnchorEvidence::unique_site`);
+2. the `0x0c` bytes immediately before it are padding (`0xCC`/`0x90`), i.e. a run
+   at least as long as the jump the hook writes (`pdata::PATCH_BYTES`);
+3. the byte at the address is code, not the padding run it follows;
+4. a `RET` appears within the first `0x40` bytes (`pdata::LEAF_SCAN_BYTES`).
+
+The verdict is reported as `leaf`, never as `verified`: the mine tool prints
+`LEAF` in its status column and `leaf` in the gate column, and `--verify` prints
+`leaf`, so a weaker acceptance is never silently folded into `ok`. The
+`.pdata` branch of the gate answers first, so an address *inside* an extent keeps
+failing as `mid-function` and the relaxation cannot reach it.
+
+Measured on both builds in §10: `CUser::GetSteamID` passes as a leaf at
+`0xcfec0` (public) / `0xd0460` (publicbeta), and the pre-existing `GetPipeClient`
+hit at `0x8c50b0` / `0x8e6f70` is still rejected — the bytes before it are a
+`lea`/`ret` plus only 7 `0xCC`, short of the patch length, and the matched bytes
+are a mid-body `test edx,edx`.
 
 Measured 2026-11-23 with build `1794536281` (public) / `1795048523` (publicbeta):
 
