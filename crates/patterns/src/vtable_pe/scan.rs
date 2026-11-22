@@ -6,13 +6,15 @@
 
 use crate::pe_image::PeImage;
 
-use super::{rtti, text_rva, validate, Corroboration, Enumeration, Functions, Rejected, Table};
+use crate::pdata::Pdata;
+
+use super::{rtti, text_rva, validate, Corroboration, Enumeration, Rejected, Table};
 
 /// Enumerate candidate vtables from every non-executable section.
 pub fn enumerate(
     image: &PeImage<'_>,
     bytes: &[u8],
-    functions: &Functions,
+    functions: &Pdata,
 ) -> Result<Enumeration, String> {
     let mut out = Enumeration::default();
     for section in image.sections() {
@@ -61,7 +63,7 @@ pub fn enumerate(
 fn accept_run(
     out: &mut Enumeration,
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     section: &crate::pe_image::PeSection,
     blob: &[u8],
     first: usize,
@@ -81,13 +83,16 @@ fn accept_run(
 
 fn corroborate(
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     blob: &[u8],
     first: usize,
     base_rva: u32,
     run: &[u32],
 ) -> Corroboration {
-    let pdata_entries = run.iter().filter(|rva| functions.is_entry(**rva)).count();
+    let pdata_entries = run
+        .iter()
+        .filter(|rva| functions.entry(**rva).is_some())
+        .count();
     let preceded_by_data_pointer = first >= 8 && {
         let mut qword = [0u8; 8];
         qword.copy_from_slice(&blob[first - 8..first]);

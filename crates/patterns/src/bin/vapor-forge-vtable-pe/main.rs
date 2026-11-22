@@ -29,8 +29,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::exit;
 
+use vapor_forge_patterns::pdata::Pdata;
 use vapor_forge_patterns::pe_image::PeImage;
-use vapor_forge_patterns::vtable_pe::{self, Enumeration, Functions, Table};
+use vapor_forge_patterns::vtable_pe::{self, Enumeration, Table};
 
 use args::Args;
 use report::{build_labels, dedupe, describe, rejection_breakdown, report_table};
@@ -47,7 +48,8 @@ fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args().skip(1))?;
     let bytes = read(&args.dll)?;
     let image = PeImage::parse(&bytes)?;
-    let functions = Functions::read(&image, &bytes)?;
+    let functions =
+        vapor_forge_patterns::pdata::parse(&image, &bytes).map_err(|error| error.to_string())?;
     let enumeration = vtable_pe::enumerate(&image, &bytes, &functions)?;
 
     println!(
@@ -119,14 +121,15 @@ fn run() -> Result<(), String> {
 fn cross_build(
     args: &Args,
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     enumeration: &Enumeration,
     anchors: &BTreeMap<u32, String>,
     against: &Path,
 ) -> Result<(), String> {
     let other_bytes = read(against)?;
     let other_image = PeImage::parse(&other_bytes)?;
-    let other_functions = Functions::read(&other_image, &other_bytes)?;
+    let other_functions = vapor_forge_patterns::pdata::parse(&other_image, &other_bytes)
+        .map_err(|error| error.to_string())?;
     let other = vtable_pe::enumerate(&other_image, &other_bytes, &other_functions)?;
     let other_anchors = match args.corpus_against.as_deref() {
         Some(path) => anchors::resolve_anchors(path, &other_image, &other_functions, &args.module)?,

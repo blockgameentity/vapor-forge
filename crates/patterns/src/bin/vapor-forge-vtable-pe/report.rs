@@ -8,10 +8,11 @@
 
 use std::collections::BTreeMap;
 
+use vapor_forge_patterns::pdata::Pdata;
 use vapor_forge_patterns::pe_image::PeImage;
 use vapor_forge_patterns::probe_rank::Probe;
 use vapor_forge_patterns::vtable_pe::structure::{self, SlotReport};
-use vapor_forge_patterns::vtable_pe::{Enumeration, Functions, Rejection, Table};
+use vapor_forge_patterns::vtable_pe::{Enumeration, Rejection, Table};
 
 use crate::args::{Args, SHORTLIST_PER_PROBE};
 
@@ -80,7 +81,7 @@ pub fn build_labels(
 
 pub fn report_table(
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     table: &Table,
     anchors: &BTreeMap<u32, String>,
     labels: &BTreeMap<u32, String>,
@@ -114,7 +115,7 @@ pub fn report_table(
 
 pub fn summarise_slots(
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     table: &Table,
     labels: &BTreeMap<u32, String>,
 ) -> Vec<SlotReport> {

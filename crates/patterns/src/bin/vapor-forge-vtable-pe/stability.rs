@@ -6,15 +6,16 @@
 //! build's corpus resolves it, otherwise every table of the same RTTI class (or
 //! of the same length when the class has no RTTI).
 
+use vapor_forge_patterns::pdata::Pdata;
 use vapor_forge_patterns::pe_image::PeImage;
 use vapor_forge_patterns::vtable_pe::cross_build::{self, Candidate};
 use vapor_forge_patterns::vtable_pe::structure;
-use vapor_forge_patterns::vtable_pe::{Functions, Table};
+use vapor_forge_patterns::vtable_pe::Table;
 
 /// The other build, borrowed once per run.
 pub struct OtherBuild<'a> {
     pub image: &'a PeImage<'a>,
-    pub functions: &'a Functions,
+    pub functions: &'a Pdata,
     pub tables: &'a [Table],
 }
 
@@ -23,7 +24,7 @@ pub fn report_stability(
     table: &Table,
     counterpart: Option<(&Table, Option<u32>)>,
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     other: &OtherBuild<'_>,
 ) {
     let shapes = table_shapes(image, functions, table);
@@ -103,13 +104,14 @@ fn candidates_for(
         .collect()
 }
 
-fn table_shapes(image: &PeImage<'_>, functions: &Functions, table: &Table) -> Vec<Option<u64>> {
+fn table_shapes(image: &PeImage<'_>, functions: &Pdata, table: &Table) -> Vec<Option<u64>> {
     table
         .entries
         .iter()
         .map(|rva| {
             let (begin, end) = functions
-                .extent(*rva)
+                .entry(*rva)
+                .map(|found| (found.begin, found.end))
                 .unwrap_or((*rva, rva.saturating_add(0x20)));
             structure::shape_of(image, begin, end)
         })

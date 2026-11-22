@@ -44,10 +44,10 @@ BETA=res/patterns/win64/steamclient/4a2d79520a72c55854c61c22cbfc53ec4e12cc13cc00
 
 | image | build | `.pdata` extents | accepted tables | with RTTI | runs rejected |
 | --- | --- | --- | --- | --- | --- |
-| `steamclient64.dll` public | 1794536281 | 49,230 | 6,523 | 6,014 | 1,338 (1,337 single-slot, 1 of 5,054 pointers) |
-| `steamclient64.dll` publicbeta | 1795048523 | 49,694 | 6,587 | 6,078 | 1,339 (1,338 single-slot, 1 of 5,093 pointers) |
-| `SteamUI.dll` public | 1794536281 | 38,154 | 5,376 | 4,887 | 1,034 (1,033 single-slot, 1 of 3,720 pointers) |
-| `SteamUI.dll` publicbeta | 1795048523 | 38,457 | 5,392 | 4,901 | 1,037 (1,036 single-slot, 1 of 3,744 pointers) |
+| `steamclient64.dll` public | 1794536281 | 52,946 | 6,523 | 6,014 | 1,338 (1,337 single-slot, 1 of 5,054 pointers) |
+| `steamclient64.dll` publicbeta | 1795048523 | 53,430 | 6,587 | 6,078 | 1,339 (1,338 single-slot, 1 of 5,093 pointers) |
+| `SteamUI.dll` public | 1794536281 | 40,826 | 5,376 | 4,887 | 1,034 (1,033 single-slot, 1 of 3,720 pointers) |
+| `SteamUI.dll` publicbeta | 1795048523 | 41,159 | 5,392 | 4,901 | 1,037 (1,036 single-slot, 1 of 3,744 pointers) |
 
 A table is accepted when it is a maximal run of 8-byte qwords, each
 `image_base + rva` with `rva` inside an executable section, of 2..512 slots.
@@ -71,10 +71,10 @@ the 9 public `SteamUI.dll` anchors, **1** does.
 
 | anchor | build | rva | vtable base | slot / len | RTTI class | `.pdata` slots | locator before table |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `GetAppDataFromAppInfo` | public / beta | `0x4de420` / `0x4f37e0` | `0x12b8eb0` / `0x12ec270` | **0 / 17** | `CUserAppInfo` | 15/17, 14/17 | yes |
+| `GetAppDataFromAppInfo` | public / beta | `0x4de420` / `0x4f37e0` | `0x12b8eb0` / `0x12ec270` | **0 / 17** | `CUserAppInfo` | 15/17, 15/17 | yes |
 | `IPCProcessMessage` | public / beta | `0x8c46c0` / `0x8e6570` | `0x136c430` / `0x13a10e0` | **16 / 22** | `CIPCServer` | 13/22, 12/22 | yes |
-| `CloseAppCloud` | public / beta | `0xa67320` / `0xa916b0` | `0x13ab9a0` / `0x13e1380` | **24 / 95** | `CUserRemoteStorage` | 84/95, 85/95 | yes |
-| `CSteamUIAppController::RunFrame` | public only | `0x64ba30` | `0xddc5d8` (`0xe17250` beta) | **2 / 5** | `CSteamUIAppController` | 4/5 | yes |
+| `CloseAppCloud` | public / beta | `0xa67320` / `0xa916b0` | `0x13ab9a0` / `0x13e1380` | **24 / 95** | `CUserRemoteStorage` | 93/95, 93/95 | yes |
+| `CSteamUIAppController::RunFrame` | public only | `0x64ba30` | `0xddc5d8` (`0xe17250` beta) | **2 / 5** | `CSteamUIAppController` | 5/5, 5/5 | yes |
 
 Everything else is a plain (non-virtual) function: `CUser::CheckAppOwnership`,
 `CPackageInfo::GetPackageInfo` (`CPackageInfo` has *no* RTTI vtable at all),
@@ -100,14 +100,14 @@ targets). "Agreement" is slots whose fingerprint is identical at the same index.
 
 | table (public base) | len public → beta | agreement | verdict |
 | --- | --- | --- | --- |
-| `CUserRemoteStorage` `0x13ab9a0` | 95 → 95 | 94/95 (99%) | stable |
-| `CUserAppInfo` `0x12b8eb0` | 17 → 17 | 12/17 (71%) | slot indices stable, several bodies rebuilt |
+| `CUserRemoteStorage` `0x13ab9a0` | 95 → 95 | 95/95 (100%) | stable |
+| `CUserAppInfo` `0x12b8eb0` | 17 → 17 | 13/17 (76%) | slot indices stable, four bodies rebuilt |
 | `CIPCServer` `0x136c430` | 22 → 22 | 17/22 (77%) | slot indices stable |
 | `CUser` `0x139e6e0` | 41 → 41 | 39/41 (95%) | stable |
-| `CUser` `0x139e830` | 260 → **261** | 217/260 (83%) | **index changed**: one method inserted, 43 indices disagree |
-| `CUser` `0x139f058` | 48 → **49** | 45/48 (94%) | **index changed** |
+| `CUser` `0x139e830` | 260 → **261** | 221/260 (85%) | **index changed**: one method inserted, indices shift after it |
+| `CUser` `0x139f058` | 48 → **49** | 47/48 (98%) | **index changed** |
 | `CUser` `0x139f1f0` | 7 → 7 | 6/7 (86%) | stable |
-| `CSteamUIAppController` `0xddc5d8` | 5 → 5 | 5/5 (100%) per-slot sizes | stable |
+| `CSteamUIAppController` `0xddc5d8` | 5 → 5 | 4/5 (80%) | stable; the rebuild is slot 2 (`RunFrame` itself, 958 → 1008 B) |
 
 So slot order is *mostly* stable but **not** guaranteed: two of the four `CUser`
 vtables gained a slot between these builds, and every index after the insertion
@@ -172,18 +172,18 @@ Classes reachable by RTTI, public build:
 
 | class | vtables (base / slots) | dispatch-shaped slots | `.pdata` coverage |
 | --- | --- | --- | --- |
-| `CUserStats` | `0x13b2330` / 56, `0x13b24f8` / 11 (beta: 57, 11) | 0 | 49/56, 6/11 |
+| `CUserStats` | `0x13b2330` / 56, `0x13b24f8` / 11 (beta: 57, 11) | 0 | 55/56, 6/11 |
 | `CGameStats` | `0x12c63d8` / 14 | 0 | 14/14 |
-| `IClientGameStatsMap` | `0x1363ab8` / 13 | 0 | 12/13 |
+| `IClientGameStatsMap` | `0x1363ab8` / 13 | 0 | 13/13 |
 | `CAdapterSteamGameStats001` | `0x133e038` / 13 | 0 | 0/13 (all shared stubs) |
 
 Measured over all 67 public `CUserStats` slots: **no slot stores a 32-bit value
-through an argument pointer** (`u32@arg -` for all 67), no slot stores a literal
-`'='`, the longest single-register compare chain is 5, and no slot has a computed
-branch. The `userstats` probe returns its maximum score (8) for **21 of 67**
-slots, so the class route narrows the field from 16,492 functions to 67 slots but
-the ranking inside those 67 carries almost no information — the same saturation
-the probe report described.
+through the second argument** (only slot 21 stores through `this` at all), no slot
+stores a literal `'='`, the longest single-register compare chain is 5, and no
+slot has a computed branch. The `userstats` probe returns its maximum score (8)
+for **22 of 67** slots, so the class route narrows the field from 16,492
+functions to 67 slots but the ranking inside those 67 carries almost no
+information — the same saturation the probe report described.
 
 The useful part is that the class is now identified: `CUserStats#n` and
 `CGameStats#n` are usable as labels, which is what a callee-based search for the
@@ -201,11 +201,11 @@ Classes reachable by RTTI, public build:
 
 | class | vtable base | slots | dispatch-shaped slots | note |
 | --- | --- | --- | --- | --- |
-| `IMsgNetPacket` | `0x142ef88` | 46 | 0 | **31 of 46 slots are the same 26-byte stub at `0xfda860`** |
-| `CProtoBufNetPacket` | `0x142f1f0` | 46 | 0 (max chain 2) | |
-| `CStructNetPacket` | `0x1430730` | 46 | 0 | |
-| `CClientStructNetPacket` | `0x1430ac0` | 46 | 0 | |
-| `CCMConnection` | `0x12e32a8` | 10 | 0 | `RecvPkt`'s Linux class; biggest slot is `0x5caf90` (1,489 B, 47 calls, 8 byte stores) but it has no table branch and chain max 84 |
+| `IMsgNetPacket` | `0x142ef88` | 46 | 0 (32/46 `.pdata`) | **31 of 46 slots are the same 26-byte stub at `0xfda860`** |
+| `CProtoBufNetPacket` | `0x142f1f0` | 46 | 0 (max chain 2, 15/46 `.pdata`) | |
+| `CStructNetPacket` | `0x1430730` | 46 | 0 (13/46 `.pdata`) | |
+| `CClientStructNetPacket` | `0x1430ac0` | 46 | 0 (6/46 `.pdata`) | |
+| `CCMConnection` | `0x12e32a8` | 10 | 0 (7/10 `.pdata`) | `RecvPkt`'s Linux class; biggest slot is `0x5caf90` (1,489 B, 47 calls, 8 byte stores) but it has no table branch and chain max 84 |
 | `CFreeNetPacketsWorkItem` | `0x149a498` | 8 | 0 | |
 
 Not one slot in any packet class contains a jump table or a compare chain over
@@ -224,7 +224,7 @@ extracted from `PchMsgNameFromEMsg`, not class structure.
 (`res/patterns/x86*.toml`), and the Windows `CUser` vtables contain no env-block
 writer: across the 356 public `CUser` slots, **no slot stores a literal `'='`**
 (`equals_imm_stores` is 0 everywhere), and no slot has the `index * 9` license
-stride the Linux 32-bit body uses (`stride9_leas` is 0 everywhere). Sixteen slots
+stride the Linux 32-bit body uses (`stride9_leas` is 0 everywhere). Fifteen slots
 combine two or more 1-byte stores with a loop, but none of them stores an
 immediate `0x3d`; they are string/serialiser work with 3-20 callees.
 
@@ -243,10 +243,11 @@ it is refuted, not pending.
   "writes through the out pointer" is under-reported in loop bodies (it is 0 for
   the slot-183 candidate even though the loop writes 4-byte values). This is the
   same limitation the probe report lists; it is not new.
-* The `.pdata` reader in `vtable_pe/functions.rs` is a deliberate duplicate of
-  `bin/vapor-forge-pe-functions.rs::function_table` (a binary cannot be
-  imported, and `pe_image.rs` is being refactored by `gate0/pdata-unify`). It is
-  the only place in `vtable_pe` that knows the `RUNTIME_FUNCTION` layout.
+* Function extents come from the shared `crate::pdata` module (landed by the
+  `gate0/pdata-unify` merge), not from a private copy. Its fragment-merge rule
+  keeps more extents than the older tools did — 52,946 against the 49,230 in
+  `PROBE-REPORT.md` for the same image — so every size in this report is the
+  shared rule's extent and is an upper bound on the body, not a byte count.
 * RTTI names come from the mangled type descriptor; template instantiations and
   function-local types are shortened to their first component, so `--class`
   matching is by (case-insensitive) exact-or-substring name.

@@ -20,7 +20,7 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind};
 use crate::pe_image::PeImage;
 use crate::probe_facts::{self, Facts};
 
-use super::functions::Functions;
+use crate::pdata::Pdata;
 
 /// Used for slots that are inside `.text` but not a `.pdata` entry (import
 /// thunks, `_purecall` stubs): enough bytes to see the shape of the stub.
@@ -63,7 +63,8 @@ pub struct SlotReport {
     /// `index * 0x50` licence stride the Linux body uses.
     pub shift4: u32,
     pub shape: Option<u64>,
-    /// Anchored symbols this slot calls directly.
+    /// Direct callees that carry a label: a corpus anchor name, or
+    /// `Class#slot` for a known vtable method.
     pub anchored_callees: Vec<String>,
 }
 
@@ -118,22 +119,23 @@ fn via_args(counts: [u32; 4]) -> String {
     }
 }
 
-/// Measure one slot. `anchors` maps function RVA to the anchored symbol name.
+/// Measure one slot. `labels` maps a function RVA to a display label (a
+/// corpus anchor name or `Class#slot`); it is only used to name callees.
 pub fn summarise(
     image: &PeImage<'_>,
-    functions: &Functions,
+    functions: &Pdata,
     slot: usize,
     rva: u32,
-    anchors: &BTreeMap<u32, String>,
+    labels: &BTreeMap<u32, String>,
 ) -> SlotReport {
-    let extent = functions.extent(rva);
+    let extent = functions.entry(rva).map(|found| (found.begin, found.end));
     let (begin, end) = extent.unwrap_or((rva, rva.saturating_add(UNINDEXED_WINDOW)));
     let facts = probe_facts::measure(image, begin, end);
     let shapes = slot_shapes(image, begin, end);
     let anchored_callees = facts
         .callees
         .iter()
-        .filter_map(|callee| anchors.get(callee).cloned())
+        .filter_map(|callee| labels.get(callee).cloned())
         .collect();
     SlotReport {
         slot,
