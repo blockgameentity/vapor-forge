@@ -1781,3 +1781,72 @@ Nothing here changes `crates/host-windows`: `CUser::GetSteamID` is still
 `replacement_address("RegisterJsMethod").is_none()` assertion and the
 `ConflictUiBridge` availability reason in `crates/host-windows/src/hooks/mod.rs`
 are upstream's to update — this branch is corpus-only.
+
+## 8. The job reply fields — derived, not tabulated
+
+`crates/patterns/src/job_fields.rs` decodes the reply field and body
+displacement from `CAPIJobRequestUserStats::BInit`'s instruction stream. The
+shape the pass above read by hand is one call deep: `BInit` hands the job
+(`this`) to the response parser and the parser dereferences the reply. The
+decoder follows the direct calls that receive `this`, follows both arms of a
+branch (the parser call sits behind `test al,al; jz …; mov …; jmp …`), tracks
+which register holds `this` and which pointer member was just loaded from it, and
+requires a `lea rdi|rsi, [that-pointer + disp]` within 0x40 bytes.
+
+| | public | publicbeta |
+| --- | --- | --- |
+| `BInit` (corpus anchor) | `0xa8fd20` | `0xab99a0` |
+| parser the walk follows | `0xa93120` | `0xabcc20` |
+| `decode_job_reply` → `reply_field` | **`0x1b0`** | **`0x1a8`** |
+| `decode_job_reply` → `body` | **`0x18`** | **`0x18`** |
+
+Both values are read from the instruction stream (the decoder has no per-build
+branch); the measured table above is only what the golden test asserts against.
+Rejected shapes are rejected with a reason: `reply field load`,
+`reply body outside the window`, `ambiguous reply field`,
+`reply field outside the job object`.
+
+## 9. `CUser::GetSteamID` — the slot ranking, re-run under the anchor gate
+
+The ranking asked for here — no `call` in the body, a single 64-bit member load
+from `this`, `ret` within 0x40 bytes — over the four `CUser` tables returns
+three slots in the 260/261-slot `IClientUser` table, and their members resolve to
+the same absolute `CUser` offsets in both builds once the secondary-base
+displacement is measured (`add $0x1e78,%rcx` public, `$0x1f48` beta, read out of
+the account-type test in `CUpdateSubscribedItemsJob`):
+
+| slot | public | publicbeta | body | member |
+| --- | --- | --- | --- | --- |
+| 10 | `0xcfed0` | `0xd0470` | `mov -0x1c6e(%rcx),%rax; mov %rax,(%rdx); mov %rdx,%rax; ret` | `CUser+0x20A` (account CSteamID, account-type tested) |
+| 11 | `0xa08cb0` | `0xa31200` | `mov -0x1ce8(%rcx),%rax; ret` | `CUser+0x190` (instance id) |
+| 57 | `0xa28ce0` | `0xa52c50` | `mov -0x1b50(%rcx),%rax; ret` | `CUser+0x328` |
+
+The primary `CUser` 41-slot table repeats slot 10's body at slot 4 (`0xcfec0`,
+`mov 0x20a(%rcx),%rax; mov %rax,(%rdx); mov %rdx,%rax; ret`). So the account id
+has exactly one accessor shape, and it takes a pointer argument: **no
+`this`-only 64-bit getter of the account CSteamID exists in either image** —
+`48 8B 81 0A 02 00 00 C3` and `48 8B 81 A8 00 00 00 C3` / `48 8B 41 A8 C3`
+(`CSteamID` at `+0xA8`, written by `CacheAccountNameAndSteamID` `0x9e3060`
+`mov %r8,0xa8(%rbx)`) both have **0** occurrences, public and beta.
+
+The member both `CheckAppOwnership` (`[r12+0x23e8]`, twice) and
+`GetSubscribedApps` (`[r13+0x570]`, its secondary-base frame — the same member)
+read is an 8-byte pointer that is dereferenced at `+0x40` and used to walk the
+license set. No `CUser` slot is a 64-bit getter of it (`mov rax,[rcx+disp]; ret`
+over the whole public image has no `+0x570`), so the discriminator rejects both
+this-only
+getters: slot 11 formats its member as `%08llx` in its only reader, slot 57 is
+not the account id, and slot 10 is the account id but not this-only.
+
+**Verdict: no corpus entry, re-confirmed on both builds.** Even the body gate
+alone refuses: `vapor-forge-pattern-mine --verify` resolves each candidate
+uniquely and then reports `unmapped` —
+
+```
+public    CUser::GetSteamID  OK  1  0x0000a08cb0  unmapped
+publicbeta CUser::GetSteamID OK  1  0x0000a31200  unmapped
+```
+
+(neither address is covered by a `RUNTIME_FUNCTION`). The same two runs report a
+pre-existing failure in the shipped corpus, unrelated to this pass:
+`GetPipeClient` at `0x8c50b0` public / `0x8e6f70` beta is also `unmapped`.

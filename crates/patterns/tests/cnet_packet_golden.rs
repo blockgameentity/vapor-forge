@@ -17,9 +17,10 @@
 
 #![cfg(feature = "tools")]
 
-use std::path::{Path, PathBuf};
+mod support;
 
-use sha2::{Digest, Sha256};
+use support::{client_path, corpus_for, find_all, pattern_for, sha256_hex};
+
 use vapor_forge_patterns::cnet_packet::{self, PacketApi};
 use vapor_forge_patterns::pe_image::PeImage;
 
@@ -65,25 +66,24 @@ const ANCHORED: [(&str, [u32; 3]); 2] = [
 
 #[test]
 fn cnet_layout_from_the_installed_client() {
-    let Some(path) = client_path() else {
+    let Some(path) = client_path(ENGINE_VARIABLE) else {
         eprintln!("{ENGINE_VARIABLE} is unset: skipping the golden decode");
         return;
     };
-    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("read {} from {ENGINE_VARIABLE}: {error}", path.display())
-    });
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("read {} from {ENGINE_VARIABLE}: {error}", path.display()));
     let digest = sha256_hex(&bytes);
-    let image = PeImage::parse(&bytes)
-        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+    let image =
+        PeImage::parse(&bytes).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
     let segment = image
         .code_segment()
         .unwrap_or_else(|error| panic!("executable section of {}: {error}", path.display()));
-    let corpus = corpus_for(&digest);
+    let corpus = corpus_for(MODULE, &digest);
 
     let mut offsets = [0usize; 3];
     let mut rvas = [0u32; 3];
     for (slot, symbol) in SYMBOLS.iter().enumerate() {
-        let pattern = pattern_for(&corpus, symbol);
+        let pattern = pattern_for(MODULE, &corpus, symbol);
         let sites = find_all(segment.bytes, &pattern);
         assert_eq!(
             sites.len(),
@@ -134,107 +134,4 @@ fn cnet_layout_from_the_installed_client() {
     if let Some((_, anchored)) = ANCHORED.iter().find(|(sha, _)| *sha == digest) {
         assert_eq!(rvas, *anchored, "corpus anchors against the measured RVAs");
     }
-}
-
-/// The client image to decode, when the environment names one.
-fn client_path() -> Option<PathBuf> {
-    let value = std::env::var_os(ENGINE_VARIABLE)?;
-    let path = PathBuf::from(value);
-    assert!(
-        path.is_file(),
-        "{ENGINE_VARIABLE} must name a file, not {}",
-        path.display()
-    );
-    Some(path)
-}
-
-/// The committed corpus file for this build: the file names are the image
-/// digests, so the corpus a live client is verified against is the one that
-/// shipped for it.
-fn corpus_for(digest: &str) -> PathBuf {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../res/patterns/win64")
-        .join(MODULE);
-    let path = directory.join(format!("{digest}.toml"));
-    assert!(
-        path.is_file(),
-        "the win64 corpus has no file for this image: {} (a new build needs \
-         vapor-forge-pattern-mine and a fresh corpus entry)",
-        path.display()
-    );
-    path
-}
-
-/// One `pattern = "..."` payload from the corpus, by symbol. The decoder test
-/// only needs the bytes, so this reads them without a TOML parser: a section
-/// header names the symbol, the next `pattern` line is its bytes, `??` is a
-/// wildcard.
-fn pattern_for(corpus: &Path, symbol: &str) -> Vec<Option<u8>> {
-    let text = std::fs::read_to_string(corpus)
-        .unwrap_or_else(|error| panic!("read {}: {error}", corpus.display()));
-    let header = format!("[{MODULE}.\"{symbol}\"]");
-    let start = text
-        .find(&header)
-        .unwrap_or_else(|| panic!("{} has no {header}", corpus.display()));
-    let section = &text[start + header.len()..];
-    let section = &section[..section.find('[').unwrap_or(section.len())];
-    let pattern = section
-        .lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("pattern = "))
-        .unwrap_or_else(|| panic!("{} has no pattern for {symbol}", corpus.display()))
-        .trim_matches('"');
-    pattern
-        .split_whitespace()
-        .map(|token| {
-            (token != "??")
-                .then(|| {
-                    u8::from_str_radix(token, 16)
-                        .unwrap_or_else(|error| panic!("bad token {token:?}: {error}"))
-                })
-        })
-        .collect()
-}
-
-/// Every offset in `haystack` where `pattern` matches, wildcards included.
-fn find_all(haystack: &[u8], pattern: &[Option<u8>]) -> Vec<usize> {
-    let Some((anchor, lead)) = pattern
-        .iter()
-        .enumerate()
-        .find_map(|(index, token)| token.map(|byte| (byte, index)))
-    else {
-        return Vec::new();
-    };
-    let mut sites = Vec::new();
-    let mut from = 0usize;
-    while let Some(found) = haystack[from..].iter().position(|&byte| byte == anchor) {
-        let start = from + found;
-        let site = start as isize - lead as isize;
-        from = start + 1;
-        if site < 0 {
-            continue;
-        }
-        let site = site as usize;
-        let Some(window) = haystack.get(site..site + pattern.len()) else {
-            break;
-        };
-        if window
-            .iter()
-            .zip(pattern)
-            .all(|(byte, token)| token.is_none_or(|token| token == *byte))
-        {
-            sites.push(site);
-        }
-    }
-    sites
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
