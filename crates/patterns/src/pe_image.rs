@@ -36,6 +36,8 @@ pub struct PeImage<'a> {
     bits: u8,
     image_base: u64,
     sections: Vec<PeSection>,
+    /// File offset of the data-directory array and its entry count.
+    directories: (usize, usize),
 }
 
 impl<'a> PeImage<'a> {
@@ -65,6 +67,11 @@ impl<'a> PeImage<'a> {
             return Err(format!("PE32 image with unexpected machine {machine:#06x}"));
         }
 
+        // Data directories live at the end of the optional header; PE32+ keeps
+        // them 16 bytes further in than PE32.
+        let dir_count = read_u32(data, optional + if bits == 64 { 108 } else { 92 })? as usize;
+        let directories = (optional + if bits == 64 { 112 } else { 96 }, dir_count.min(16));
+
         let table = optional
             .checked_add(optional_size)
             .ok_or_else(|| "section table offset overflows".to_owned())?;
@@ -93,6 +100,7 @@ impl<'a> PeImage<'a> {
             bits,
             image_base,
             sections,
+            directories,
         })
     }
 
@@ -106,6 +114,24 @@ impl<'a> PeImage<'a> {
 
     pub fn image_base(&self) -> u64 {
         self.image_base
+    }
+
+    /// `(rva, size)` of data directory `index` (3 = exception directory).
+    pub fn data_directory(&self, index: usize) -> Option<(u32, u32)> {
+        let (offset, count) = self.directories;
+        if index >= count {
+            return None;
+        }
+        let at = offset + index * 8;
+        let rva = read_u32(self.data, at).ok()?;
+        let size = read_u32(self.data, at + 4).ok()?;
+        Some((rva, size))
+    }
+
+    /// Borrow `len` bytes at an RVA.
+    pub fn bytes_at_rva(&self, rva: u64, len: usize) -> Option<&'a [u8]> {
+        let offset = self.rva_to_offset(rva)?;
+        self.data.get(offset..offset + len)
     }
 
     pub fn sections(&self) -> &[PeSection] {
