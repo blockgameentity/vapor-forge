@@ -8,6 +8,7 @@
 pub mod corpus;
 pub mod deps;
 pub mod installer;
+pub mod patch;
 mod run;
 
 #[cfg(test)]

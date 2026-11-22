@@ -10,6 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vapor-forge-pe = { path = "../pe" }
+iced-x86.workspace = true
 vapor-forge-patterns = { path = "../patterns", default-features = false }
 sha2.workspace = true
 thiserror.workspace = true

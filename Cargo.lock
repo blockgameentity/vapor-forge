@@ -1427,6 +1427,7 @@ dependencies = [
 name = "vapor-forge-host-windows"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "sha2",
  "thiserror",
  "tracing",
