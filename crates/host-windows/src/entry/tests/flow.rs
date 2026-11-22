@@ -224,13 +224,14 @@ fn the_config_flags_reach_the_hook_state() {
 /// body table rather than the resolver.
 ///
 /// This is the achievements flow in one place: `CAPIJobRequestUserStats::BInit` and
-/// `::YieldingMergeStats` are anchored in both live builds and listed in
-/// `install::deps`, but no replacement body exists (`crate::abi::achievements`
-/// measures why). So today the batch resolves the symbol, declines to install it,
-/// and reports `achievements` disabled with the reason naming the symbol — every
-/// other capability is untouched. The assertion is written against
-/// [`hooks::replacement_address`] on purpose: the day a body lands, this test
-/// asserts the other half (installed, capability kept) without an edit.
+/// `::YieldingMergeStats` are anchored in both live builds, and only the merge is
+/// listed in `install::deps` because only the merge has a body
+/// ([`hooks::achievements`], observation-only — it forwards the call and reports,
+/// `crate::abi::achievements` measures why the rebuild needs one more anchor). So
+/// today the batch resolves the symbol and installs it, keeping `achievements`
+/// enabled; every other capability is untouched. The assertion is written against
+/// [`hooks::replacement_address`] so both states are covered: a bodyless stats symbol
+/// must still decline to install and disable exactly its own capability.
 #[test]
 fn the_stats_job_anchor_resolves_and_achievements_follows_its_body() {
     let dir = TempDir::new("achievements");

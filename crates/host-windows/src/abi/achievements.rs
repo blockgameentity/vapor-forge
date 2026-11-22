@@ -12,11 +12,11 @@
 //! | [`BINIT_SYMBOL`] | `0xa8fd20` | `0xab99a0` | 736 B / 902 B |
 //! | [`MERGE_SYMBOL`] | `0xaa0420` | `0xac97d0` | 3,562 B / 3,491 B |
 //!
-//! **Nothing here is installed.** [`crate::features::achievements`] keeps the
-//! decision and [`crate::hooks::REPLACEMENTS`] carries no body for either symbol;
-//! the last section of this module is the measurement that says why, and what a
-//! hook would need instead. The shapes are recorded so the next pass does not
-//! re-derive them from 26 MB of module bytes.
+//! **Only the merge carries a body**, and it is *observation only*:
+//! [`crate::hooks::achievements`] forwards the call verbatim, classifies the
+//! `EResult` and logs what the local-rebuild decision answers. It rebuilds
+//! nothing, because the reply it would have to rewrite is not an argument and no
+//! longer bytes: see [the conclusion](#why-the-reply-cannot-be-replaced-here).
 //!
 //! # Calling convention and evidence classes
 //!
@@ -64,8 +64,8 @@ pub type BInitFn =
 ///
 /// | slot | meaning | status |
 /// | --- | --- | --- |
-/// | `rcx` | `this`: the same job object | **Verified** — public `0xaa042c` (`mov %rcx,0x8(%rax)`), beta `0xac97dc`; the merge dereferences it throughout. |
-/// | `edx` | `EResult` of the reply, supplied by the only caller from the response parser | **Verified** — public `0xaa0420` (`sub $0x2,%edx`), beta `0xac97d0`, and the caller sequence `mov %edi,%edx; mov %rbx,%rcx; call YieldingMergeStats` quoted in `VTABLE-REPORT.md` §1. 32 bits: the dispatch is `sub`, `sub`, `cmp $0xd`, not a pointer test. |
+/// | `rcx` | `this`: the same job object | **Verified** — public `0xaa042c` (`mov %rcx,0x8(%rax)`), beta `0xac97dc`; the merge dereferences it throughout (`mov 0x1a8(%r13),%rax` at public `0xaa04a5`, `mov 0x198(%r13),%rcx` at `0xaa0477`). |
+/// | `edx` | `EResult` of the reply, supplied by the only caller from the response parser | **Verified** — public `0xaa0420` (`sub $0x2,%edx`), beta `0xac97d0`, and the caller sequence `call 0xa93120; mov %eax,%edi; … mov %edi,%edx; call 0xaa0420` (public `0xa8ff72`–`0xa8ff7e`). 32 bits: the dispatch is `sub`, `sub`, `cmp $0xd`, not a pointer test. |
 /// | `r8` | unmeasured | **Assumed** — the anchored entry does not read it; declared for verbatim forwarding. |
 /// | `r9` | unmeasured | **Assumed** — same evidence as `r8`. |
 ///
@@ -73,13 +73,27 @@ pub type BInitFn =
 ///
 /// Nothing. The epilogues (`public 0xaa1200`, `0xaa1209`) leave `eax` untouched
 /// and the only caller ignores it, so a replacement is `-> ()`.
+///
+/// # Which `EResult`s merge
+///
+/// See [`MERGE_EARLY_RETURN`]: the entry's own dispatch returns before any merge
+/// for exactly three values, and every other value runs it.
 pub type MergeStatsFn =
     unsafe extern "system" fn(this: *mut c_void, eresult: i32, r8: usize, r9: usize);
+
+/// The `EResult`s at which [`MERGE_SYMBOL`] returns without merging.
+///
+/// **Verified** from the anchored entry in both builds: public `0xaa0420` is
+/// `sub $0x2,%edx; je …` (`0xaa0423`), `sub $0x1,%edx; je …` (`0xaa043f`) and
+/// `cmp $0xd,%edx; je …` (`0xaa0448`), i.e. `2`, `3` and `16` leave the client's
+/// stats store alone. `3` is also the value the run method passes on its own
+/// "no connection to Steam" path (public `0xa8ff24`, `mov $0x3,%edi`).
+pub const MERGE_EARLY_RETURN: [i32; 3] = [2, 3, 16];
 
 /// The job-object fields a body would have to read, per live build.
 ///
 /// Offsets are the **only** way into this object: both anchored functions take
-/// nothing but `this` and an `EResult`, so the app id, the reply block and the
+/// nothing but `this` and an `EResult`, so the app id, the reply object and the
 /// engine all live inside the allocation. Each offset is **Verified** by the
 /// instruction that reads it, in that build; they are *not* interchangeable
 /// between builds.
@@ -89,7 +103,7 @@ pub struct JobFields {
     /// for the service-method response. Verified: public `0xa8fda1`
     /// (`mov 0x170(%rbx),%rcx; mov (%rcx),%rax; call *0x28(%rax)`).
     pub engine: usize,
-    /// The reply's stats block: the ordered dictionary the merge walks, replaces
+    /// The parsed stats block: the ordered dictionary the merge walks, replaces
     /// and frees. Verified: public `0xaa04a5` (`mov 0x1a8(%r13),%rax`), written
     /// back at `0xaa0ca4` (`mov %rbp,0x1a8(%r13)`) with the old block released.
     pub stats_block: usize,
@@ -98,6 +112,12 @@ pub struct JobFields {
     /// own argument block: public `0xa8fd65` (`movzbl 0x3(%rsi)`),
     /// `0xa8fd99` (`test $0xffffff,(%rsi)`), `0xa8fd7a` (`cmp $0x0,0x4(%rsi)`).
     pub game_id: usize,
+    /// The reply object the response parser reads the protobuf body out of.
+    /// Verified twice per build: the run method stores it (`mov %rax,0x1b0(%rbx)`,
+    /// public `0xa8fe11`; `mov %rax,0x1a8(%rbx)`, beta `0xab9a64`) and the parser
+    /// loads it before the body (`mov 0x1b0(%r14),%rcx; … lea 0x18(%rcx),%rdi`,
+    /// public `0xa93161`; the same on `0x1a8` at beta `0xabcc61`).
+    pub reply: usize,
 }
 
 /// Public build `669fa08e259277fbf5a1dfe15ce88afe734e89151194304b44d92f418dcc985b`.
@@ -105,6 +125,7 @@ pub const PUBLIC: JobFields = JobFields {
     engine: 0x170,
     stats_block: 0x1a8,
     game_id: 0x198,
+    reply: 0x1b0,
 };
 
 /// Publicbeta build `4a2d79520a72c55854c61c22cbfc53ec4e12cc13cc00e0c27d9b520648fe1c10`.
@@ -112,7 +133,17 @@ pub const PUBLICBETA: JobFields = JobFields {
     engine: 0x168,
     stats_block: 0x1a0,
     game_id: 0x190,
+    reply: 0x1a8,
 };
+
+/// Where the protobuf body sits inside the reply object, in both builds.
+///
+/// **Verified**: public `0x138a9318c` (`lea 0x18(%rcx),%rdi` with `rcx` loaded
+/// from `*(this+0x1b0)` one instruction earlier) and beta `0x138abcc8b` (the same
+/// `lea` on `*(this+0x1a8)`). This is the *only* place a rebuilt stats reply could
+/// be substituted, and it is inside the response parser — not inside either
+/// anchored job method.
+pub const REPLY_BODY_OFFSET: usize = 0x18;
 
 /// The fields of the build whose module sha256 is `sha256`, or `None`.
 ///
@@ -128,38 +159,44 @@ pub fn fields_for(sha256: &str) -> Option<JobFields> {
     }
 }
 
-// Why neither anchored site carries the local achievement rebuild yet.
+// Why the reply cannot be replaced here.
 //
 // This is the module's conclusion, kept next to the shapes it is derived from.
+// Every claim below was re-read from the two live builds for this pass; none of
+// it is inherited from the earlier "no merge-site hook" verdict without a quote.
 //
-// 1. **The reply bytes are already gone.** Linux replaces the encoded reply
-//    body (`crates/hooks/src/netpacket/stats_proxy.rs`), before anything parses
-//    it. Both anchored sites run *after* the parse: the reply is a stats block
-//    inside `this` ([`JobFields::stats_block`]), not bytes.
-// 2. **Replacing that block means constructing the client's own dictionary.**
-//    The merge builds a replacement block, stores it over the old pointer
-//    (`mov %rbp,0x1a8(%r13)`, public `0xaa0ca4`) and releases the old one with a
-//    size of 0xa0 (`0xaa0c97`). The walk is inlined over 0x38-byte nodes with the
-//    key at `+0x10`; the calls inside it are the dictionary's hash/lookup pair
-//    (`0x138d9ef40`, `0x138d9fb50`) and, at the replacement, the block's
-//    destructor and deallocation (`0x138a8c4a0`, `0x1388cead0`). None of the four
-//    is in the corpus, and none is a writer the host could call: there is no
-//    separable insert function at all, so this cannot be fixed by a second
-//    pattern — the shape has to be reimplemented or replaced upstream of the
-//    parse.
+// 1. **The reply is already a dictionary, not bytes.** The parser
+//    (`0xa93120` / `0xabcc20`) reads the protobuf body at `*(this + reply) +
+//    REPLY_BODY_OFFSET`, builds the ordered dictionary it stores at
+//    `this + stats_block`, and returns the `EResult` the merge is then handed. By
+//    the time either anchored job method is entered with an `EResult` in hand,
+//    the encoded reply no longer exists in the job object.
+// 2. **Nothing writes that dictionary but inlined code.** The merge copies the
+//    reply's entries into the client's per-app store
+//    (`0x138a95900(engine_ctx, &game_id, *(this+0x190))`, public `0xaa0498`) with
+//    the insert inlined over `0x38`-byte nodes: interning/hashing at
+//    `0x138d9ef40`, lookup at `0x138d9fb50`, the replacement written directly at
+//    `0xaa0ca4` (`mov %rbp,0x1a8(%r13)`). The parser inlines the same pair
+//    (`0x138a9383b`, `0x138a93848`). There is no `Insert(key, value)` function to
+//    anchor, so "add an achievement entry" is not a missing pattern — it is a
+//    shape no pattern can supply.
 // 3. **Every field is a per-build offset.** [`PUBLIC`] and [`PUBLICBETA`] differ
-//    by a uniform `-0x8`; the corpus format carries patterns only, so a body
+//    by a uniform `-0x8`, and the corpus format carries patterns only, so a body
 //    would carry a build table ([`fields_for`]) and fail closed off it.
 // 4. **The decision has no input producer on this host.** Definitions come from
 //    a stats schema parsed by `vapor_forge_steam_protocol`'s
 //    `parse_achievement_bit_mappings`, which is not a dependency of this crate
 //    and which no Windows hook has ever fed.
 //
-// What the body would need instead: the reply *body* site — §1 site 2
-// (`0xa93120` / `0xabcc20`, the response parser, unanchored) — or the CM receive
-// path with the win64 packet layout (`CNetPacket::{Init, Alloc, Release}`, in
-// neither win64 corpus file), plus a schema cache for this host. See
-// [`crate::features::achievements`] for the wiring that *is* done.
+// What a real rebuild needs instead is exactly one more anchor: the response
+// parser (`0xa93120` / `0xabcc20`, §1 site 2). It takes only `this` and returns
+// the `EResult`, so a detour there would have the reply object in hand — and with
+// it `*(this + reply) + REPLY_BODY_OFFSET`, the bytes the Linux host substitutes
+// in `crates/hooks/src/netpacket/stats_proxy.rs`. It is in neither win64 corpus
+// file, and adding it is the patterns workstream's call, not this crate's.
+// [`crate::features::achievements`] holds the wiring that *is* done, and
+// [`crate::hooks::achievements`] the observation-only body that stands at the
+// merge today.
 
 #[cfg(test)]
 mod tests {
@@ -171,14 +208,16 @@ mod tests {
     const BETA_SHA: &str = "4a2d79520a72c55854c61c22cbfc53ec4e12cc13cc00e0c27d9b520648fe1c10";
 
     #[test]
-    fn both_anchored_sites_gate_the_achievements_capability() {
-        for symbol in [BINIT_SYMBOL, MERGE_SYMBOL] {
-            assert_eq!(
-                capabilities_for_symbol(symbol),
-                &[Capability::Achievements],
-                "{symbol} is the achievements site and must gate nothing else"
-            );
-        }
+    fn the_merge_is_the_one_site_that_gates_the_capability() {
+        // The merge is the site with a body (`crate::hooks::achievements`), so it is
+        // the dependency. The run method has none, and a bodyless symbol would
+        // disable the capability on every real install.
+        assert_eq!(
+            capabilities_for_symbol(MERGE_SYMBOL),
+            &[Capability::Achievements],
+            "{MERGE_SYMBOL} is the achievements site and must gate nothing else"
+        );
+        assert!(capabilities_for_symbol(BINIT_SYMBOL).is_empty());
     }
 
     #[test]
@@ -208,8 +247,25 @@ mod tests {
             (PUBLIC.engine, PUBLICBETA.engine),
             (PUBLIC.stats_block, PUBLICBETA.stats_block),
             (PUBLIC.game_id, PUBLICBETA.game_id),
+            (PUBLIC.reply, PUBLICBETA.reply),
         ] {
             assert_eq!(public, beta + 0x8);
         }
+    }
+
+    #[test]
+    fn the_reply_body_offset_is_the_same_in_both_builds() {
+        // The one measured fact a future parser hook would not have to re-derive:
+        // the body is at `+0x18` from the reply object even though the object's own
+        // offset in the job moves by 8 between builds.
+        assert_eq!(REPLY_BODY_OFFSET, 0x18);
+        assert_ne!(PUBLIC.reply, PUBLICBETA.reply);
+    }
+
+    #[test]
+    fn the_merge_dispatch_values_are_the_three_measured_ones() {
+        assert_eq!(MERGE_EARLY_RETURN, [2, 3, 16]);
+        // The merge runs for everything else, so a body must forward any value.
+        assert!(!MERGE_EARLY_RETURN.contains(&1));
     }
 }

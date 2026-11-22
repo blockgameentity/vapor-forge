@@ -23,6 +23,7 @@
 //! | [`callbacks`] | `CSteamEngine::SetAPICallResult` (body in [`callback_result`]) | yes / yes |
 //! | [`legacy_cdkey`] | `IClientUser::RequiresLegacyCDKey` | yes / yes |
 //! | [`launch_env`] | `CUser::BuildSpawnEnvBlock` | yes / yes |
+//! | [`achievements`] (observation only) | `CAPIJobRequestUserStats::YieldingMergeStats` | yes / yes |
 //! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
 //!
 //! The rows that carry an anchor gap are listed rather than hidden: `install::deps`
@@ -47,20 +48,21 @@
 //! anchor never installs, and registering one would make the install report claim a
 //! hook it does not have.
 //!
-//! `achievements` is the third, and a different case: its decision lives in
+//! `achievements` is no longer in that list. Its decision lives in
 //! [`crate::features::achievements`], its two candidate sites are **anchored**
-//! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`, both live builds),
-//! and there is still no body — the reply the rebuild would answer has already been
-//! parsed by the time either site runs, and the stats block it would replace is
-//! written by inlined dictionary code that no pattern can resolve to a function.
-//! `crate::abi::achievements` records the disassembly, the per-build job-object
-//! offsets and what a hook would need instead; `install::deps` maps both symbols to
-//! `Capability::Achievements`, so a live install reports the capability disabled
-//! with the truthful "no replacement body" reason rather than claiming a hook.
+//! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`, both live
+//! builds), and [`achievements`] now registers an **observation-only** body at the
+//! merge: it forwards the call verbatim, classifies the `EResult` it was handed and
+//! logs what the local-rebuild decision answers, and it mutates nothing. The
+//! rebuild itself still has no site — `crate::abi::achievements` records the
+//! disassembly that rules the merge (and the run method) out and names the reply
+//! parser as the anchor it would need — so the capability is enabled by the
+//! install pass and the report says what the body truthfully is.
 //!
 //! [`family_play`] is the one decision that is not a hook: it is the concurrent-play
 //! consult that [`ownership`] and [`package`] call.
 
+pub mod achievements;
 pub mod callback_result;
 pub mod callbacks;
 pub mod cloud_http;
@@ -123,6 +125,7 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (callback_result::SYMBOL, callback_result::address),
     (legacy_cdkey::SYMBOL, legacy_cdkey::address),
     (launch_env::SYMBOL, launch_env::address),
+    (achievements::SYMBOL, achievements::address),
     (ui::visibility::SYMBOL, ui::visibility::address),
     (ui::overview::SYMBOL, ui::overview::address),
     (ui::snapshot::SYMBOL, ui::snapshot::address),
@@ -239,22 +242,23 @@ mod tests {
     }
 
     #[test]
-    fn the_anchored_stats_job_carries_no_body_yet() {
-        // The achievements decision is the one that has anchors and no body: both
-        // job sites resolve in both live builds, and neither can carry the rebuild
-        // (see `crate::abi::achievements`). The capability's gate follows this
-        // table, so the assertion is also what keeps the install report honest:
-        // the day either body is written, this test fails and the report starts
-        // saying `achievements` is on.
-        for symbol in [
-            crate::abi::achievements::BINIT_SYMBOL,
-            crate::abi::achievements::MERGE_SYMBOL,
-        ] {
-            assert_eq!(
-                replacement_address(symbol),
-                None,
-                "{symbol} must not be claimed as installable while it has no body"
-            );
-        }
+    fn the_merge_body_is_observation_only_and_registered() {
+        // The body replaces the stats-job merge and changes nothing: it forwards
+        // the call and reports. The capability is gated by the same symbol
+        // (`install::deps`), so registering it is what keeps `achievements`
+        // enabled on a live install — and the install report says "installed",
+        // which is exactly as much as this body earns.
+        assert_eq!(
+            replacement_address(crate::abi::achievements::MERGE_SYMBOL),
+            Some(achievements::address())
+        );
+        // The run method stays without a body: it drives the whole
+        // request/parse/merge cycle, so a detour there could only observe, and the
+        // merge already does.
+        assert_eq!(
+            replacement_address(crate::abi::achievements::BINIT_SYMBOL),
+            None,
+            "the job's run method must not be claimed as installable while it has no body"
+        );
     }
 }

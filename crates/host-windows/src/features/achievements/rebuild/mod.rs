@@ -1,5 +1,5 @@
-//! The local achievement rebuild — **decision ready, both job sites anchored,
-//! still no body**.
+//! The local achievement rebuild — **decision ready, merge site observed, rebuild
+//! still blocked on one anchor**.
 //!
 //! `features::achievements::local` rebuilds a stats reply's achievement payload
 //! from locally known definitions when the schema path cannot describe it. The
@@ -10,7 +10,7 @@
 //! `RebuiltAchievements::{service_response, legacy_response}` into the packet body
 //! about to be queued.
 //!
-//! # Both job sites, and why neither carries a body yet
+//! # Both job sites, and why neither carries the rebuild
 //!
 //! `res/patterns/win64/VTABLE-REPORT.md` §1 replaced the old verdict ("no stats
 //! symbol exists") with the real shape: a job chain. `CUserStats` slot 6 constructs
@@ -29,16 +29,19 @@
 //!
 //! 1. The reply *bytes* are gone by then. The Linux body substitutes an encoded
 //!    reply; at the merge the reply is already a stats block inside the job
-//!    object, and the two arguments are only `this` and an `EResult`.
+//!    object, and the two arguments are only `this` and an `EResult`. The bytes
+//!    are at `*(this + reply) + 0x18` (`REPLY_BODY_OFFSET`, the same `+0x18` in
+//!    both builds) and nothing at the job site reads them any more.
 //! 2. Replacing that block means constructing Steam's own ordered dictionary: the
 //!    merge allocates a fresh block and inserts into it with **inlined** code
 //!    (0x38-byte nodes, interned keys, a comparator called at `0x138d9ef40`). There
 //!    is no writer function to anchor — so this is not a missing pattern, it is a
 //!    shape that no pattern can supply.
-//! 3. Every field of the job object is a per-build offset (`engine`, the reply
-//!    block, the `CGameID` holding the app id — public `0x170`/`0x1a8`/`0x198`,
-//!    publicbeta `0x168`/`0x1a0`/`0x190`). A body would carry a build table and
-//!    fail closed off it; the corpus carries patterns only.
+//! 3. Every field of the job object is a per-build offset (the engine, the reply
+//!    block, the reply *object*, the `CGameID` holding the app id — public
+//!    `0x170`/`0x1a8`/`0x1b0`/`0x198`, publicbeta `0x168`/`0x1a0`/`0x1a8`/`0x190`).
+//!    A body would carry a build table and fail closed off it; the corpus carries
+//!    patterns only.
 //! 4. The decision's `local` input has no producer on this host: definitions come
 //!    from a stats schema parsed by `vapor_forge_steam_protocol`, which this crate
 //!    does not depend on and which no Windows hook has ever fed.
@@ -48,12 +51,14 @@
 //! the CM receive path with the win64 packet layout
 //! (`CNetPacket::{Init, Alloc, Release}`, in neither win64 corpus file) — where
 //! `legacy_response`/`service_response` bytes can actually be substituted, exactly
-//! as Linux does — plus a schema cache for this host. Registering a body at the
-//! job today would make the install report claim a hook that serves nothing, so
-//! nothing is registered.
+//! as Linux does — plus a schema cache for this host. Registering a body that
+//! served nothing would make the install report claim a rebuild the host does not
+//! have, so the only body registered at the job is the **observation-only** one in
+//! [`crate::hooks::achievements`]: it forwards the merge verbatim, classifies the
+//! `EResult` and logs [`decide`]'s answer without mutating anything.
 //!
-//! [`decide`] is the portable half, written so the future body is a wrapper: it
-//! runs the **real** feature entry point
+//! [`decide`] is the portable half and the observation body's wrapper: it runs the
+//! **real** feature entry point
 //! (`rebuild_local_achievements_if_enabled`), so the flag, the schema precedence
 //! and the definitions all behave exactly as the Linux path does.
 
@@ -197,129 +202,4 @@ pub fn counts(plan: &RebuildPlan) -> Option<AchievementCounts> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use vapor_forge_features::achievements::{
-        set_local_rebuild, AchievementDisplay, LocalAchievement,
-    };
-
-    /// The rebuild flag is process-wide, and `features::run` writes it from other
-    /// tests in this binary. Every test here holds the crate-wide lock
-    /// ([`crate::test_lock`]) so no one can flip the flag between the write and
-    /// the assertion, and each restores it before the guard is dropped.
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_lock::serial()
-    }
-
-    fn on() -> AchievementSettings {
-        AchievementSettings {
-            local_rebuild: true,
-        }
-    }
-
-    fn local() -> LocalAchievementSet {
-        LocalAchievementSet {
-            groups: Vec::new(),
-            achievements: vec![
-                LocalAchievement::new("ACH_ONE", 1, 0),
-                LocalAchievement::new("ACH_TWO", 1, 1),
-            ],
-        }
-    }
-
-    fn request() -> RebuildRequest {
-        RebuildRequest {
-            app_id: 480,
-            local: local(),
-            unlocks: vec![AchievementUnlockState {
-                key: "ACH_TWO".to_owned(),
-                unlocked: true,
-                unlock_time: Some(1_600_000_000),
-            }],
-            schema: None,
-        }
-    }
-
-    #[test]
-    fn a_disabled_capability_wins_over_every_other_reason() {
-        let plan = decide(Some("CUser::GetUserStats did not resolve"), &on(), &request());
-        assert_eq!(
-            plan,
-            RebuildPlan::CapabilityDisabled("CUser::GetUserStats did not resolve".to_owned())
-        );
-        assert!(!plan.rebuilds());
-        assert!(plan.summary().contains("disabled"));
-    }
-
-    #[test]
-    fn the_flag_being_off_leaves_the_schema_path_alone() {
-        let _guard = serial();
-        let plan = decide(None, &AchievementSettings::default(), &request());
-        assert_eq!(plan, RebuildPlan::FlagOff);
-        assert!(counts(&plan).is_none());
-    }
-
-    #[test]
-    fn a_setting_that_was_never_applied_is_refused_rather_than_served() {
-        let _guard = serial();
-        set_local_rebuild(false);
-        let plan = decide(None, &on(), &request());
-        assert_eq!(plan, RebuildPlan::SwitchOff);
-    }
-
-    #[test]
-    fn a_reply_with_a_schema_keeps_the_schema_authoritative() {
-        let _guard = serial();
-        set_local_rebuild(true);
-        let mut request = request();
-        request.schema = Some(vec![0x01, 0x02, 0x03]);
-        assert_eq!(decide(None, &on(), &request), RebuildPlan::SchemaAvailable);
-        set_local_rebuild(false);
-    }
-
-    #[test]
-    fn a_reply_that_names_no_app_is_not_rebuilt() {
-        let _guard = serial();
-        set_local_rebuild(true);
-        let mut request = request();
-        request.app_id = 0;
-        assert_eq!(decide(None, &on(), &request), RebuildPlan::NoApp);
-        set_local_rebuild(false);
-    }
-
-    #[test]
-    fn no_local_definitions_means_nothing_to_rebuild_from() {
-        let _guard = serial();
-        set_local_rebuild(true);
-        let mut request = request();
-        request.local = LocalAchievementSet::default();
-        assert_eq!(
-            decide(None, &on(), &request),
-            RebuildPlan::NoLocalDefinitions
-        );
-        set_local_rebuild(false);
-    }
-
-    #[test]
-    fn an_enabled_flag_rebuilds_through_the_feature_entry_point() {
-        let _guard = serial();
-        set_local_rebuild(true);
-        let plan = decide(None, &on(), &request());
-        let RebuildPlan::Rebuild(rebuilt) = &plan else {
-            panic!("an enabled flag with local definitions must rebuild: {plan:?}");
-        };
-        assert_eq!(rebuilt.app_id, 480);
-        assert_eq!(rebuilt.counts.total, 2);
-        assert_eq!(rebuilt.counts.unlocked, 1);
-        assert_eq!(rebuilt.source, RebuildSource::Local);
-        assert_eq!(rebuilt.achievements.len(), 2);
-        assert_eq!(counts(&plan), Some(rebuilt.counts));
-        assert!(plan.summary().contains("rebuilt 2 achievement(s)"));
-        // The rebuilt display names come from the key, never from an invention.
-        assert_eq!(
-            rebuilt.achievements[0].display,
-            AchievementDisplay::from_key("ACH_ONE")
-        );
-        set_local_rebuild(false);
-    }
-}
+mod tests;

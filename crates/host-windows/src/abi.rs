@@ -27,13 +27,14 @@
 //!    be undefined behaviour, so the trampoline types return `u8` and every body
 //!    produces its own `0`/`1`.
 //!
-//! One module here documents a shape with no body behind it:
+//! One module here documents a shape whose rebuild has no site yet:
 //! [`achievements`] records the two anchored `CAPIJobRequestUserStats` sites, the
-//! per-build job-object offsets they would have to read, and the measurement that
-//! currently rules a replacement body out. It is the one place where a
-//! *Verified* fact is derived from the whole anchored function rather than from
-//! the pattern's store widths, because the pattern alone cannot express "this
-//! method only reads `rcx`".
+//! per-build job-object offsets, where the reply bytes actually are, and the one
+//! anchor that is still missing. It is also the one place where a *Verified* fact is
+//! derived from the whole anchored function rather than from the pattern's store
+//! widths, because the pattern alone cannot express "this method only reads `rcx`".
+//! Its merge type does have a body ([`crate::hooks::achievements`]), and that body
+//! is observation-only.
 
 pub mod achievements;
 pub mod callbacks;

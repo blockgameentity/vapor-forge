@@ -24,6 +24,7 @@ use vapor_forge_features::ticket::authorisation::{self, AuthorisationWindow};
 use vapor_forge_features::ticket::TicketCache;
 
 use crate::capability::{Capability, Gate};
+use crate::features::achievements::AchievementSettings;
 use crate::features::{CloudPlan, IdentitySettings};
 use crate::hooks::depot_store::DepotPlan;
 use crate::hooks::netpacket::ledger::Ledger as NetPacketLedger;
@@ -62,6 +63,13 @@ pub struct HostState {
     depot_keys: HashMap<DepotId, Vec<u8>>,
     /// The per-game SteamID overrides, config and script state merged.
     identity: IdentitySettings,
+    /// The resolved `[achievements]` settings, which is the flag the stats-merge
+    /// hook consults.
+    ///
+    /// The worker resolves it from `config_apply` (`config.achievements.local_rebuild`)
+    /// and attaches it here, so a hook body reads the value the feature pass
+    /// applied rather than a second copy of the config.
+    achievements: AchievementSettings,
     /// What the CM dispatch hook saw, bounded and read-only once recorded.
     ///
     /// A hook body runs on Steam's networking thread, so the record is a fixed
@@ -92,6 +100,7 @@ impl HostState {
             cloud: CloudPlan::default(),
             depot_keys: HashMap::new(),
             identity: IdentitySettings::default(),
+            achievements: AchievementSettings::default(),
             netpacket: NetPacketLedger::new(),
         }
     }
@@ -135,6 +144,16 @@ impl HostState {
     #[must_use]
     pub fn with_identity_settings(mut self, identity: IdentitySettings) -> Self {
         self.identity = identity;
+        self
+    }
+
+    /// Attach the resolved `[achievements]` settings.
+    ///
+    /// Without this the body sees [`AchievementSettings::default`], i.e. the
+    /// rebuild off, which is the same behaviour as a user who never enabled it.
+    #[must_use]
+    pub fn with_achievement_settings(mut self, achievements: AchievementSettings) -> Self {
+        self.achievements = achievements;
         self
     }
 
@@ -188,6 +207,11 @@ impl HostState {
     /// The resolved per-game SteamID overrides.
     pub fn identity_settings(&self) -> &IdentitySettings {
         &self.identity
+    }
+
+    /// The resolved `[achievements]` settings.
+    pub fn achievement_settings(&self) -> &AchievementSettings {
+        &self.achievements
     }
 
     /// What the CM dispatch hook recorded, for diagnostics.

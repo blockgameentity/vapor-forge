@@ -163,12 +163,17 @@ pub fn run(
             DepotPlan::new(env.depotcache_dir(), Vec::new()),
         )
         .with_lua_tickets(lua_tickets)
-        // The three inputs the hook bodies cannot derive themselves: the cloud plan
+        // The four inputs the hook bodies cannot derive themselves: the cloud plan
         // (one decision, made once), the Lua depot keys the shader decision needs,
-        // and the per-game ids the SteamID decision presents.
+        // the per-game ids the SteamID decision presents, and the achievement flag
+        // the stats-merge observation reports.
         .with_cloud_plan(crate::features::plan_cloud(&settings.cloud))
         .with_depot_keys(script.depot_keys.clone())
-        .with_identity_settings(settings.identity.clone()),
+        .with_identity_settings(settings.identity.clone())
+        // The stats-merge hook consults the flag this pass applied, so the
+        // resolved setting travels with the state instead of being re-read from
+        // the config inside a hook body on Steam's thread.
+        .with_achievement_settings(settings.achievements),
     );
     // Published before any entry is patched: a body reached during the batch
     // sees the real configuration, and the gate is tightened as soon as the

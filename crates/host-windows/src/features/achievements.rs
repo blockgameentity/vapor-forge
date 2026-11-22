@@ -12,12 +12,12 @@
 //! `achievements` capability is enabled.
 //!
 //! [`rebuild`] is the other half: the decision that would answer a stats reply with
-//! a locally rebuilt payload. Both of the win64 stats-job sites it would sit at are
-//! anchored now (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`), and
-//! `crate::abi::achievements` measures why neither can carry the body yet — so the
-//! decision stays decision-only, calls the feature's own
-//! `rebuild_local_achievements_if_enabled` rather than a copy of it, and is not
-//! registered in [`crate::hooks::REPLACEMENTS`].
+//! a locally rebuilt payload. Both win64 stats-job sites are anchored
+//! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`), the merge now
+//! carries an **observation-only** body ([`crate::hooks::achievements`]) that
+//! forwards the call and reports what the decision answers, and
+//! `crate::abi::achievements` measures why the rebuild itself needs one more anchor
+//! (the response parser) before any body can serve it.
 
 use crate::features::report::FeatureState;
 use vapor_forge_features::achievements::{local_rebuild_enabled, set_local_rebuild};

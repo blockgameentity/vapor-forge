@@ -39,14 +39,13 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     // module and no slot has its shape, so it described a dependency the install
     // pass could never satisfy.
     //
-    // Neither job symbol has a body yet (`crate::abi::achievements` records the
-    // measurement that rules one out, and what a hook would need instead), so a
-    // live install reports `achievements` as disabled with "no replacement body
-    // for it yet" — which is the truth. Listing them here is what makes an
-    // anchor that stops resolving cost the capability instead of passing
-    // silently; the day a body is written, the same row keeps the gate honest
-    // without an edit.
-    (achievements::BINIT_SYMBOL, &[Capability::Achievements]),
+    // Only the merge is listed. It is the site that carries a body
+    // (`crate::hooks::achievements`, observation-only), so it is the symbol whose
+    // failure has to cost the capability. The run method has **no** body, and a
+    // bodyless symbol resolves-but-cannot-install in every batch: listing it would
+    // disable `achievements` on every live install regardless of the merge, which
+    // is the opposite of what a dependency row is for. The day `BInit` gets a
+    // replacement, its row comes back here with it.
     (achievements::MERGE_SYMBOL, &[Capability::Achievements]),
     (
         "CloseAppCloud",
@@ -137,21 +136,19 @@ mod tests {
     }
 
     #[test]
-    fn the_stats_job_symbols_gate_achievements_and_nothing_else() {
-        // The two anchored sites of the job chain `VTABLE-REPORT.md` §1 measures.
-        // Both are the same capability's dependency: an install that resolves only
-        // one of them still has no achievements path, so a failure at either is
-        // one disabled feature, not two.
-        for symbol in [
-            crate::abi::achievements::BINIT_SYMBOL,
-            crate::abi::achievements::MERGE_SYMBOL,
-        ] {
-            assert_eq!(
-                capabilities_for_symbol(symbol),
-                &[Capability::Achievements],
-                "{symbol} must gate achievements"
-            );
-        }
+    fn the_merge_symbol_gates_achievements_and_the_run_method_gates_nothing() {
+        // The merge carries the observation-only body, so it is the dependency.
+        assert_eq!(
+            capabilities_for_symbol(crate::abi::achievements::MERGE_SYMBOL),
+            &[Capability::Achievements]
+        );
+        // The run method has no body. Mapping it would make every real install
+        // resolve a symbol it cannot install and disable `achievements` with
+        // "no replacement body", even though the merge body installed.
+        assert!(
+            capabilities_for_symbol(crate::abi::achievements::BINIT_SYMBOL).is_empty(),
+            "a bodyless symbol must not gate a capability it cannot serve"
+        );
     }
 
     #[test]

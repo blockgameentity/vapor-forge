@@ -11,9 +11,10 @@
 //! * the depotcache candidate list comes from manifest request planning
 //!   (`vapor_forge_features::manifest`), not from config; the host fills
 //!   [`DepotCacheSettings::wanted`] from the plan it is about to install;
-//! * the local achievement rebuild flag has no config field yet
-//!   (`[achievements]` only carries `offline_schema`), so `resolve` leaves it off
-//!   and a caller that owns the setting sets [`AchievementSettings`] explicitly;
+//! * the local achievement rebuild flag has its own config field
+//!   (`[achievements] local_rebuild`), which the worker applies through
+//!   `vapor_forge_features::config_apply`, so `resolve` leaves it off here and the
+//!   worker sets [`AchievementSettings`] from the applied value;
 //! * `[steam_id]` overrides are not enumerable (`SteamIdSection` exposes only
 //!   `get`), so `resolve` takes the per-game ids from script state
 //!   (`ScriptState::stat_steam_ids`), which is the live source the Linux stats

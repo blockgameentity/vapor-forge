@@ -25,6 +25,10 @@ const DLC_ENABLED: &str = "IClientAppManager::BIsDlcEnabled";
 const CALLBACK: &str = "CSteamEngine::SetAPICallResult";
 const CDKEY: &str = "IClientUser::RequiresLegacyCDKey";
 const LAUNCH_ENV: &str = "CUser::BuildSpawnEnvBlock";
+/// The observation-only stats-merge body. Its row here is the achievements flow
+/// proof: the body installs at its entry through the real registry and
+/// [`Capability::Achievements`] stays enabled because it did.
+const MERGE: &str = crate::abi::achievements::MERGE_SYMBOL;
 const NO_BODY: &str = "CUser::GetSteamID";
 
 /// Every symbol the corpus gained a body for in this pass, with the unique
@@ -37,6 +41,7 @@ const ANCHORED: &[(&str, &str, usize)] = &[
     (CDKEY, "01 02 03 04", 0x1020),
     (LAUNCH_ENV, "0A 0B 0C 0D", 0x1040),
     (SUBSCRIBED, "0F 1E 2D 3C", 0x1060),
+    (MERGE, "5A 5B 5C 5D", 0x1080),
 ];
 
 static NEXT_CORPUS: AtomicU64 = AtomicU64::new(0);
@@ -139,6 +144,7 @@ fn synthetic_steamclient_pe64() -> Vec<u8> {
     data[0x250..0x254].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
     data[0x260..0x264].copy_from_slice(&[0x0F, 0x1E, 0x2D, 0x3C]);
     data[0x270..0x274].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    data[0x280..0x284].copy_from_slice(&[0x5A, 0x5B, 0x5C, 0x5D]);
     data
 }
 
@@ -190,6 +196,7 @@ fn every_anchored_body_installs_and_keeps_its_capability() {
         Capability::LegacyCdKeyControl,
         Capability::LaunchEnvironment,
         Capability::Ownership,
+        Capability::Achievements,
     ] {
         assert!(
             report.gate.is_enabled(capability),
@@ -227,6 +234,7 @@ fn one_missing_anchor_costs_only_its_own_capability() {
         Capability::LegacyCdKeyControl,
         Capability::LaunchEnvironment,
         Capability::Ownership,
+        Capability::Achievements,
     ] {
         assert!(
             report.gate.is_enabled(capability),
