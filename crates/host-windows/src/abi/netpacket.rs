@@ -46,46 +46,47 @@
 //!   `cmp %r13d,0x138(%rsi)` at public `0x1385d30f4`) does not matter for a
 //!   pass-through: the body writes no receiver field.
 //!
-//! # Missing (measured, and the reason this hook is not an interception)
+//! # The packet layout: decoded, not compiled
 //!
-//! Two capabilities the Linux body has and this one does not, both named in
-//! [`crate::hooks::netpacket`]:
+//! `RecvPkt` reads the payload through `IMsgNetPacket`'s own vtable rather than
+//! through a struct offset, but `CNetPacket::{Alloc, Init, Release}` are anchored
+//! in both win64 corpus files, and `patterns::cnet_packet` decodes an MS-x64 body:
+//! `Init(this, conn_id, data, size, owned_data, add_ref)` arrives in
+//! `rcx, edx, r8, r9d`, so the four stores give the field offsets directly
+//! (`conn_id 0x00`, `data 0x10`, `size 0x18`, `owned_data 0x20` in both live
+//! builds). [`crate::hooks::netpacket::layout`] turns that into a [`Layout`] once
+//! per module, and every payload read in this crate goes through it — no offset is
+//! written down here.
 //!
-//! 1. **The packet layout.** `RecvPkt` reads the payload through
-//!    `IMsgNetPacket`'s own vtable, not through a struct offset, and the offsets
-//!    (`data`, `size`, `owned_data`) are decoded from `CNetPacket::Init` — which
-//!    **no win64 corpus file anchors**. `CNetPacket::Init`, `CNetPacket::Alloc`
-//!    and `CNetPacket::Release` appear in `res/patterns/x86_64.toml` (the Linux
-//!    corpus) and in neither `res/patterns/win64/steamclient/*.toml`. Without
-//!    them [`Layout`] cannot be decoded, so no payload byte, no `EMsg` and no
-//!    `(depot, gid)` is readable here.
-//! 2. **The EMsg accessor.** The dispatch obtains the message id as
-//!    `(*0x138d4bec0(packet))->vtable[0x60/8]()` (public; the beta calls the same
-//!    shape at `0x138d788c0`). The helper is a deserialising accessor — it reads
-//!    packet fields at `+0x10`/`+0x18`/`+0x28`, size-checks them and builds an
-//!    object — and no corpus pattern anchors it either. Calling an unanchored RVA
-//!    from a hook body would be a pinned address in disguise, which is exactly
-//!    what the corpus exists to avoid.
+//! # Still missing (measured)
 //!
-//! Both are reported as a disabled capability rather than skipped silently: see
-//! `crate::hooks::netpacket::availability`.
+//! **The EMsg accessor.** The dispatch obtains the message id as
+//! `(*0x138d4bec0(packet))->vtable[0x60/8]()` (public; the beta calls the same
+//! shape at `0x138d788c0`). The helper is a deserialising accessor — it reads
+//! packet fields at `+0x10`/`+0x18`/`+0x28`, size-checks them and builds an object —
+//! and no corpus pattern anchors it. Calling an unanchored RVA from a hook body would
+//! be a pinned address in disguise, which is exactly what the corpus exists to avoid.
+//!
+//! So the host never claims to know the message id: it asks the conservative
+//! opposite question ("does this payload parse as the request-code request, and does
+//! it name a `(depot, gid)`") and leaves anything else alone. See
+//! `crate::hooks::netpacket::payload`.
 
 use core::ffi::c_void;
 
 /// `RecvPkt(this, packet) -> void`.
 ///
-/// Both arguments are forwarded to the original untouched; the body treats the
-/// packet as opaque, because its layout is unmeasured (module docs, "Missing").
+/// Both arguments are forwarded to the original untouched. The packet is read only
+/// through [`Layout`]'s two decoded slots, and only when the caller has one; see
+/// [`crate::hooks::netpacket::serve`].
 pub type RecvPktFn = unsafe extern "system" fn(this: *mut c_void, packet: *mut c_void);
 
-/// Offsets of the `CNetPacket` fields a response rewrite would have to swap.
+/// Offsets of the `CNetPacket` fields a response rewrite swaps.
 ///
-/// Nothing constructs one of these on Windows today: the offsets are decoded from
-/// `CNetPacket::Init`, which the win64 corpus does not anchor (module docs,
-/// "Missing"). The type exists because the decision table in
-/// [`crate::hooks::netpacket::decision`] is written for the day it lands, and
-/// because the validation below is the part that must not be improvised at that
-/// moment.
+/// Decoded from `CNetPacket::Init` by `patterns::cnet_packet` (MS-x64) once per
+/// module; the validation below is what keeps a decode that overlaps or is
+/// misaligned from being used, so a wrong decode falls through instead of
+/// corrupting the packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     /// Offset of the `const uint8 *m_pData` slot.

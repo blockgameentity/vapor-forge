@@ -1,5 +1,4 @@
-//! The local achievement rebuild — **decision ready, merge site observed, rebuild
-//! still blocked on one anchor**.
+//! The local achievement rebuild — the decision, and the body that applies it.
 //!
 //! `features::achievements::local` rebuilds a stats reply's achievement payload
 //! from locally known definitions when the schema path cannot describe it. The
@@ -7,10 +6,9 @@
 //! (`crates/hooks/src/netpacket/stats_proxy.rs::inject_merged_stats_response` →
 //! `client::achievement::local_reply`): it keeps Steam's schema when there is
 //! one, and otherwise answers with the rebuilt page, encoded by
-//! `RebuiltAchievements::{service_response, legacy_response}` into the packet body
-//! about to be queued.
+//! `RebuiltAchievements::{service_response, legacy_response}`.
 //!
-//! # Both job sites, and why neither carries the rebuild
+//! # The site
 //!
 //! `res/patterns/win64/VTABLE-REPORT.md` §1 replaced the old verdict ("no stats
 //! symbol exists") with the real shape: a job chain. `CUserStats` slot 6 constructs
@@ -18,47 +16,38 @@
 //! [`crate::abi::achievements::BINIT_SYMBOL`] sends the request and calls the
 //! response parser and then the merge; and
 //! [`crate::abi::achievements::MERGE_SYMBOL`] merges the parsed reply into the
-//! client's stats map. **Both are anchored in both live builds**, so this host now
-//! has two candidate sites — and the merge is the semantically right one: it is the
-//! completion point, after the reply is in hand and before it reaches the local
-//! map, and it is the site its own log strings name
-//! ("`YieldingMergeStats - beginning merge`", "`using %s stats data`").
+//! client's stats map. Both are anchored in both live builds, and the merge is the
+//! site this host bodies: it is the completion point, and it is where the reply
+//! object is reachable from `this`.
 //!
-//! It still cannot carry the rebuild, for four measured reasons (the disassembly
-//! behind each is in [`crate::abi::achievements`]):
+//! # What the body can and cannot do
 //!
-//! 1. The reply *bytes* are gone by then. The Linux body substitutes an encoded
-//!    reply; at the merge the reply is already a stats block inside the job
-//!    object, and the two arguments are only `this` and an `EResult`. The bytes
-//!    are at `*(this + reply) + 0x18` (`REPLY_BODY_OFFSET`, the same `+0x18` in
-//!    both builds) and nothing at the job site reads them any more.
-//! 2. Replacing that block means constructing Steam's own ordered dictionary: the
-//!    merge allocates a fresh block and inserts into it with **inlined** code
-//!    (0x38-byte nodes, interned keys, a comparator called at `0x138d9ef40`). There
-//!    is no writer function to anchor — so this is not a missing pattern, it is a
-//!    shape that no pattern can supply.
-//! 3. Every field of the job object is a per-build offset (the engine, the reply
-//!    block, the reply *object*, the `CGameID` holding the app id — public
-//!    `0x170`/`0x1a8`/`0x1b0`/`0x198`, publicbeta `0x168`/`0x1a0`/`0x1a8`/`0x190`).
-//!    A body would carry a build table and fail closed off it; the corpus carries
-//!    patterns only.
-//! 4. The decision's `local` input has no producer on this host: definitions come
-//!    from a stats schema parsed by `vapor_forge_steam_protocol`, which this crate
-//!    does not depend on and which no Windows hook has ever fed.
+//! [`crate::hooks::achievements`] forwards the merge verbatim and, when the
+//! rebuild produces a payload that differs, swaps the reply body for the duration
+//! of that call and restores Steam's bytes afterwards. Three inputs are needed, and
+//! each has a named answer rather than a guess:
 //!
-//! So the body that *would* work is not at the job at all: it is the reply-body
-//! site (§1 site 2, the response parser at `0xa93120` / `0xabcc20`, unanchored) or
-//! the CM receive path with the win64 packet layout
-//! (`CNetPacket::{Init, Alloc, Release}`, in neither win64 corpus file) — where
-//! `legacy_response`/`service_response` bytes can actually be substituted, exactly
-//! as Linux does — plus a schema cache for this host. Registering a body that
-//! served nothing would make the install report claim a rebuild the host does not
-//! have, so the only body registered at the job is the **observation-only** one in
-//! [`crate::hooks::achievements`]: it forwards the merge verbatim, classifies the
-//! `EResult` and logs [`decide`]'s answer without mutating anything.
+//! 1. **Where the reply body is** — the geometry decoder
+//!    (`patterns::job_fields::decode_job_reply`), wired through
+//!    [`crate::hooks::achievements::geometry`]. Not merged yet, so
+//!    [`crate::hooks::achievements::ReplyOutcome::NoGeometry`] is what a live client
+//!    records today.
+//! 2. **Which app the reply is about** — the reply itself, for the legacy shape
+//!    (`CGameID`'s low 24 bits). A service-shaped reply names no app, and the job
+//!    object's own `game_id` is a per-build offset this crate no longer keeps, so
+//!    that reply is reported as [`crate::hooks::achievements::reply::RewriteBlocker::NoApp`].
+//! 3. **The definitions** — the schema a *previous* reply for the same app carried,
+//!    held in [`crate::hooks::achievements::cache`]. A reply that carries its own
+//!    schema keeps the schema path authoritative, exactly as on Linux, and the
+//!    rebuild is not consulted for it.
 //!
-//! [`decide`] is the portable half and the observation body's wrapper: it runs the
-//! **real** feature entry point
+//! So the rewrite fires for a schema-less legacy reply whose app this process has
+//! already seen a schema for. That is the same fallback order the Linux host
+//! applies, and it means the first reply for an app teaches this host and a later
+//! one is answered.
+//!
+//! [`decide`] is the portable half the body consults: it runs the **real** feature
+//! entry point
 //! (`rebuild_local_achievements_if_enabled`), so the flag, the schema precedence
 //! and the definitions all behave exactly as the Linux path does.
 

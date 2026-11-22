@@ -1,47 +1,43 @@
-//! `CCMInterface::RecvPkt` — the request-code hook body, and its gap.
+//! `CCMInterface::RecvPkt` — the request-code serve body.
 //!
 //! # What the body does, in one sentence
 //!
-//! When Steam dispatches an inbound connection-manager message, decide whether a
-//! cached manifest request code could be served for it — and, because this corpus
-//! provides no packet layout, record the message as *unreadable with the cause
-//! named* and forward it to Steam untouched.
+//! When Steam dispatches an inbound connection-manager message, read the payload
+//! through the decoded packet layout, parse it as a manifest request-code request,
+//! and — when the host already holds a code for that `(depot, gid)` — show Steam
+//! the answer for the duration of the original call and then put its own bytes
+//! back.
 //!
-//! # Which scope this is, and why
+//! # The three halves
 //!
-//! The Linux reference (`crates/hooks/src/client/network.rs::hk_recv_pkt` →
-//! `netpacket::prepare_recv_packet`) does four things: discover the packet layout
-//! at runtime, decide pass/drop/rewrite, keep rewritten bytes alive across the
-//! original call, and restore Steam's payload afterwards. Porting it required
-//! answering one question first: is that layout discovery portable?
+//! * [`payload`] parses a request body and encodes the response body. Pure.
+//! * [`cache`] holds the `(depot, gid)` → code table. Bounded, no I/O.
+//! * [`swap`] owns the swap-and-restore of the packet's `(data, size)` slots, which
+//!   is the same discipline as the Linux host's
+//!   `netpacket::boundary::PacketSwapGuard`.
 //!
-//! It is portable as *code* — `patterns::cnet_packet::decode_init` takes a bitness
-//! and code bytes, so nothing in it is Linux-specific — but it is **not available
-//! on this corpus**, and that is the honest answer:
+//! [`serve`] glues them for one message and is the only thing the FFI body calls
+//! besides the displaced original.
 //!
-//! * the offsets are decoded from `CNetPacket::Init`; those three symbols
-//!   (`Init`, `Alloc`, `Release`) are in `res/patterns/x86_64.toml` (Linux) and in
-//!   **neither** win64 corpus file;
-//! * `res/patterns/win64/VTABLE-REPORT.md` §3 measures why: the packet classes'
-//!   only route to the payload is a virtual call, and no packet-class vtable slot
-//!   is dispatch shaped, so the dispatch lives one class up at
-//!   `CCMInterface::RecvPkt` — the symbol this body hooks;
-//! * the EMsg is not an argument either: the dispatch obtains it through an
-//!   unanchored deserialising accessor (see [`crate::abi::netpacket`]).
+//! # What is anchored, and what is still missing
 //!
-//! So the body is written to the second scope: gate → classify → record the
-//! `(EMsg, depot, gid)` it could read into the host state → answer from a cached
-//! code **if one exists and the layout exists** → otherwise fall through. The
-//! missing capability is not a silent no-op: [`availability`] disables
-//! `request-codes` at install time with the corpus gap as its reason, and every
-//! record carries [`decision::ServeBlocker::NoLayout`].
+//! The layout comes from the corpus — `CNetPacket::{Alloc, Init, Release}` are
+//! decoded by `patterns::cnet_packet` (MS-x64) once per module in
+//! [`crate::entry::worker`], so `(data, size)` are the build's own offsets and no
+//! constant is compiled here. Two things are still missing, and each is a named
+//! blocker rather than a silent no-op:
 //!
-//! There is no request-code cache in the host state either, and that is not an
-//! omission: `features::request_code::PendingQueue::queue_fetch` needs a decoded
-//! `CMsgProtoBufHeader` (a `vapor_forge_steam_protocol` type this crate does not
-//! depend on), and the body it would decode is exactly the payload this build
-//! cannot read. A cache nobody can fill would be a second silent no-op, so the
-//! seam is [`decision::Inputs::cached`] — typed, tested, and empty.
+//! 1. **The `EMsg`.** The dispatch obtains the message id through an accessor no
+//!    corpus pattern anchors (see [`crate::abi::netpacket`]), so the host cannot
+//!    ask "is this the request-code message". It asks the conservative opposite
+//!    instead: does this body parse as that request, and does it name a target. A
+//!    payload that does not parse is left alone, and every record says
+//!    [`ServeBlocker::NoTarget`].
+//! 2. **A producer for the cache.** Nothing on this host fills it yet: a provider
+//!    round trip belongs on a worker, and this host has no request-code worker.
+//!    So a live client records [`ServeBlocker::NoCachedCode`] for every message it
+//!    can read — the cache is the seam a worker fills, not a second silent no-op.
+//!    The body never dials: [`serve::prepare`] only ever reads.
 //!
 //! # Gating
 //!
@@ -53,28 +49,26 @@
 //! * `request-codes` — may the host answer Steam's round trip locally? Off means
 //!   the host may observe, never serve.
 //!
-//! `cm-interception` also depends on four outbound/pipe symbols
-//! (`BBuildAndAsyncSendFrame`, `IPCProcessMessage`, `GetPipeClient`,
-//! `PchMsgNameFromEMsg`) that have no bodies on this host yet, so a live install
-//! reports it disabled with *their* reason and this body passes everything
-//! through. That is the existing contract of the capability, not something this
-//! module changed: the moment those bodies land, this body starts recording
-//! without an edit.
+//! [`availability`] disables `request-codes` when no layout could be decoded, with
+//! the corpus gap as the reason: a capability that cannot be honoured must say so.
 //!
 //! # What this body never does
 //!
-//! * It never dereferences the packet. No layout, no accessor: every read here is
-//!   a read of *host* state, never of Steam's memory.
-//! * It never allocates unbounded or blocks: the ledger is a 32-entry ring behind
-//!   one mutex, and nothing on this path dials, resolves or sleeps. A provider
-//!   fetch would have to be queued to a worker, and it is not attempted here.
+//! * It never allocates while the swap is installed, never dials, and never holds
+//!   a lock across the original call.
+//! * It writes exactly two slots of Steam's packet, and only when a code is
+//!   served; both are restored by the swap guard before the body returns.
 
 pub mod availability;
+pub mod cache;
 pub mod classify;
-pub mod layout;
 pub mod decision;
+pub mod layout;
 pub mod ledger;
 pub mod lookup;
+pub mod payload;
+pub mod serve;
+pub mod swap;
 
 use core::ffi::c_void;
 
@@ -84,7 +78,7 @@ use crate::abi::netpacket::RecvPktFn;
 use crate::capability::Capability;
 use crate::hooks::{original, state};
 
-use decision::{Disposition, Inputs, Observation, ServeBlocker};
+use decision::{Observation, ServeBlocker};
 
 /// Corpus symbol this body replaces.
 pub const SYMBOL: &str = "CCMInterface::RecvPkt";
@@ -98,7 +92,7 @@ pub fn address() -> usize {
 ///
 /// # Safety
 /// Called by Steam through the detour that displaced the entry: `this` and
-/// `packet` must be whatever Steam passed. Neither is dereferenced.
+/// `packet` must be whatever Steam passed.
 pub unsafe extern "system" fn recv_pkt(this: *mut c_void, packet: *mut c_void) {
     // SAFETY: the type passed here is the one documented in `crate::abi::netpacket`;
     // the trampoline was published for this symbol before its entry was patched.
@@ -106,49 +100,25 @@ pub unsafe extern "system" fn recv_pkt(this: *mut c_void, packet: *mut c_void) {
         debug!("netpacket hook reached without a published original; falling through to Steam");
         return;
     };
-    observe(packet.is_null());
-    // SAFETY: forwarding this callback's unchanged receiver and packet pointer.
-    unsafe { original(this, packet) }
-}
-
-/// Record one dispatch and say, once, what the host could not read.
-fn observe(packet_is_null: bool) {
-    let Some(state) = state::get() else {
-        return;
-    };
-    if !state.allows(Capability::CmInterception) {
-        return;
-    }
-    // The message id and the (depot, gid) would come out of the packet payload.
-    // Neither is readable: `crate::abi::netpacket` names the two missing anchors.
-    // Passing them as `None` keeps the gap visible in the record instead of
-    // pretending the message carried nothing.
-    let inputs = Inputs {
-        cm_enabled: true,
-        request_codes_enabled: state.allows(Capability::RequestCodes),
-        layout: state.layout(),
-        emsg: None,
-        target: None,
-        cached: None,
-    };
-    let observation = match decision::decide(&inputs) {
-        Disposition::Pass => return,
-        Disposition::Observe(observation) => observation,
-        Disposition::Serve { target, code } => {
-            // Unreachable without a layout (`decision::decide` returns `NoLayout`
-            // first). If it ever fires, the payload must not be left rewritten:
-            // nothing here holds a guard, so do not serve and do not lie.
-            debug!(
-                depot = target.depot,
-                gid = target.gid,
-                code,
-                "netpacket: a serve was decided without a swap guard; falling through instead"
-            );
-            return;
+    // The swap guard is created before the call and dropped after it. Restoring is
+    // therefore unconditional: it is `Drop`, not a branch, so no early return in
+    // this body can leave Steam's payload rewritten.
+    let swap = match state::get() {
+        Some(state) => {
+            // SAFETY: `packet` is the pointer Steam passed to this dispatch.
+            let prepared = unsafe { serve::prepare(state, packet) };
+            if let Some(observation) = prepared.observation {
+                let sequence = state.netpacket().record(observation);
+                log(state, sequence, &observation, packet.is_null());
+            }
+            prepared.swap
         }
+        None => None,
     };
-    let sequence = state.netpacket().record(observation);
-    log(state, sequence, &observation, packet_is_null);
+    // SAFETY: forwarding this callback's unchanged receiver and packet pointer.
+    unsafe { original(this, packet) };
+    // Steam's own bytes go back before its caller can release the packet.
+    drop(swap);
 }
 
 fn log(state: &state::HostState, sequence: u64, observation: &Observation, packet_is_null: bool) {
@@ -161,14 +131,14 @@ fn log(state: &state::HostState, sequence: u64, observation: &Observation, packe
     }
     let blocker = observation.blocker.reason();
     if sequence == 1 {
-        // Once, and at `debug` like every other hook body here: it proves the
-        // hook is reached and names the gap. Everything after this is
-        // per-message noise.
+        // Once, and at `debug` like every other hook body here: it proves the hook
+        // is reached and names the first reason a code was not served.
         debug!(
             capability = Capability::CmInterception.label(),
             blocker,
+            layout = state.layout().is_some(),
             request_codes = state.allows(Capability::RequestCodes),
-            "netpacket: inbound CM dispatch observed; the payload is unreadable for this build"
+            "netpacket: inbound CM dispatch observed"
         );
         let plan = lookup::plan(
             state.config(),
@@ -191,18 +161,28 @@ fn log(state: &state::HostState, sequence: u64, observation: &Observation, packe
     }
 }
 
-/// Whether a cached code could be served for this host at all.
+/// Why the host would not serve a code today, given what it has decoded.
 ///
 /// Exposed for the install report, which must not claim a capability it cannot
-/// honour: `None` means "no layout, no serving", and the reason is
-/// [`ServeBlocker::NoLayout`].
-pub fn serving_gap() -> Option<ServeBlocker> {
-    Some(ServeBlocker::NoLayout)
+/// honour: `None` means "a layout exists, so the body can serve as soon as the
+/// cache holds a code".
+pub fn serving_gap(state: &state::HostState) -> Option<ServeBlocker> {
+    if state.layout().is_none() {
+        return Some(ServeBlocker::NoLayout);
+    }
+    if state.request_codes().is_empty() {
+        return Some(ServeBlocker::NoCachedCode);
+    }
+    None
 }
 
+/// The decision an uninitialised host would take, for the tests that assert the
+/// gate order without a live packet.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::netpacket::decision::{CachedCode, Disposition, Inputs, RequestTarget};
+    use crate::hooks::tests_support::{config_with, state_with};
 
     #[test]
     fn the_body_is_registered_under_its_anchored_name() {
@@ -214,13 +194,45 @@ mod tests {
     fn a_body_reached_without_an_original_falls_through_without_panicking() {
         // No trampoline is published in this process, which is the "called before
         // initialisation" contract: the body must return, not unwind.
-        // SAFETY: the body returns before touching either pointer; neither is
-        // dereferenced on any path (see the module docs).
+        // SAFETY: the body returns before touching either pointer.
         unsafe { recv_pkt(core::ptr::null_mut(), core::ptr::null_mut()) };
     }
 
     #[test]
-    fn serving_is_always_blocked_by_the_layout_gap() {
-        assert_eq!(serving_gap(), Some(ServeBlocker::NoLayout));
+    fn the_gate_order_is_disabled_first_then_serve() {
+        // `cm-interception` off is a plain pass, whatever else is available.
+        assert_eq!(
+            decision::decide(&Inputs {
+                cm_enabled: false,
+                request_codes_enabled: true,
+                layout: None,
+                emsg: None,
+                target: None,
+                cached: None,
+            }),
+            Disposition::Pass
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_layout_reports_the_layout_gap() {
+        let state = state_with(config_with(&[480]), Vec::new());
+        assert_eq!(serving_gap(&state), Some(ServeBlocker::NoLayout));
+    }
+
+    #[test]
+    fn a_host_with_a_layout_but_no_codes_reports_the_missing_code() {
+        let state = state_with(config_with(&[480]), Vec::new());
+        state.set_layout(crate::abi::netpacket::Layout::new(16, 24).expect("valid"));
+        assert_eq!(serving_gap(&state), Some(ServeBlocker::NoCachedCode));
+
+        state.request_codes().insert(
+            RequestTarget { depot: 731, gid: 1 },
+            CachedCode {
+                code: 7,
+                provider: None,
+            },
+        );
+        assert_eq!(serving_gap(&state), None, "a layout and a code is a servable host");
     }
 }

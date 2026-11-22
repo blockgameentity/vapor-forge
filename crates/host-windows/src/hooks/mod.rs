@@ -23,7 +23,7 @@
 //! | [`callbacks`] | `CSteamEngine::SetAPICallResult` (body in [`callback_result`]) | yes / yes |
 //! | [`legacy_cdkey`] | `IClientUser::RequiresLegacyCDKey` | yes / yes |
 //! | [`launch_env`] | `CUser::BuildSpawnEnvBlock` | yes / yes |
-//! | [`achievements`] (observation only) | `CAPIJobRequestUserStats::YieldingMergeStats` | yes / yes |
+//! | [`achievements`] (rewrites the reply) | `CAPIJobRequestUserStats::YieldingMergeStats` | yes / yes |
 //! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
 //!
 //! The rows that carry an anchor gap are listed rather than hidden: `install::deps`
@@ -51,13 +51,14 @@
 //! `achievements` is no longer in that list. Its decision lives in
 //! [`crate::features::achievements`], its two candidate sites are **anchored**
 //! (`CAPIJobRequestUserStats::BInit` and `::YieldingMergeStats`, both live
-//! builds), and [`achievements`] now registers an **observation-only** body at the
-//! merge: it forwards the call verbatim, classifies the `EResult` it was handed and
-//! logs what the local-rebuild decision answers, and it mutates nothing. The
-//! rebuild itself still has no site — `crate::abi::achievements` records the
-//! disassembly that rules the merge (and the run method) out and names the reply
-//! parser as the anchor it would need — so the capability is enabled by the
-//! install pass and the report says what the body truthfully is.
+//! builds), and [`achievements`] registers a body at the merge that forwards the
+//! call verbatim and rewrites the reply body when the local rebuild produces a
+//! different payload: the geometry decoder locates the reply, the swap guard owns
+//! the bytes for the duration of the call, and Steam's bytes are restored before
+//! the body returns. Whether it can rewrite depends on one corpus decode
+//! (`patterns::job_fields`, wired through
+//! [`achievements::geometry`]); until that is merged the body records the gap and
+//! forwards Steam's reply unchanged.
 //!
 //! [`family_play`] is the one decision that is not a hook: it is the concurrent-play
 //! consult that [`ownership`] and [`package`] call.

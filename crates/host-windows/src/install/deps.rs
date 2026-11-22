@@ -40,7 +40,7 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     // pass could never satisfy.
     //
     // Only the merge is listed. It is the site that carries a body
-    // (`crate::hooks::achievements`, observation-only), so it is the symbol whose
+    // (`crate::hooks::achievements`, which rewrites the reply body), so it is the symbol whose
     // failure has to cost the capability. The run method has **no** body, and a
     // bodyless symbol resolves-but-cannot-install in every batch: listing it would
     // disable `achievements` on every live install regardless of the merge, which
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn the_merge_symbol_gates_achievements_and_the_run_method_gates_nothing() {
-        // The merge carries the observation-only body, so it is the dependency.
+        // The merge carries the reply-rewrite body, so it is the dependency.
         assert_eq!(
             capabilities_for_symbol(crate::abi::achievements::MERGE_SYMBOL),
             &[Capability::Achievements]
