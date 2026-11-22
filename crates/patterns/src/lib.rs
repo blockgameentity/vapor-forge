@@ -30,6 +30,8 @@ pub mod http;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod msabi;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod pdata;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod probe_facts;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod probe_rank;
