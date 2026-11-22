@@ -148,9 +148,15 @@ mod tests {
     #[test]
     fn no_structure_offset_is_compiled_into_this_module() {
         // The rule this module follows: the reply's two offsets come from the
-        // decoder, not from a table here. `geometry::PENDING` is the honest gap until
-        // that decoder is merged.
-        assert!(crate::hooks::achievements::geometry::PENDING.contains("decode_job_reply"));
+        // decoder that reads the target's code, not from a table here. What this
+        // module keeps is the *symbol* and the `EResult` dispatch, both of which are
+        // contract, not layout.
+        assert_eq!(MERGE_SYMBOL, "CAPIJobRequestUserStats::YieldingMergeStats");
+        assert_eq!(BINIT_SYMBOL, "CAPIJobRequestUserStats::BInit");
+        assert!(
+            crate::hooks::achievements::geometry::NO_GEOMETRY.contains("no stats-reply geometry"),
+            "the per-merge reason names the decode, not a compiled offset"
+        );
     }
 
     #[test]

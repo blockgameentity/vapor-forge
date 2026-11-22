@@ -27,13 +27,15 @@
 //! flag cannot be bypassed. Every refusal is a named [`ReplyOutcome`], logged once
 //! per merge at `debug`.
 //!
-//! # What is still missing
+//! # When the rewrite fires, and when it does not
 //!
-//! The geometry decoder (`patterns::job_fields::decode_job_reply`) is not merged
-//! yet, so [`geometry::decode_plan`] reports [`geometry::PENDING`] and every merge
-//! records [`ReplyOutcome::NoGeometry`] with that reason. Nothing else here is
-//! blocked: the decode is one line in [`geometry::CorpusDecoder`], and the merge
-//! body, the reply rewrite and the swap are all tested against it as data.
+//! The geometry comes from `patterns::job_fields::decode_job_reply` (via
+//! [`geometry::CorpusDecoder`]), published once per module by the worker. A merge
+//! whose build decoded none records [`ReplyOutcome::NoGeometry`]; one whose reply
+//! carries a schema keeps the schema path authoritative; one that names no app
+//! records [`reply::RewriteBlocker::NoApp`]; one whose app has no remembered schema
+//! records [`ReplyOutcome::NothingToRebuild`]. Every one of those forwards Steam's
+//! reply untouched.
 //!
 //! # What this body never does
 //!

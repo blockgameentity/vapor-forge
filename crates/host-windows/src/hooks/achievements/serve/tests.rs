@@ -223,7 +223,7 @@ fn without_a_geometry_the_merge_records_the_pending_decoder() {
     // SAFETY: no geometry means the body returns before the dereference.
     let prepared = unsafe { prepare(&state, 0x1000 as *mut c_void, 1) };
     assert!(prepared.swap.is_none());
-    assert!(matches!(prepared.observation.reply, ReplyOutcome::NoGeometry(reason) if reason == geometry::PENDING));
+    assert!(matches!(prepared.observation.reply, ReplyOutcome::NoGeometry(reason) if reason == geometry::NO_GEOMETRY));
     set_local_rebuild(false);
 }
 
