@@ -538,6 +538,15 @@ pub enum TicketCacheMode {
 pub struct ManifestSection {
     #[serde(default = "default_manifest_providers")]
     pub providers: Vec<ManifestSource>,
+    /// Try the next entry of `providers` when one fails.
+    ///
+    /// Off by default, and that is the point: with failover off only the first
+    /// entry is ever contacted, so a depot lookup cannot quietly travel to a
+    /// host the user did not pick. When it is on, the chain is walked in order,
+    /// every attempt is logged at `info`, and the provider that served the code
+    /// is reported back to the caller.
+    #[serde(default)]
+    pub failover: bool,
     #[serde(default = "default_timeout_connect_ms")]
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
@@ -556,6 +565,7 @@ impl Default for ManifestSection {
     fn default() -> Self {
         Self {
             providers: default_manifest_providers(),
+            failover: false,
             timeout_connect_ms: default_timeout_connect_ms(),
             timeout_ms: default_timeout_ms(),
             min_interval_ms: default_min_interval_ms(),
