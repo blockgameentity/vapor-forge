@@ -57,8 +57,8 @@ have a tested decision with no anchor. Linux implements ~19 and now consults the
 shared family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
-Corpus coverage: Linux ships **34** symbols, Windows **27** (public 19 + 8, beta
-18 + 6). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
+Corpus coverage: Linux ships **34** symbols, Windows **32** (public 25 + 7, beta
+24 + 5). Mined this round: `CUser::GetSubscribedApps` (slot 183, confirmed by the
 x64 licence stride), `CUser::BuildSpawnEnvBlock` (candidate, found by its 63 env-key
 strings and its caller), and the real dispatch site — `CCMInterface::RecvPkt`,
 a two-level MSVC jump table over EMsg `0x2f3..0x370` (the `CNetPacket::*` tables
@@ -72,12 +72,14 @@ implements it: `ShaderCacheControl`, `DlcOverrides`, `CallbackEvents`,
 `LaunchEnvironment`. Linux has a working reference for each. This is mechanical
 work — one body plus its decide function and tests per capability.
 
-**B. No anchor (corpus).** What remains: the **stats path**, refuted cleanly —
-no `CUserStats` (67 slots) or `CGameStats` (14) slot writes N 32-bit values
-through a pointer argument, and the name appears in no string; the real path is
-the `CAPIJobRequestUserStats` pair, whose creator is `CUserStats` slot 6. That
-blocks `Achievements` on Windows. Everything else moved: `CmInterception`'s
-anchor now exists (body not yet written), `LaunchEnvironment`'s too. Vtable anchoring is
+**B. No anchor (corpus).** Two symbols remain without one: `CUser::GetSteamID`
+(blocks `SteamIdOverride`) and `RegisterJsMethod` (blocks `ConflictUiBridge`).
+The **stats path turned out to be a job chain, not a per-stat writer**:
+`CUserStats` slot 6 constructs a `CAPIJobRequestUserStats`, whose `BInit` and
+`YieldingMergeStats` are now anchored (public `0xa8fd20`/`0xaa0420`, beta
+`0xab99a0`/`0xac97d0`). There is no read-side counterpart of the Linux hook, so
+`Achievements` needs a different shape (hook the merge, not a getter) before it
+can install. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
 **C. Unverified ABI.** Everything below the planner assumes MS-x64 argument
