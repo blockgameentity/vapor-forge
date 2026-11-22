@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::{
     config_text, factory, write_corpus, FakeEnv, RecordingSink, TempDir, CLOUD, DEPOT, OWNERSHIP,
+    TICKET,
 };
 use crate::capability::Capability;
 use crate::entry::worker;
@@ -266,4 +267,30 @@ fn a_missing_lua_directory_is_not_a_failure() {
     let outcome = worker::run(&mut env, &mut installer, &mut sink);
     assert_eq!(outcome.failed_modules(), 0);
     assert!(outcome.report().contains("lua: 0 dir(s)"));
+}
+
+/// The ticket body used to be uninstallable because no corpus entry existed for
+/// `CUser::GetAppTicket`. With the anchor now mined for both live builds, a
+/// corpus that carries it must install the body and keep its capability.
+#[test]
+fn the_ticket_body_installs_now_that_its_symbol_is_anchored() {
+    let dir = TempDir::new("ticket-anchor");
+    let config = dir.write("config.toml", &config_text(&[730]));
+    let corpus_root = dir.path().join("corpus");
+    write_corpus(&corpus_root, &[(OWNERSHIP, "AA BB CC DD"), (TICKET, "DE AD BE EF")]);
+    let mut env = FakeEnv::new(Some(config), Some(corpus_root));
+    let attempts = Rc::new(RefCell::new(Vec::new()));
+    let mut installer = factory(&attempts, None);
+    let mut sink = RecordingSink::default();
+
+    let outcome = worker::run(&mut env, &mut installer, &mut sink);
+
+    let report = outcome.modules[0].report.as_ref().expect("batch planned");
+    let installed: Vec<&str> = report.installed.iter().map(|i| i.symbol.as_str()).collect();
+    assert!(installed.contains(&TICKET), "installed {installed:?}");
+    assert!(
+        report.gate.is_enabled(Capability::TicketOverrides),
+        "reason: {:?}",
+        report.gate.reason(Capability::TicketOverrides)
+    );
 }

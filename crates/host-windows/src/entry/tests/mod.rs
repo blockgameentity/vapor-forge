@@ -20,6 +20,7 @@ use super::worker::{HostEnv, LoadedModule, StateSink};
 const OWNERSHIP: &str = "CUser::CheckAppOwnership";
 const DEPOT: &str = "GetDecryptionKey";
 const CLOUD: &str = "CloseAppCloud";
+const TICKET: &str = "CUser::GetAppTicket";
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -84,6 +85,7 @@ fn synthetic_pe64() -> Vec<u8> {
     data[0x210..0x214].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
     data[0x230..0x234].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
     data[0x250..0x254].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+    data[0x270..0x274].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
     data
 }
 
