@@ -10,6 +10,12 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vapor-forge-pe = { path = "../pe" }
+# The host-agnostic features the Linux host already runs: cloud, per-game
+# identity, depotcache pre-seed and the local achievement rebuild. The host
+# wires settings into them behind traits, it does not reimplement them.
+vapor-forge-config = { path = "../config" }
+vapor-forge-core = { path = "../runtime-core" }
+vapor-forge-features = { path = "../features" }
 iced-x86.workspace = true
 vapor-forge-patterns = { path = "../patterns", default-features = false }
 sha2.workspace = true
