@@ -1,5 +1,20 @@
 #![allow(clippy::manual_range_contains)]
 
+//! Repair of 32-bit PIC-thunk calls in a copied function prologue.
+//!
+//! A 32-bit ELF build of a shared library reaches the GOT through
+//! `call __x86.get_pc_thunk.<reg>`, which materialises its own return address
+//! in a register; the caller then adds a constant offset. When the prologue is
+//! copied into a trampoline the return address changes and the computed GOT
+//! base is wrong, so the `call` has to be rewritten into `mov reg, imm32`.
+//!
+//! Only 32-bit ELF images have this pattern. MS-x64 reaches globals through
+//! RIP-relative operands and 64-bit ELF through RIP-relative `lea`, so a copied
+//! prologue there has no thunk call to repair. [`ensure_supported`] states that
+//! in one place and the public analysis entry points refuse to run elsewhere,
+//! rather than decoding 32-bit bytes on a target where they mean something
+//! else.
+
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -8,6 +23,11 @@ pub enum PicThunkError {
     NoPicThunkFound,
     #[error("PIC thunk uses an unsupported register (reg_field={0})")]
     UnsupportedThunkRegister(u8),
+    #[error(
+        "PIC-thunk repair only applies to 32-bit x86 ELF images; refusing to \
+         apply 32-bit PIC semantics on this target"
+    )]
+    UnsupportedTarget,
     #[cfg(test)]
     #[error("PIC thunk repair range is outside the target buffer")]
     PatchOutsideBuffer,
@@ -62,11 +82,45 @@ pub struct PicThunkRepairPlan {
     pub patch_bytes: [u8; 5],
 }
 
+/// Whether the compiled target is a 32-bit x86 ELF image, the only place a
+/// `call __x86.get_pc_thunk.*` can appear in a copied prologue.
+pub const SUPPORTED: bool = cfg!(all(
+    target_arch = "x86",
+    target_pointer_width = "32",
+    target_family = "unix",
+    not(target_vendor = "apple"),
+));
+
+/// Refuse to run the 32-bit repair on a target where it does not apply.
+///
+/// Callers use this as a gate before scanning anything, so an MS-x64 or 64-bit
+/// ELF install reports why PIC repair was skipped instead of misreading a
+/// 64-bit prologue as 32-bit code.
+pub fn ensure_supported() -> Result<(), PicThunkError> {
+    if SUPPORTED {
+        Ok(())
+    } else {
+        Err(PicThunkError::UnsupportedTarget)
+    }
+}
+
 /// Scan a byte buffer for a `call rel32` whose target is a PIC thunk
 /// (`mov reg,[esp]; ret`), returning the first match.
 ///
-/// This is a pure analysis function. It does not modify any memory.
+/// This is a pure analysis function. It does not modify any memory. Returns
+/// [`PicThunkError::UnsupportedTarget`] unless this is a 32-bit ELF target.
 pub fn find_pic_thunk_call(
+    buffer: &[u8],
+    buffer_base_address: u32,
+    read_target_bytes: &dyn Fn(u32) -> Option<[u8; 4]>,
+) -> Result<PicThunkCallSite, PicThunkError> {
+    ensure_supported()?;
+    find_pic_thunk_call_32(buffer, buffer_base_address, read_target_bytes)
+}
+
+/// The 32-bit decoder itself, without the target gate. Unit-tested on any host;
+/// the public wrapper above is what production code calls.
+fn find_pic_thunk_call_32(
     buffer: &[u8],
     buffer_base_address: u32,
     read_target_bytes: &dyn Fn(u32) -> Option<[u8; 4]>,
@@ -113,7 +167,19 @@ pub fn find_pic_thunk_call(
 /// `original_call_address` is the address of the `call __x86.get_pc_thunk.*`
 /// instruction in the **original function** (before hooking). The correct return
 /// address is `original_call_address + 5`.
+///
+/// Returns [`PicThunkError::UnsupportedTarget`] unless this is a 32-bit ELF
+/// target: the plan is only meaningful where the call was a PIC thunk.
 pub fn plan_pic_thunk_repair(
+    call_site: PicThunkCallSite,
+    original_call_address: u32,
+) -> Result<PicThunkRepairPlan, PicThunkError> {
+    ensure_supported()?;
+    Ok(plan_pic_thunk_repair_32(call_site, original_call_address))
+}
+
+/// The 32-bit plan builder itself, without the target gate.
+fn plan_pic_thunk_repair_32(
     call_site: PicThunkCallSite,
     original_call_address: u32,
 ) -> PicThunkRepairPlan {
@@ -161,167 +227,4 @@ fn is_pic_thunk_bytes(bytes: &[u8; 4]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_thunk_bytes(reg: ThunkRegister) -> [u8; 4] {
-        let modrm = 0x04
-            | (match reg {
-                ThunkRegister::Eax => 0,
-                ThunkRegister::Ecx => 1,
-                ThunkRegister::Edx => 2,
-                ThunkRegister::Ebx => 3,
-                ThunkRegister::Esi => 6,
-                ThunkRegister::Edi => 7,
-            } << 3);
-        [0x8b, modrm, 0x24, 0xc3]
-    }
-
-    #[test]
-    fn detects_pic_thunk_bytes_for_all_registers() {
-        for reg in [
-            ThunkRegister::Eax,
-            ThunkRegister::Ecx,
-            ThunkRegister::Edx,
-            ThunkRegister::Ebx,
-            ThunkRegister::Esi,
-            ThunkRegister::Edi,
-        ] {
-            assert!(
-                is_pic_thunk_bytes(&make_thunk_bytes(reg)),
-                "should detect thunk for {:?}",
-                reg
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_non_thunk_bytes() {
-        assert!(!is_pic_thunk_bytes(&[0x8b, 0x04, 0x24, 0x90])); // no ret
-        assert!(!is_pic_thunk_bytes(&[0x89, 0x04, 0x24, 0xc3])); // wrong opcode
-        assert!(!is_pic_thunk_bytes(&[0x8b, 0x44, 0x24, 0xc3])); // [esp+disp8], not [esp]
-    }
-
-    #[test]
-    fn finds_pic_thunk_call_in_buffer() {
-        // Simulate: call rel32 at offset 0, target = base + 10
-        // Buffer base = 0x1000, call target = 0x100A
-        let mut buffer = [0x90u8; 16];
-        buffer[0] = 0xE8; // call rel32
-        let disp: i32 = 5; // target = 0x1000 + 5 + 5 = 0x100A
-        buffer[1..5].copy_from_slice(&disp.to_le_bytes());
-
-        let thunk_bytes = make_thunk_bytes(ThunkRegister::Ebx);
-
-        let result = find_pic_thunk_call(&buffer, 0x1000, &|addr| {
-            if addr == 0x100A {
-                Some(thunk_bytes)
-            } else {
-                None
-            }
-        });
-
-        let site = result.expect("should find PIC thunk call");
-        assert_eq!(site.offset_in_buffer, 0);
-        assert_eq!(site.call_target, 0x100A);
-        assert_eq!(site.register, ThunkRegister::Ebx);
-    }
-
-    #[test]
-    fn reports_no_thunk_in_empty_buffer() {
-        let buffer = [0x90u8; 8];
-        let result = find_pic_thunk_call(&buffer, 0x1000, &|_| None);
-        assert_eq!(result, Err(PicThunkError::NoPicThunkFound));
-    }
-
-    #[test]
-    fn plans_correct_repair_bytes() {
-        let site = PicThunkCallSite {
-            offset_in_buffer: 0,
-            call_target: 0xDEAD,
-            register: ThunkRegister::Eax,
-        };
-        let plan = plan_pic_thunk_repair(site, 0x1000);
-
-        assert_eq!(plan.correct_return_address, 0x1005);
-        // mov eax, 0x00001005 = B8 05 10 00 00
-        assert_eq!(plan.patch_bytes, [0xB8, 0x05, 0x10, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn plans_correct_repair_for_ebx() {
-        let site = PicThunkCallSite {
-            offset_in_buffer: 3,
-            call_target: 0xBEEF,
-            register: ThunkRegister::Ebx,
-        };
-        let plan = plan_pic_thunk_repair(site, 0xABC0);
-
-        assert_eq!(plan.correct_return_address, 0xABC5);
-        // mov ebx, 0x0000ABC5 = BB C5 AB 00 00
-        assert_eq!(plan.patch_bytes, [0xBB, 0xC5, 0xAB, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn applies_repair_to_buffer() {
-        let mut buffer = [0xE8, 0x05, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90];
-        let site = PicThunkCallSite {
-            offset_in_buffer: 0,
-            call_target: 0xBEEF,
-            register: ThunkRegister::Eax,
-        };
-        let plan = plan_pic_thunk_repair(site, 0x1000);
-        apply_repair_to_buffer(&mut buffer, &plan).expect("apply should succeed");
-
-        assert_eq!(buffer[0], 0xB8); // mov eax, imm32
-        assert_eq!(&buffer[1..5], &0x1005u32.to_le_bytes());
-        assert_eq!(&buffer[5..], &[0x90, 0x90, 0x90]); // untouched
-    }
-
-    #[test]
-    fn rejects_repair_outside_buffer() {
-        let mut buffer = [0x90; 8];
-        let plan = plan_pic_thunk_repair(
-            PicThunkCallSite {
-                offset_in_buffer: 4,
-                call_target: 0xBEEF,
-                register: ThunkRegister::Eax,
-            },
-            0x1000,
-        );
-
-        assert_eq!(
-            apply_repair_to_buffer(&mut buffer, &plan),
-            Err(PicThunkError::PatchOutsideBuffer)
-        );
-    }
-
-    #[test]
-    fn end_to_end_find_plan_apply() {
-        // Simulate a copied prologue with a thunk call
-        let mut buffer = [0x90u8; 16];
-        buffer[0] = 0xE8;
-        let disp: i32 = 5;
-        buffer[1..5].copy_from_slice(&disp.to_le_bytes());
-
-        let thunk_bytes = make_thunk_bytes(ThunkRegister::Eax);
-        let base_addr = 0x2000u32;
-        let original_fn_addr = 0x1000u32;
-
-        let site = find_pic_thunk_call(&buffer, base_addr, &|addr| {
-            if addr == base_addr + 10 {
-                Some(thunk_bytes)
-            } else {
-                None
-            }
-        })
-        .expect("should find thunk");
-
-        let plan = plan_pic_thunk_repair(site, original_fn_addr);
-        apply_repair_to_buffer(&mut buffer, &plan).expect("apply should succeed");
-
-        // Verify: buffer[0..5] is now mov eax, 0x1005
-        assert_eq!(buffer[0], 0xB8);
-        assert_eq!(&buffer[1..5], &0x1005u32.to_le_bytes());
-    }
-}
+mod tests;

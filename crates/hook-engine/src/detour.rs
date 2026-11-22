@@ -2,11 +2,18 @@ use retour::GenericDetour;
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::pic_repair;
 use crate::plan::ValidatedHookTarget;
+use crate::protect::{self, Protection};
 
-use crate::pic_thunk;
-
-static TRAMPOLINE_PAGES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Trampolines this process has created, in creation order.
+///
+/// `retour` allocates trampolines in executable memory that is writable while
+/// the detour is being built. The addresses are kept so an install pass can
+/// reopen them ([`ensure_trampoline_pages_writable`]) and harden them back to
+/// read-execute afterwards ([`restore_trampoline_pages_rx`]). Each entry is a
+/// raw trampoline address; page rounding is the protection backend's job.
+static TRAMPOLINES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Function-pointer types the active backend can hook.
 ///
@@ -18,6 +25,30 @@ pub use retour::Function as HookFn;
 ///
 /// Backend-specific; callers hold it opaquely and reach the original entry
 /// point through [`crate::original::original_detour`].
+///
+/// # Platform behaviour
+///
+/// The backend is `retour`, which patches 32-bit and 64-bit x86 on both unix
+/// and Windows, so this type has the same shape and the same API on either
+/// platform: `new`, `enable`, `disable`, `is_enabled`, `trampoline`, and the
+/// original-entry-point lookup through
+/// [`crate::original::original_detour`] all behave identically. There is no
+/// Windows-only restriction on the type.
+///
+/// Two engine-level steps around the backend do differ, and are stated here so
+/// no caller assumes otherwise:
+///
+/// * PIC-thunk repair ([`create_detour`] → the `finalize` path) is 32-bit ELF
+///   only. On MS-x64 it is skipped by design: x64 reaches globals through
+///   RIP-relative operands, so a copied prologue holds no
+///   `call __x86.get_pc_thunk.*` whose return address would need rewriting.
+///   The `pic_thunk` gate refuses instead of decoding 32-bit bytes on a
+///   64-bit target.
+/// * The backend's patcher changes page protection through its own allocator
+///   and does not marshal the instruction-cache flush. This crate's own writer
+///   ([`crate::patch::write_code_patch`]) does, via
+///   [`protect::flush_instruction_cache`] (`FlushInstructionCache` on Windows).
+///   Prefer that writer when installing a patch on Windows outside `retour`.
 pub type Detour<F> = GenericDetour<F>;
 
 pub struct PendingDetour<F: HookFn> {
@@ -78,7 +109,7 @@ pub unsafe fn create_detour<F: HookFn>(
 /// Called after a loader-consistent install pass. A future create_detour call
 /// will reopen these pages before asking retour to allocate again.
 pub fn restore_trampoline_pages_rx() {
-    set_trampoline_pages_protection(libc::PROT_READ | libc::PROT_EXEC, "RX");
+    set_trampoline_pages_protection(Protection::READ_EXECUTE, "RX");
 }
 
 /// Store a pending detour into its process-lifetime slot and finalize it.
@@ -110,38 +141,39 @@ pub unsafe fn store_and_finalize<F: HookFn>(
 }
 
 fn ensure_trampoline_pages_writable() {
-    set_trampoline_pages_protection(libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, "RWX");
+    set_trampoline_pages_protection(Protection::READ_WRITE_EXECUTE, "RWX");
 }
 
-fn set_trampoline_pages_protection(protection: i32, label: &str) {
-    let Ok(pages) = TRAMPOLINE_PAGES.lock() else {
+fn set_trampoline_pages_protection(protection: Protection, label: &str) {
+    let Ok(trampolines) = TRAMPOLINES.lock() else {
+        warn!("trampoline list is poisoned, leaving trampoline protection alone");
         return;
     };
-    if pages.is_empty() {
+    if trampolines.is_empty() {
         return;
     }
-    let page_size = page_size();
     let mut failures = 0usize;
-    for &page_start in pages.iter() {
-        // SAFETY: page_start values are page-aligned trampoline pages that
-        // were previously accepted by mprotect during PIC repair.
-        let rc = unsafe { libc::mprotect(page_start as *mut libc::c_void, page_size, protection) };
-        if rc != 0 {
+    for &trampoline in trampolines.iter() {
+        // `trampoline` is the start of a trampoline retour allocated for this
+        // process: it stays mapped for the process lifetime, and one byte is
+        // enough for the backend to find the page that contains it.
+        if protect::set_protection(trampoline, 1, protection).is_err() {
             failures += 1;
         }
     }
+    let trampolines = trampolines.len();
     if failures == 0 {
         debug!(
-            pages = pages.len(),
+            trampolines,
             protection = label,
-            "trampoline pages protected"
+            "trampoline protection applied"
         );
     } else {
         warn!(
-            pages = pages.len(),
+            trampolines,
             failures,
             protection = label,
-            "trampoline page protection failed"
+            "trampoline protection failed"
         );
     }
 }
@@ -156,7 +188,7 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     callee_addr: usize,
 ) -> bool {
     let tramp_addr = detour.trampoline() as *const _ as usize;
-    remember_trampoline_page(trampoline_page_start(tramp_addr));
+    remember_trampoline(tramp_addr);
 
     // Read the original prologue NOW, before enable() overwrites it.
     let mut prologue = [0u8; 16];
@@ -166,7 +198,7 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
         std::ptr::copy_nonoverlapping(callee_addr as *const u8, prologue.as_mut_ptr(), 16);
     }
 
-    repair_pic_thunk(tramp_addr, callee_addr, &prologue);
+    pic_repair::repair_pic_thunk(tramp_addr, callee_addr, &prologue);
 
     // SAFETY: enabling the detour.
     if let Err(e) = unsafe { detour.enable() } {
@@ -177,181 +209,12 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     true
 }
 
-/// PIC thunk repair using the saved original prologue.
-///
-/// retour rewrites call instructions in the trampoline (changing their
-/// displacement to point at retour's own thunk stubs). We cannot rely on
-/// the trampoline's call targets to identify PIC thunks. Instead, scan the
-/// saved original prologue to find call-to-thunk patterns, then verify the
-/// trampoline has an E8 (call) at the same offset before patching.
-fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[u8; 16]) {
-    if !cfg!(target_pointer_width = "32") {
-        return;
-    }
-
-    // SAFETY: reading trampoline bytes.
-    let tramp_bytes = unsafe { std::slice::from_raw_parts(tramp_addr as *const u8, 64) };
-
-    // Scan the ORIGINAL prologue (pre-retour) for PIC thunk calls.
-    // The original call targets (PIC thunk functions) are still intact in
-    // steamclient.so. Only the function's own prologue bytes were overwritten.
-    let result = pic_thunk::find_pic_thunk_call(original_prologue, callee_addr as u32, &|addr| {
-        let ptr = addr as usize as *const u8;
-        if ptr.is_null() {
-            return None;
-        }
-        // SAFETY: PIC thunk is a small function elsewhere in the module,
-        // not affected by retour's prologue overwrite.
-        Some(unsafe { [*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)] })
-    });
-
-    let Ok(site) = result else { return };
-
-    let offset = site.offset_in_buffer;
-    let register = site.register;
-
-    let Some(relocated_len) = trampoline_relocated_prefix_len32(
-        tramp_bytes,
-        tramp_addr as u32,
-        callee_addr as u32,
-        original_prologue.len(),
-    ) else {
+fn remember_trampoline(trampoline: usize) {
+    let Ok(mut trampolines) = TRAMPOLINES.lock() else {
+        warn!("trampoline list is poisoned, trampoline protection not tracked");
         return;
     };
-    if !range_within_relocated_prefix(offset, 5, relocated_len) {
-        return;
-    }
-
-    // Verify: the trampoline must have a call (E8) at this offset.
-    if offset >= tramp_bytes.len() || tramp_bytes[offset] != 0xE8 {
-        return;
-    }
-
-    let call_address = callee_addr as u32 + offset as u32;
-    let plan = pic_thunk::plan_pic_thunk_repair(site, call_address);
-
-    // SAFETY: making the trampoline writable for PIC repair.
-    unsafe {
-        let page_size = page_size();
-        let page_start = trampoline_page_start(tramp_addr);
-        if libc::mprotect(
-            page_start as *mut libc::c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        ) != 0
-        {
-            error!("PIC thunk repair: mprotect(RWX) failed");
-            return;
-        }
-        let patch_ptr = (tramp_addr + offset) as *mut u8;
-        for (i, &byte) in plan.patch_bytes.iter().enumerate() {
-            *patch_ptr.add(i) = byte;
-        }
-    }
-    info!(
-        register = format_args!("{:?}", register),
-        offset = offset,
-        "PIC thunk repaired"
-    );
-}
-
-fn trampoline_relocated_prefix_len32(
-    trampoline: &[u8],
-    trampoline_address: u32,
-    callee_address: u32,
-    original_window_len: usize,
-) -> Option<usize> {
-    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
-
-    let original_end = callee_address.checked_add(original_window_len as u32)?;
-    let mut decoder = Decoder::with_ip(
-        32,
-        trampoline,
-        u64::from(trampoline_address),
-        DecoderOptions::NONE,
-    );
-    while decoder.can_decode() {
-        let instruction = decoder.decode();
-        if instruction.is_invalid() {
-            return None;
-        }
-        if instruction.mnemonic() != Mnemonic::Jmp
-            || !matches!(
-                instruction.op0_kind(),
-                OpKind::NearBranch16 | OpKind::NearBranch32
-            )
-        {
-            continue;
-        }
-        let target = instruction.near_branch_target() as u32;
-        if target > callee_address && target <= original_end {
-            return Some(target.wrapping_sub(callee_address) as usize);
-        }
-    }
-    None
-}
-
-fn range_within_relocated_prefix(offset: usize, len: usize, relocated_len: usize) -> bool {
-    offset
-        .checked_add(len)
-        .is_some_and(|end| end <= relocated_len)
-}
-
-fn remember_trampoline_page(page_start: usize) {
-    let Ok(mut pages) = TRAMPOLINE_PAGES.lock() else {
-        return;
-    };
-    if !pages.contains(&page_start) {
-        pages.push(page_start);
-    }
-}
-
-fn trampoline_page_start(addr: usize) -> usize {
-    let page_size = page_size();
-    addr & !(page_size - 1)
-}
-
-fn page_size() -> usize {
-    // SAFETY: sysconf is thread-safe and does not retain pointers.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{range_within_relocated_prefix, trampoline_relocated_prefix_len32};
-
-    fn append_return_jump(bytes: &mut Vec<u8>, trampoline_address: u32, target: u32) {
-        let jump_address = trampoline_address + bytes.len() as u32;
-        bytes.push(0xe9);
-        bytes.extend_from_slice(&target.wrapping_sub(jump_address + 5).to_le_bytes());
-    }
-
-    #[test]
-    fn measures_only_the_prefix_relocated_by_retour() {
-        let trampoline_address = 0xf670_0054;
-        let callee_address = 0xd22e_36b0;
-        let mut bytes = vec![0x55, 0x89, 0xe5, 0x57, 0x56];
-        append_return_jump(&mut bytes, trampoline_address, callee_address + 5);
-        bytes.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
-
-        let relocated_len =
-            trampoline_relocated_prefix_len32(&bytes, trampoline_address, callee_address, 16)
-                .unwrap();
-        assert_eq!(relocated_len, 5);
-        assert!(!range_within_relocated_prefix(8, 5, relocated_len));
-    }
-
-    #[test]
-    fn includes_a_pic_call_relocated_before_the_return_jump() {
-        let trampoline_address = 0xf670_0054;
-        let callee_address = 0xd22e_36b0;
-        let mut bytes = vec![0x55, 0x57, 0x56, 0x53, 0xe8, 0, 0, 0, 0];
-        append_return_jump(&mut bytes, trampoline_address, callee_address + 9);
-
-        let relocated_len =
-            trampoline_relocated_prefix_len32(&bytes, trampoline_address, callee_address, 16)
-                .unwrap();
-        assert_eq!(relocated_len, 9);
-        assert!(range_within_relocated_prefix(4, 5, relocated_len));
+    if !trampolines.contains(&trampoline) {
+        trampolines.push(trampoline);
     }
 }
