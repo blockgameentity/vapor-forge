@@ -1190,3 +1190,411 @@ previous passes.
   `0x4f6a40`, `0x4eb080`, `0xa16f70` and `0x9bf3d0` are all static identifications with the
   strings, slots, callees and argument shapes quoted; the "what would confirm"
   question for each is in its section.
+
+---
+
+# Fifth pass: the packet layout family, `GetSteamID`, `RegisterJsMethod`
+
+The fourth pass worked from interface name tables. This pass works from a place
+the previous four could not reach: the **module's own assert expressions and
+source-file tags**. `CNetPacket` has no RTTI — it is not in any enumerated table,
+so no slot map, no class name, no vtable anchor reaches it — but every method in
+its cluster asserts through a tag string that is the *source file*
+(`…\src\common\netpacket.cpp`) and an expression that names the *member*
+(`m_cRef == 0`, `!m_pParsedHeader && !m_pParsedBody`) or the *argument*
+(`pubData`, `cubData`). That turns "a function that stores four arguments into
+`this`" into "the netpacket.cpp function that asserts `pubData` and `cubData`",
+which is the identity the packet layout needed. The other two targets stay
+negatives, and both are now refused for a measured reason rather than a missing
+route.
+
+| target | verdict | anchor, public / publicbeta | corpus entry |
+| --- | --- | --- | --- |
+| `CNetPacket::Init` | **confirmed** (role, class and members; the member *name* is an interpretation) | `0xead290` / `0xebf080` | **added** |
+| `CNetPacket::Alloc` | **confirmed** | `0xd3fe90` / `0xd6bcd0` | **added** |
+| `CNetPacket::Release` | **confirmed** | `0xead4d0` / `0xebf2c0` | **added** |
+| `CUser::GetSteamID` | **candidate (strong)** for the slot, **refuted** as an anchor | slot 10, `0xcfed0` / `0xd0470` | none |
+| `RegisterJsMethod` | **no candidate** | — (`SteamUI.dll`) | none |
+
+## What was measured
+
+Same corpus, same anchor body gate, same `--verify` discipline
+(`res/patterns/win64/README.md`). Three additions to the method, all read-only:
+
+* **assert strings as ground truth.** The inline assert path of these functions is
+  `call *<assert>` with `r8` = expression, `rdx` = line, `rcx` = source file. A
+  RIP-relative reference scan that resolves those three operands to strings gives
+  the file and the expression, which names members and arguments.
+* **cluster neighbourhood.** A method family sits together in the image (the
+  packet methods are all within `0xead080..0xead640`, public), so a log string
+  that names one member of the family locates the rest by proximity, and each is
+  then confirmed by its own body.
+* **hand argument flow.** `crate::arg_flow` (and therefore `msflow`) seeds the
+  System V register order, so on these images every "argument N" it reports is
+  wrong. The ABI below was read from the disassembly by hand and stated as such;
+  section 1.5 measures exactly what the shipped walk does with these bodies.
+
+## 1. `CNetPacket` — the layout, and three anchors
+
+### 1.1 The family, and why it is one family
+
+All of these are inside `…\src\common\netpacket.cpp` (the assert tag at public
+`0x13949a3d0`, referenced by `Init`, `AddRef`, `Release` and `SetData`) except
+`Alloc`, whose tag is `…\src\common\net.cpp` (`0x13942de68`). Public RVAs; the
+beta RVA for each function is in the verdict table above and the corpus table at
+the end of the report.
+
+| function | public | size | what its body does |
+| --- | --- | --- | --- |
+| constructor | `0xeac900` | 27 B | zeroes `+0x1c` (`m_cRef`), `+0x28`, `+0x2c`, `+0x30`, `+0x48` (`m_pParsedHeader`), `+0x50` (`m_pParsedBody`); returns `this` |
+| **`Init`** | **`0xead290`** | 514 B | stores four of its arguments into `this` (1.2), asserts `pubData`, `cubData`, `!m_pParsedHeader && !m_pParsedBody`, `m_cRef == 0`, then `m_cRef = 1` when its last argument is set |
+| `AddRef` | `0xeac9f0` | 170 B | `incl 0x1c`; when the count rose above 1 and `+0x20` is null it allocates `[+0x18]` bytes, `memcpy`s from `[+0x10]`, and stores the copy at `+0x20` **and** `+0x10`; logs `CNetPacket::AddRef - Copy` (netpacket.cpp line 142) |
+| `SetData` | `0xead5e0` | 84 B | frees the previous `+0x20` buffer when it is not the new pointer, then sets `+0x18`, `+0x20`, `+0x10` |
+| **`Release`** | **`0xead4d0`** | 262 B | `subl $0x1,0x1c(%rcx)`; on zero it pushes the object onto the module's deferred-free `CUtlLinkedList` (`utllinkedlist.h` asserts) |
+| `ReallyRelease` drain | `0xead080` | 419 B | the queue processor: logs `CNetPacket::ReallyRelease() [%s] [%u] - %s` / `[%u] - null`, frees `+0x48`, `+0x50`, `+0x20` |
+| **`Alloc`** | **`0xd3fe90`** | 226 B | allocates `0x58` bytes through the allocator interface, calls the constructor, allocates a copy of the payload, `memcpy`, then `Init(packet, 0, copy, size, copy, true)` and returns the packet (1.3) |
+
+The two consumers that make this a *packet* and not an arbitrary object:
+
+* `0xd4bec0` (842 B) — the wrapper factory that `CCMConnection::RecvPkt` calls —
+  reads `+0x18` (length), `+0x10` (payload) and `+0x28`, and builds one of the
+  `IMsgNetPacket` wrappers around the object. The host's
+  `crates/host-windows/src/abi/netpacket.rs` already describes this accessor by
+  shape ("reads packet fields at `+0x10`/`+0x18`/`+0x28`"); this pass confirms
+  which object those offsets belong to.
+* `CCMConnection::RecvPkt` (`0x5d2f80`, 167 B) logs `CCMConnection::RecvPkt()
+  multi` and hands the wrapper to `CNetConnectionBuffer::MultiplexMultiMsg`
+  (`0xe90940`, 430 B → `0xe90330`), which splits a multi-message into
+  sub-packets: it reads the sub-packet length out of the buffer, takes the
+  connection id from the connection's own getter (`call *0x20(%rax)`), and calls
+  `Init(sub, conn_id, data, size, 0, 1)`. That call site is the Linux
+  `CCMConnection` loop's counterpart, and it is where `Init`'s ABI is visible in
+  full.
+
+### 1.2 The field offsets, as `Init` writes them
+
+Public `0xead290`; the beta body (`0xebf080`) writes exactly the same offsets.
+
+```
+mov  %r9d,%edi             ; cubData
+mov  %r8,%rsi              ; pubData
+mov  %edx,%ebp             ; unConnID
+mov  %rcx,%rbx             ; this
+test %r8,%r8   ; Assert( pubData )                      netpacket.cpp:45
+test %edi,%edi ; Assert( cubData )                      netpacket.cpp:46
+mov  0x80(%rsp),%rax       ; arg 5 (first stack argument)
+movups <zero>,%xmm0        ; 16-byte constant from .rdata 0x13949a3a8
+mov  %rax,0x20(%rbx)       ; m_pOwned  = arg 5
+mov  %edi,0x18(%rbx)       ; m_cubData = cubData
+movups %xmm0,0x38(%rbx)    ; +0x38..0x47 zeroed
+mov  %ebp,(%rbx)           ; m_unConnID = unConnID
+mov  %rsi,0x10(%rbx)       ; m_pubData  = pubData
+...
+mov  %ecx,0x4(%rbx)        ; from a u32 module global (.data 0x13976f308, 0 here)
+mov  %ecx,0x8(%rbx)        ; the same global
+cmpq $0x0,0x48(%rbx)       ; Assert( !m_pParsedHeader && !m_pParsedBody )
+cmpq $0x0,0x50(%rbx)       ;   (rdi = lea 0x50(%rbx))
+xor  %esi,%esi             ; zero
+mov  %rsi,0x48(%rbx)       ; m_pParsedHeader = null
+mov  %rsi,0x50(%rbx)       ; m_pParsedBody   = null
+mov  %sil,0x2c(%rbx)       ; byte field = 0
+mov  %esi,0x28(%rbx)       ; dword field = 0
+cmp  %sil,0x88(%rsp)       ; the bool argument
+je   done
+cmp  %esi,0x1c(%rbx)       ; Assert( m_cRef == 0 )
+incl 0x1c(%rbx)            ; m_cRef = 1
+```
+
+| offset | width | what it is | how it is known |
+| --- | --- | --- | --- |
+| `+0x00` | 4 | connection id — `Init`'s `edx` (`unConnID`) | `mov %ebp,(%rbx)`, `ebp` = `edx`; `Alloc` passes 0, the multi-splitter passes the connection's own getter result |
+| `+0x04` | 4 | u32 module global (`.data` `0x13976f308`, **0** in this build) | `mov %ecx,0x4(%rbx)` after three `movzbl`/`movzwl` loads from that global |
+| `+0x08` | 4 | the same global | `mov %ecx,0x8(%rbx)`, same computation |
+| `+0x10` | 8 | payload pointer — `Init`'s `r8`, named **`pubData`** by its assert | `mov %rsi,0x10(%rbx)`; read by `AddRef`, `SetData` and the wrapper factory `0xd4bec0` |
+| `+0x18` | 4 | payload length — `Init`'s `r9d`, named **`cubData`** | `mov %edi,0x18(%rbx)`; `movslq 0x18(%rcx)` is the `memcpy` length in `AddRef`/`SetData` |
+| `+0x1c` | 4 | **`m_cRef`** | `Assert( m_cRef == 0 )` in `Init`; `incl`/`subl $1` in `AddRef`/`Release`; zeroed by the constructor |
+| `+0x20` | 8 | owned buffer — `Init`'s first stack argument (the pointer `Alloc` just allocated) | `mov %rax,0x20(%rbx)`; `SetData` frees it; `AddRef` copies into it |
+| `+0x28` | 4 | flag/count, zeroed | `mov %esi,0x28`; the wrapper factory `0xd4bec0` tests it (`cmpl $0x0,0x28(%rcx)`) |
+| `+0x2c` | 1 | byte flag, zeroed | `mov %sil,0x2c(%rbx)` |
+| `+0x30` | 8 | pointer, zeroed by the constructor only | `mov %rax,0x30(%rcx)` in `0xeac900`; `Init` does not touch it |
+| `+0x38` | 16 | 16-byte constant from `.rdata` `0x13949a3a8` (zero in this build) | `movups %xmm0,0x38(%rbx)` |
+| `+0x48` | 8 | **`m_pParsedHeader`** | `Assert( !m_pParsedHeader && !m_pParsedBody )`, then zeroed; freed by the `ReallyRelease` drain |
+| `+0x50` | 8 | **`m_pParsedBody`** | the same assert; freed by the drain |
+| object size | `0x58` | — | the constant `edx` of `Alloc`'s allocator call |
+
+The names `m_cRef`, `m_pParsedHeader` and `m_pParsedBody` are read out of the
+module; `pubData` and `cubData` name `Init`'s arguments 2 and 3. The names
+`m_unConnID`, `m_pubData`, `m_cubData` are the Linux corpus's names for the same
+four fields, applied in the same order — the *ordering* is measured here, the
+member spelling is not.
+
+### 1.3 `Alloc`, and the object size
+
+```
+Alloc(pubData = rcx, cubData = edx)
+  lock incl <g_pNetPacketCount>          ; PL5 counter, .data 0x139873214
+  mov  $0x58,%edx                        ; object size
+  call *0x10(<g_pMemAllocSteam>)         ; allocate, tag = net.cpp
+  call 0xeac900                          ; constructor (zeroes 1.2's tail fields)
+  cmp  $0xa00000,%esi ; Assert( cubData <= k_cubMaxExpectedMsgDataSize )
+  allocate cubData bytes, memcpy(dst, pubData, cubData)
+  Init(packet, 0, copy, cubData, copy, add_ref = true)
+  return packet
+```
+
+Two independent constants agree on the object: the allocation is `0x58` and the
+last field `Init` clears starts at `+0x50` (8 bytes). Its callers are a send path
+(`0x595bd0`, which looks a connection id up in a `0x20`-stride map, calls `Alloc`,
+then wraps the result with `0xd4bec0` and reads the `EMsg` back through the
+wrapper's slot `0x60`). Beta: `0xd6bcd0`, constructor `0xebe6f0`, same sizes and
+the same `0x58`.
+
+### 1.4 The ABI, as measured
+
+`Init(CNetPacket *this, uint32 unConnID, const void *pubData, uint32 cubData,
+void *pOwned, bool bAddRef)` — six parameters, so `rcx, rdx, r8, r9` plus two on
+the stack at entry `[rsp+0x28]` / `[rsp+0x30]` (Windows reserves `0x20` bytes of
+shadow space). `pOwned` is parameter 5; `bAddRef` is parameter 6 and only
+controls the `m_cRef = 1` tail.
+`Alloc(void *pubData, uint32 cubData)` takes **no** `this` and returns the packet
+in `rax`. `Release(this)` is `void`.
+
+### 1.5 Can `patterns::cnet_packet::decode_init` consume these bodies today? No
+
+Measured, not argued: the shipped decoders were run against the three Windows
+bodies with `bitness = 64` and the images' own `.text` (a throwaway example, since
+deleted):
+
+| decoder | result on the Windows body | first missing fact |
+| --- | --- | --- |
+| `decode_init` | `Err("connection id store")` | argument 1 is `rdx` here, `rsi` under System V |
+| `decode_alloc` | `Err("allocator call with a constant size")` | `args[1]` is read from `rsi`; the size `0x58` is loaded into `edx` |
+| `decode_release` | `Err("refcount decrement")` | the decrement is on `rcx`, which the System V seeding labels **argument 3**; `decode_release` looks for `Arg(0)` |
+
+The cause is one layer down from `cnet_packet.rs`: `crate::arg_flow::trace` seeds
+`RDI, RSI, RDX, RCX, R8, R9` as arguments 0..5 and clobbers
+`RAX,RCX,RDX,RSI,RDI,R8,R9,R10,R11` at every call. On MS-x64 that is wrong twice
+over — the `this` pointer is `rcx`, so everything is shifted by three, and
+`rsi`/`rdi` are **callee-saved**, which matters concretely here: `Init` holds
+`pubData` in `rsi` and `cubData` in `rdi` across the two assert calls
+(`call *0x1391b7510`), so a walk that drops them loses both stores. The
+`0x100`-byte field cap and the overlap rule in `cnet_packet.rs` are not a problem:
+`conn_id = 0` passes `offset % width == 0`, and `0x00/0x10/0x18/0x20` with
+`m_cRef` at `0x1c` do not overlap.
+
+**The change this needs** (described, not made — `cnet_packet.rs` is untouched):
+make the argument model an ABI parameter instead of a constant.
+
+1. `arg_flow::trace(abi, bitness, code, offset, limit)` with
+   `Abi::SysV64 | Abi::Ms64 | Abi::Cdecl32`; `Ms64` seeds `RCX,RDX,R8,R9` as
+   arguments 0..3 **and** the first two stack arguments at entry `[rsp+0x28]`,
+   `[rsp+0x30]` as arguments 4 and 5 (the same `TRACKED_ARGUMENTS` bound already
+   covers it), and clobbers the MS-x64 volatile set
+   (`RAX,RCX,RDX,R8,R9,R10,R11`).
+2. Thread that ABI through `decode_init`/`decode_alloc`/`decode_release`/
+   `decode_api` and the two callers that already know the target ABI
+   (`crates/patterns/src/bin/vapor-forge-pattern-scan/semantic.rs`, and the
+   runtime's layout decode).
+3. Nothing else: `PacketFields`, `spans`, `end`, `overlaps` and the limits are
+   ABI-free.
+
+With that, `decode_api` on `0xd3fe90` / `0xead290` / `0xead4d0` would return
+
+```
+fields { conn_id: 0x00, data: 0x10, size: 0x18, owned_data: 0x20 }
+refcount 0x1c
+object_size 0x58
+```
+
+which `crates/host-windows/src/abi/netpacket.rs::Layout::new(0x10, 0x18)` accepts
+(both slots aligned, disjoint) — i.e. the body workstream's missing `Layout`
+becomes derivable from the corpus with no offset hard-coded anywhere.
+
+### 1.6 What confirms this, and what would overturn it
+
+**Confirmed:** class identity from the module's own strings (`netpacket.cpp` tag
+plus `CNetPacket::AddRef - Copy` / `CNetPacket::ReallyRelease`), member identity
+from assert expressions, the field offsets from `Init`'s stores, the object size
+from `Alloc`'s allocation, and the role from the two consumers on the packet path
+(the wrapper factory that reads `+0x10`/`+0x18`, and the multi-message splitter
+that calls `Init`). Five bodies agree on the same offsets; the beta build stores
+the same offsets at the same displacements.
+
+**Not proven:** that the pre-`this` calling convention is the same as the Linux
+`Init` (the field *ordering* matches, the argument *count* does too, but the two
+extra arguments after `cubData` are `pOwned` and `bAddRef` only by their use);
+that `+0x00` is the connection id rather than a sequence number — `Alloc` passes
+0 and the splitter passes a connection-layer getter, which is the only
+discriminating evidence available statically.
+
+**What a live client would show to overturn it:** a hook on `0xead290` whose
+`edx` is not a small connection id, or `Init` being entered with `pubData` equal
+to the connection buffer rather than a payload; or `0x58` not being the allocation
+size of the object that `0xd4bec0` later reads. **What would confirm the ABI:** a
+detour that logs the six arguments for a received packet and sees `cubData` equal
+to the wire length and `pOwned` null on the receive path but equal to `pubData` on
+the `Alloc` path.
+
+## 2. `CUser::GetSteamID` — the slot is confirmed, the anchor is refused
+
+The fourth pass derived `IClientUser` slot 10 as `GetSteamID` and 11 as
+`GetClientInstanceID` from the name table, and refused an entry because slot 10's
+body writes through a pointer. This pass adds the field-level proof and the gate
+measurement; the verdict stays **no entry**.
+
+| | public | publicbeta |
+| --- | --- | --- |
+| `CUser` 260/261-slot table slot 10 | `0xcfed0` | `0xd0470` |
+| body | `mov -0x1c6e(%rcx),%rax; mov %rax,(%rdx); mov %rdx,%rax; ret` (13 insns, 4 real) | `mov -0x1d3e(%rcx),%rax; mov %rax,(%rdx); mov %rdx,%rax; ret` |
+| slot 11 | `0xa08cb0` | `0xa31200` |
+| body | `mov -0x1ce8(%rcx),%rax; ret` | `mov -0x1db8(%rcx),%rax; ret` |
+
+**The field slot 10 exposes is a CSteamID — measured.** `CUpdateSubscribedItemsJob`
+(`0x9d1300`) reads that same field through the `CUser` pointer it holds and tests
+the id's *account type*:
+
+```
+mov  0x98(%rcx),%rcx      ; the job's CUser *
+add  $0x1e78,%rcx         ; its IClientUser subobject
+mov  -0x1c6e(%rcx),%rax   ; = CUser + 0x20A   (the slot-10 field)
+shr  $0x20,%rax
+and  $0xf00000,%eax       ; bits 52..55
+cmp  $0xa00000,%eax       ; k_EAccountTypeAnonUser
+```
+
+That is a SteamID64 account-type test and nothing else, so slot 10 is the
+account-id accessor even though its ABI is an out-parameter.
+
+**Slot 11 is the instance id.** It is the only two-instruction 64-bit getter in
+the 260-slot table (every other no-argument slot there is an adjustor thunk
+(`sub $0x1e78,%rcx; jmp`) or a 32-bit getter), which is exactly the shape `crates/hooks/src/client/user.rs` declares
+(`unsafe extern "C" fn(*mut c_void) -> u64`, id in `rax`), but it reads a different
+field and the interface order puts `GetClientInstanceID` there; its only reader
+(`0x9fb890`) formats the value as `%08llx`, not as a SteamID.
+
+**The trivial getter the Linux host hooks does not exist as a body.**
+`mov rax,[rcx+0xA8]; ret` has **0** occurrences in either image (byte search for
+`48 8B 81 A8 00 00 00 C3` and `48 8B 41 A8 C3`), so `CUser::CacheAccountNameAndSteamID`'s
+store at `+0xA8` is only ever read through inlined code.
+
+**Both getters fail the anchor body gate** — the objective reason for no entry.
+`vapor-forge-pattern-mine` resolves each body uniquely (`1` match) and then
+rejects it as `unmapped` on both builds: neither `0xcfed0`/`0xd0470` nor
+`0xa08cb0`/`0xa31200` is a `.pdata` function entry (checked against the raw
+`.pdata` table as well: no `RUNTIME_FUNCTION` covers those addresses at all, in
+either build — they are leaf thunks with no prologue and therefore no unwind
+record). A corpus entry would therefore be a pinned address, precisely what the
+gate exists to refuse.
+
+**Verdict: candidate (strong) for the slot, refuted as an anchor.** A
+`SteamIdOverride` body on Windows cannot be a two-line `rax` wrapper: it must
+detour the out-parameter ABI (`*out = id; return out`) **and** the entry cannot
+come from this corpus. The capability needs `crates/host-windows` to publish the
+id some other way (the wrapper factory `0xd4bec0` and the packet path already read
+`CUser`'s fields through anchored friends) before an anchor question even arises.
+**What a live client would show to overturn it:** slot 10 being called during
+logon with an `rdx` that comes back holding the account's CSteamID — that would
+confirm the accessor *and* the ABI; slot 11 returning the same value as slot 10
+would mean the interface map is off by one here.
+
+## 3. `RegisterJsMethod` — still no candidate, but the containers are now named
+
+Neither build contains `RegisterJsMethod` / `RegisterJSMethod` as a string. What
+this pass adds is the RTTI the fourth pass did not use: the registration
+containers are named in the module, in both builds.
+
+| RTTI name | owner |
+| --- | --- |
+| `.?AUJSMethodRegistration_t@CHTMLWindow@@` | the registration *value* type |
+| `CUtlHashMap<CUtlString, JSMethodRegistration_t@CHTMLWindow, CDefEquals<CUtlString>, HashFunctor<CUtlString>, StringView>` | the map a registrar would insert into, on `CHTMLWindow` |
+| `CUtlHashMap<CUtlString, JSRegisteredMethod_t@CHTMLWindowController, …>` | the twin map on `CHTMLWindowController` |
+| `CJSMethodCallHandler<CHTMLWindow, …>`, `CHTMLWindow::ExecuteJSCallback` | the call side |
+
+So the missing method is a **non-virtual** member (neither map type has a vtable —
+`--class` finds no table for either) of `CHTMLWindow` or
+`CHTMLWindowController`, keyed by `CUtlString`. The two classes' tables are 42 + 64
+slots (`CHTMLWindow`) and 13 slots (`CHTMLWindowController`); none of their slots
+takes `(name, handler, flags)` and inserts into a string-keyed map — the closest,
+`CHTMLWindowController` slot 11 (`0x210800`, 602 B), is the window-state serialiser
+the fourth pass already identified by its writer-vtable member stores. The only
+string in the neighbourhood is still the log line
+`CreateSharedJSContext:RegisterJSMethods` (fourth pass: `0xdea140`, used at
+`0x687322`), and
+`CHTMLWindow::ExecuteJSCallback` (`0xcec590`) is a log-category tag: the function
+that references it, `0x20c0b0`, is `CHTMLWindow` slot 1 and logs it at line `0x13`
+of its own translation unit.
+
+**Verdict: no candidate.** `SteamUI`'s corpus is unchanged (7 public / 5 beta
+patterns). **What would change it:** a `CUtlString`-keyed insert in either class
+whose value stores a `CSmartPtr<CJSCallbackFunc>` plus a flags byte; that shape is
+what to search for if a future build keeps its log strings, and the two map type
+names above are the handle. **What would overturn the negative:** the JS context
+builder at `0x687322` turning out to call such an insert through a thin thunk —
+that thunk would be the registrar, and it would need its own anchor.
+
+## Corpus entries added and verified
+
+Three entries, one pattern each; `Init` and `Release` are the **same bytes in both
+builds**, `Alloc` differs in exactly one byte (`F0`, a `lock` prefix on the
+profiling counter, against `FF`, the indirect call that replaced it).
+
+| symbol | public | publicbeta |
+| --- | --- | --- |
+| `CNetPacket::Alloc` | `0xd3fe90` verified | `0xd6bcd0` verified |
+| `CNetPacket::Init` | `0xead290` verified | `0xebf080` verified |
+| `CNetPacket::Release` | `0xead4d0` verified | `0xebf2c0` verified |
+
+Patterns (mined by `vapor-forge-pattern-mine`, 1 match each, uniqueness checked
+against each image, `round-trip verified` by the shipped scanner):
+
+```
+[steamclient."CNetPacket::Alloc"]
+pattern = "40 53 55 56 57 41 56 48 83 EC 30 48 63 F2 4C 8B F1 F0"   # public
+pattern = "40 53 55 56 57 41 56 48 83 EC 30 48 63 F2 4C 8B F1 FF"   # publicbeta
+
+[steamclient."CNetPacket::Init"]
+pattern = "40 53 55 56 57 48 83 EC 38 41 8B F9 49 8B F0 8B EA 48 8B D9 4D 85 C0 75 28"
+
+[steamclient."CNetPacket::Release"]
+pattern = "40 56 48 83 EC 20 83 69 1C 01 48 8B F1 0F 85 ED"
+```
+
+`--verify` on the full corpus, both images: all 28 public patterns and all 27
+publicbeta patterns resolve, and 27 / 26 of them pass the body gate; the only
+rejection in either run is the pre-existing `GetPipeClient: unmapped` (unchanged
+from the first pass). Both
+`SteamUI` corpora are untouched and still verify.
+
+**Naming note for the host:** `CNetPacket::Init`, `CNetPacket::Alloc` and
+`CNetPacket::Release` are the three names `crates/hooks/src/client/network.rs`
+already resolves and `crates/host-windows/src/hooks/netpacket/availability.rs`
+reports as the reason `request-codes` is off. The corpus now anchors them; the
+remaining gate is the ABI change in 1.5 and the body work that consumes the
+layout, both outside this corpus-only branch.
+
+## Limits of this fifth pass
+
+* The member *names* `Init`, `Alloc`, `Release` are not in the binary. What is in
+  it: the source file (`netpacket.cpp` / `net.cpp`), the members `m_cRef`,
+  `m_pParsedHeader`, `m_pParsedBody`, the arguments `pubData`, `cubData`, and the
+  log lines `CNetPacket::AddRef - Copy` / `CNetPacket::ReallyRelease`. The mapping
+  from "the netpacket.cpp function that fills the four fields" to `CNetPacket::Init`
+  is the Linux corpus's name for the same role; the role itself is measured.
+* The argument flow in section 1.4 is a hand reading. The shipped walk cannot
+  confirm it on these images (1.5 measures its failure), so the layout claim rests
+  on the literal stores quoted above, not on `msflow`. A corrected walk is the
+  cheapest way to re-verify it.
+* `+0x04` and `+0x08` receive one module global that is zero in this build, so
+  nothing here says what they mean; they are not arguments and no decoder needs
+  them.
+* The `CUser` field offsets in section 2 are per build: public reads
+  `interface - 0x1c6e` (= `CUser + 0x20A` at the fourth pass's `0x1e78` subobject
+  offset), beta reads `interface - 0x1d3e`, and beta has no `0x1e78` adjustor at
+  all — the object layout moved, so the beta field offset must be re-derived
+  rather than assumed.
+* Slot indices, sizes and every RVA above were re-measured in both builds; the
+  beta column is beta measurements, not a delta applied to public.
+* Nothing here is a live confirmation. `0xead290`, `0xd3fe90`, `0xead4d0`,
+  `0xcfed0` and `0x210800` are static identifications with their strings, offsets,
+  callees and argument stores quoted; each section's "what a live client would
+  show" is the check that would turn them into fact.
