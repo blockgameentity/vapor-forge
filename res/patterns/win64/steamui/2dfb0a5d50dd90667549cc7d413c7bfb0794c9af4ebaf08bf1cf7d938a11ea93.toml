@@ -33,3 +33,7 @@ pattern = "48 83 EC 78 48 8B 05 ?? ?? ?? ?? 48 89 74 24 70 8B"
 follow = "none"
 pattern = "40 53 48 83 EC 20 48 8B 01 48 8B D9 FF 10 3D D6 0C 09 00 0F"
 
+
+[steamui."RegisterJsMethod"]
+follow = "none"
+pattern = "48 89 5C 24 18 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40 4C 8D B1 A0 00 00 00 41 8B F9 41 83 7E 44 00 4D 8B E0"

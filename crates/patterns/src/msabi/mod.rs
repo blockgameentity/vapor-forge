@@ -32,6 +32,35 @@ pub const MSABI_ARGUMENTS: [Register; 4] =
     [Register::RCX, Register::RDX, Register::R8, Register::R9];
 /// Shadow space / home area the caller owns above the return address.
 pub const SHADOW_SPACE: i64 = 0x20;
+/// Offset, from the entry stack pointer, of the first home slot: the return
+/// address sits at 0, so the four register arguments' copies start at 8.
+pub const HOME_SLOT: i64 = 8;
+/// Offset, from the entry stack pointer, of the fifth argument, the first one
+/// the caller pushes. The callee's shadow space lies between it and the home
+/// slots, so it is `SHADOW_SPACE + 8`, not `SHADOW_SPACE`.
+pub const STACK_ARGUMENT: i64 = SHADOW_SPACE + 8;
+
+/// Offset, from the entry stack pointer, of argument `position` on the stack,
+/// for the positions the four registers do not cover.
+pub fn stack_argument_offset(position: u8) -> Option<i64> {
+    let index = i64::from(position.checked_sub(MSABI_ARGUMENTS.len() as u8)?);
+    Some(STACK_ARGUMENT + 8 * index)
+}
+
+/// Registers a call may destroy: `rax, rcx, rdx, r8, r9, r10, r11`.
+///
+/// `rsi` and `rdi` are callee-saved here, which is the one place this differs
+/// from the System V list in [`crate::arg_flow`] — a value parked in `rsi`
+/// survives the `DCHECK` calls an argument-tracking walk crosses.
+pub const VOLATILE: [Register; 7] = [
+    Register::RAX,
+    Register::RCX,
+    Register::RDX,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+];
 /// Bytes decoded from an entry by default. Argument reads sit in the opening
 /// checks and prologue spills, well inside this.
 pub const WINDOW: usize = 0x80;

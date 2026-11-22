@@ -77,6 +77,8 @@ pub struct ModuleScanReport {
 ///
 /// The pattern engine below only ever sees this: an ELF `PT_LOAD` region and a
 /// PE executable section are both just bytes plus their address mapping.
+/// [`Container`] is carried for the decoders that care which of the two a
+/// region came from — the x86_64 call convention differs between them.
 #[derive(Clone, Copy, Debug)]
 pub struct CodeSegment<'a> {
     pub bytes: &'a [u8],
@@ -84,6 +86,16 @@ pub struct CodeSegment<'a> {
     /// Virtual address (ELF) or section RVA (PE) of `bytes[0]`.
     pub vaddr: u64,
     pub bits: u8,
+    pub container: Container,
+}
+
+/// The image format a [`CodeSegment`] was cut from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Container {
+    /// An ELF `PT_LOAD` segment: x86_64 builds use the System V convention.
+    Elf,
+    /// A PE section: x86_64 builds use MS-x64.
+    Pe,
 }
 
 impl ModuleScanReport {
@@ -173,6 +185,7 @@ pub fn scan_module(
         file_offset: segment.file_offset,
         vaddr: segment.vaddr,
         bits: segment.elf_class.bits(),
+        container: Container::Elf,
     };
     let kind = match segment.elf_class {
         ElfClass::Elf64 => "ELF64",

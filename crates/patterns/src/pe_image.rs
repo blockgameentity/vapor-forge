@@ -8,7 +8,7 @@
 //! trusts the image: inputs are treated as untrusted bytes and every field read
 //! is bounds-checked.
 
-use crate::scan::CodeSegment;
+use crate::scan::{CodeSegment, Container};
 
 pub const MACHINE_I386: u16 = 0x014c;
 pub const MACHINE_AMD64: u16 = 0x8664;
@@ -199,6 +199,7 @@ impl<'a> PeImage<'a> {
             file_offset: u64::from(section.raw_offset),
             vaddr: u64::from(section.virtual_address),
             bits: self.bits,
+            container: Container::Pe,
         })
     }
 }

@@ -76,10 +76,13 @@ Measured 2026-11-23 with build `1794536281` (public) / `1795048523` (publicbeta)
 
 | channel | module | sha256 | raw `.pdata` entries | functions (merged) | short extents < `0x18` | corpus patterns | on a function entry | passing the body gate |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| public | `steamclient64.dll` | `669fa08e2592…` | 92,949 | **52,946** | 254 | 25 | 24 | 24 |
-| public | `SteamUI.dll` | `2dfb0a5d50dd…` | 72,223 | **40,826** | 200 | 7 | 7 | 7 |
-| publicbeta | `steamclient64.dll` | `4a2d79520a72…` | 93,858 | **53,430** | 253 | 24 | 23 | 23 |
-| publicbeta | `SteamUI.dll` | `55f7a4f9ad55…` | 72,694 | **41,159** | 204 | 5 | 5 | 5 |
+| public | `steamclient64.dll` | `669fa08e2592…` | 92,949 | **52,946** | 254 | 28 | 27 | 27 |
+| public | `SteamUI.dll` | `2dfb0a5d50dd…` | 72,223 | **40,826** | 200 | 8 | 8 | 8 |
+| publicbeta | `steamclient64.dll` | `4a2d79520a72…` | 93,858 | **53,430** | 253 | 27 | 26 | 26 |
+| publicbeta | `SteamUI.dll` | `55f7a4f9ad55…` | 72,694 | **41,159** | 204 | 6 | 6 | 6 |
+
+The three corpus columns are `--verify` counts as of the sixth pass; the
+`.pdata` and extent columns are unchanged, because the images are.
 
 Per-fragment breakdown for those four tables (`--metrics`):
 

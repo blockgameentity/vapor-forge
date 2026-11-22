@@ -8,13 +8,27 @@
 //!
 //! The runtime and the offline scan both decode through here, so what the scan
 //! reports is what the hooks will use.
+//!
+//! Two builds, two argument conventions: the Linux client is System V and the
+//! Windows one is MS-x64, where `Init` arrives as
+//! `(this, conn_id, data, size, owned_data, add_ref)` in `rcx, edx, r8, r9d` with
+//! the rest pushed past the shadow space. The plain decoders are System V — the
+//! Linux callers are unchanged — and [`decode_api_segment`] picks the convention
+//! from the [`CodeSegment`] it is given, so a PE section decodes as MS-x64.
 
-use crate::arg_flow::{self, Value};
+use crate::arg_flow::{self, Abi, Value, Walk};
+use crate::scan::{CodeSegment, Container};
 use iced_x86::Mnemonic;
 
 const INIT_WINDOW: usize = 0x200;
 const RELEASE_WINDOW: usize = 0x40;
 const ALLOC_WINDOW: usize = 0x80;
+/// The same walk for an MS-x64 `Alloc`: the Windows builds open with
+/// `DCHECK`s whose failure paths sit between the entry and the allocator call,
+/// and one of them steps over a `lock`-prefixed counter, so the walk needs the
+/// longer window and has to follow that forward jump. Measured: 0x106 bytes to
+/// the `ret` in the beta build, 0xe1 in the public one.
+const ALLOC_WINDOW_MSX64: usize = 0x180;
 /// Well past the largest packet seen, and small enough to reject a store into
 /// something that is not a packet.
 const MAX_FIELD_END: usize = 0x100;
@@ -62,8 +76,18 @@ pub struct PacketApi {
 
 /// Read the field offsets from `CNetPacket::Init` at `offset` in `code`.
 pub fn decode_init(bitness: u32, code: &[u8], offset: usize) -> Result<PacketFields, &'static str> {
+    decode_init_in(Abi::SysV, bitness, code, offset)
+}
+
+/// [`decode_init`] for a named call convention.
+pub fn decode_init_in(
+    abi: Abi,
+    bitness: u32,
+    code: &[u8],
+    offset: usize,
+) -> Result<PacketFields, &'static str> {
     let pointer_size = bitness as usize / 8;
-    let trace = arg_flow::trace(bitness, code, offset, INIT_WINDOW);
+    let trace = arg_flow::trace_with(Walk::linear(abi, INIT_WINDOW), bitness, code, offset);
     let field = |argument: u8, width: usize, label: &'static str| {
         let mut offsets: Vec<(i64, usize)> = trace
             .stores
@@ -99,8 +123,18 @@ pub fn decode_init(bitness: u32, code: &[u8], offset: usize) -> Result<PacketFie
 
 /// Read the refcount offset from `CNetPacket::Release` at `offset` in `code`.
 pub fn decode_release(bitness: u32, code: &[u8], offset: usize) -> Result<usize, &'static str> {
+    decode_release_in(Abi::SysV, bitness, code, offset)
+}
+
+/// [`decode_release`] for a named call convention.
+pub fn decode_release_in(
+    abi: Abi,
+    bitness: u32,
+    code: &[u8],
+    offset: usize,
+) -> Result<usize, &'static str> {
     const LABEL: &str = "refcount decrement";
-    let trace = arg_flow::trace(bitness, code, offset, RELEASE_WINDOW);
+    let trace = arg_flow::trace_with(Walk::linear(abi, RELEASE_WINDOW), bitness, code, offset);
     let update = trace
         .updates
         .iter()
@@ -123,7 +157,17 @@ pub fn decode_release(bitness: u32, code: &[u8], offset: usize) -> Result<usize,
 
 /// Read the object size from `CNetPacket::Alloc` at `offset` in `code`.
 pub fn decode_alloc(bitness: u32, code: &[u8], offset: usize) -> Result<usize, &'static str> {
-    let trace = arg_flow::trace(bitness, code, offset, ALLOC_WINDOW);
+    decode_alloc_in(Abi::SysV, bitness, code, offset)
+}
+
+/// [`decode_alloc`] for a named call convention.
+pub fn decode_alloc_in(
+    abi: Abi,
+    bitness: u32,
+    code: &[u8],
+    offset: usize,
+) -> Result<usize, &'static str> {
+    let trace = arg_flow::trace_with(alloc_walk(abi), bitness, code, offset);
     // Steam allocates through its allocator interface: an indirect call whose
     // first argument after `this` is the object size.
     let (allocation, size) = trace
@@ -159,10 +203,22 @@ pub fn decode_api(
     init: usize,
     release: usize,
 ) -> Result<PacketApi, &'static str> {
+    decode_api_in(Abi::SysV, bitness, code, alloc, init, release)
+}
+
+/// [`decode_api`] for a named call convention.
+pub fn decode_api_in(
+    abi: Abi,
+    bitness: u32,
+    code: &[u8],
+    alloc: usize,
+    init: usize,
+    release: usize,
+) -> Result<PacketApi, &'static str> {
     let pointer_size = bitness as usize / 8;
-    let fields = decode_init(bitness, code, init)?;
-    let refcount = decode_release(bitness, code, release)?;
-    let object_size = decode_alloc(bitness, code, alloc)?;
+    let fields = decode_init_in(abi, bitness, code, init)?;
+    let refcount = decode_release_in(abi, bitness, code, release)?;
+    let object_size = decode_alloc_in(abi, bitness, code, alloc)?;
     let mut spans = fields.spans(pointer_size).to_vec();
     spans.push((refcount, 4));
     if overlaps(&spans) {
@@ -178,6 +234,47 @@ pub fn decode_api(
     })
 }
 
+/// Decode the three functions out of one PE executable section.
+///
+/// Offsets are relative to the start of `segment`, which is what the scanner
+/// reports, and the convention follows from the container: a 64-bit PE is
+/// MS-x64, so its `Init` is `(this, conn_id, data, size, owned_data, add_ref)`
+/// in `rcx, edx, r8, r9d` with the owned buffer pushed.
+pub fn decode_api_segment(
+    segment: &CodeSegment<'_>,
+    alloc: usize,
+    init: usize,
+    release: usize,
+) -> Result<PacketApi, &'static str> {
+    decode_api_in(
+        convention(segment),
+        u32::from(segment.bits),
+        segment.bytes,
+        alloc,
+        init,
+        release,
+    )
+}
+
+/// The call convention a segment's code was compiled for.
+pub fn convention(segment: &CodeSegment<'_>) -> Abi {
+    match segment.container {
+        Container::Pe if segment.bits == 64 => Abi::MsX64,
+        _ => Abi::SysV,
+    }
+}
+
+/// The walk shape each function needs, for one convention.
+fn alloc_walk(abi: Abi) -> Walk {
+    match abi {
+        Abi::SysV => Walk::linear(abi, ALLOC_WINDOW),
+        Abi::MsX64 => Walk {
+            follow_forward_jumps: true,
+            ..Walk::linear(abi, ALLOC_WINDOW_MSX64)
+        },
+    }
+}
+
 fn overlaps(spans: &[(usize, usize)]) -> bool {
     spans.iter().enumerate().any(|(index, &(start, width))| {
         spans[index + 1..]
@@ -187,417 +284,4 @@ fn overlaps(spans: &[(usize, usize)]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use iced_x86::code_asm::*;
-
-    /// Each region holds `Alloc`, `Init` and `Release` at these offsets.
-    const ALLOC: usize = 0x00;
-    const INIT: usize = 0x80;
-    const RELEASE: usize = 0x180;
-
-    /// Calls that leave the region: allocator lock, constructor, PIC thunk.
-    const EXTERNAL: u64 = 0x0100_0000;
-    /// Displacements off the i686 PIC base; any full imm32 will do.
-    const PIC_ADD: i32 = 0x003b_eb35;
-    const GLOBAL: i32 = 0x08cc;
-
-    const fn api(
-        [conn_id, data, size, owned_data]: [usize; 4],
-        refcount: usize,
-        object_size: usize,
-    ) -> PacketApi {
-        PacketApi {
-            fields: PacketFields {
-                conn_id,
-                data,
-                size,
-                owned_data,
-            },
-            refcount,
-            object_size,
-        }
-    }
-
-    /// The layouts either side of client build 1790380355.
-    const X86_LAYOUT: PacketApi = api([0x00, 0x04, 0x08, 0x10], 0x0c, 0x20);
-    const X86_GROWN_LAYOUT: PacketApi = api([0x00, 0x0c, 0x10, 0x18], 0x14, 0x38);
-    const X64_LAYOUT: PacketApi = api([0x00, 0x08, 0x10, 0x18], 0x14, 0x30);
-    const X64_GROWN_LAYOUT: PacketApi = api([0x00, 0x10, 0x18, 0x20], 0x1c, 0x58);
-
-    fn displacement(offset: usize) -> i32 {
-        offset as i32
-    }
-
-    /// `Alloc` through Steam's allocator interface, with the source line as a
-    /// second constant argument that must not be taken for the size.
-    fn x86_alloc(layout: &PacketApi) -> Vec<u8> {
-        assemble(32, |a| {
-            a.push(esi)?;
-            a.push(ebx)?;
-            a.call(EXTERNAL)?;
-            a.add(ebx, PIC_ADD)?;
-            a.sub(esp, 8)?;
-            a.mov(eax, dword_ptr(ebx + GLOBAL))?;
-            a.mov(eax, dword_ptr(eax))?;
-            a.lea(ecx, ptr(ebx - 0x0010_0000))?;
-            a.mov(edx, dword_ptr(eax))?;
-            a.push(1)?;
-            a.push(0)?;
-            a.push(0x7bf)?;
-            a.push(ecx)?;
-            a.push(layout.object_size as i32)?;
-            a.push(eax)?;
-            a.call(dword_ptr(edx + 0x14))?;
-            a.add(esp, 0x18)?;
-            a.sub(esp, 0x0c)?;
-            a.push(eax)?;
-            a.mov(esi, eax)?;
-            a.call(EXTERNAL)?;
-            a.add(esp, 0x18)?;
-            a.mov(eax, esi)?;
-            a.pop(ebx)?;
-            a.pop(esi)?;
-            a.ret()
-        })
-    }
-
-    fn x64_alloc(layout: &PacketApi) -> Vec<u8> {
-        assemble(64, |a| {
-            a.push(rbx)?;
-            a.mov(rax, qword_ptr(rbx + GLOBAL))?;
-            a.mov(r9d, 1)?;
-            a.xor(r8d, r8d)?;
-            a.mov(ecx, 0x7bf)?;
-            a.mov(esi, layout.object_size as u32)?;
-            a.mov(rdi, qword_ptr(rax))?;
-            a.mov(rax, qword_ptr(rdi))?;
-            a.call(qword_ptr(rax + 0x28))?;
-            a.mov(rbx, rax)?;
-            a.mov(rdi, rax)?;
-            a.call(EXTERNAL)?;
-            a.mov(rax, rbx)?;
-            a.pop(rbx)?;
-            a.ret()
-        })
-    }
-
-    /// i686 `Init` with a frame pointer: arguments read through ebp and
-    /// relayed through eax. `spill_data` is the steamrt build, which parks the
-    /// data argument in a local first and stores it from there.
-    fn x86_frame_init(layout: &PacketApi, spill_data: bool) -> Vec<u8> {
-        let fields = layout.fields;
-        let arg = |index: i32| ebp + (8 + 4 * index);
-        assemble(32, |a| {
-            let mut out = a.create_label();
-            a.push(ebp)?;
-            a.mov(ebp, esp)?;
-            a.push(edi)?;
-            a.call(EXTERNAL)?;
-            a.add(edi, PIC_ADD)?;
-            a.push(esi)?;
-            a.push(ebx)?;
-            a.sub(esp, 0x2c)?;
-            // add_ref, or the data pointer on steamrt, kept in a local.
-            a.mov(eax, dword_ptr(arg(if spill_data { 2 } else { 5 })))?;
-            a.mov(esi, dword_ptr(arg(0)))?;
-            a.mov(dword_ptr(ebp - 0x2c), eax)?;
-            a.test(eax, eax)?;
-            a.je(out)?;
-            a.mov(ecx, dword_ptr(arg(3)))?;
-            a.test(ecx, ecx)?;
-            a.je(out)?;
-            a.mov(eax, dword_ptr(arg(1)))?;
-            a.mov(dword_ptr(esi + displacement(layout.object_size - 4)), 0)?;
-            a.mov(dword_ptr(esi + displacement(fields.conn_id)), eax)?;
-            if spill_data {
-                a.mov(eax, dword_ptr(ebp - 0x2c))?;
-            } else {
-                a.mov(eax, dword_ptr(arg(2)))?;
-            }
-            a.mov(dword_ptr(esi + displacement(fields.data)), eax)?;
-            a.mov(eax, dword_ptr(arg(3)))?;
-            a.mov(dword_ptr(esi + displacement(fields.size)), eax)?;
-            a.mov(eax, dword_ptr(arg(4)))?;
-            a.mov(dword_ptr(esi + displacement(fields.owned_data)), eax)?;
-            a.set_label(&mut out)?;
-            a.lea(esp, ptr(ebp - 0x0c))?;
-            a.pop(ebx)?;
-            a.pop(esi)?;
-            a.pop(edi)?;
-            a.pop(ebp)?;
-            a.ret()
-        })
-    }
-
-    /// i686 `Init` without a frame pointer: arguments read through esp once
-    /// the frame is set up, and stored straight from the registers holding them.
-    fn x86_frameless_init(layout: &PacketApi) -> Vec<u8> {
-        let fields = layout.fields;
-        // Four pushes, the frame, and the return address.
-        let arg = |index: i32| esp + (0x1c + 0x10 + 4 + 4 * index);
-        assemble(32, |a| {
-            let mut out = a.create_label();
-            a.push(ebp)?;
-            a.push(edi)?;
-            a.push(esi)?;
-            a.push(ebx)?;
-            a.call(EXTERNAL)?;
-            a.add(ebx, PIC_ADD)?;
-            a.sub(esp, 0x1c)?;
-            a.mov(eax, dword_ptr(arg(5)))?;
-            a.mov(ebp, dword_ptr(arg(2)))?;
-            a.mov(esi, dword_ptr(arg(0)))?;
-            a.mov(ecx, dword_ptr(arg(1)))?;
-            a.mov(edi, dword_ptr(arg(3)))?;
-            a.mov(dword_ptr(esp + 4), eax)?;
-            a.mov(edx, dword_ptr(arg(4)))?;
-            a.test(ebp, ebp)?;
-            a.je(out)?;
-            a.test(edi, edi)?;
-            a.je(out)?;
-            a.mov(dword_ptr(esi + displacement(fields.conn_id)), ecx)?;
-            a.mov(dword_ptr(esi + displacement(fields.owned_data)), edx)?;
-            a.mov(dword_ptr(esi + displacement(fields.data)), ebp)?;
-            a.mov(dword_ptr(esi + displacement(fields.size)), edi)?;
-            a.mov(dword_ptr(esi + displacement(layout.object_size - 4)), 0)?;
-            a.set_label(&mut out)?;
-            a.add(esp, 0x1c)?;
-            a.pop(ebx)?;
-            a.pop(esi)?;
-            a.pop(edi)?;
-            a.pop(ebp)?;
-            a.ret()
-        })
-    }
-
-    /// x86_64 `Init`: arguments parked in callee-saved registers, one of which
-    /// first holds the stack guard, with a computed value stored beside them.
-    fn x64_init(layout: &PacketApi) -> Vec<u8> {
-        let fields = layout.fields;
-        assemble(64, |a| {
-            let mut out = a.create_label();
-            a.push(r15)?;
-            a.mov(r15d, esi)?;
-            a.push(r14)?;
-            a.mov(r14, r8)?;
-            a.push(r13)?;
-            a.push(r12)?;
-            a.mov(r12, rdx)?;
-            a.push(rbp)?;
-            a.mov(ebp, ecx)?;
-            a.push(rbx)?;
-            a.mov(rbx, rdi)?;
-            a.sub(rsp, 0x18)?;
-            a.test(rdx, rdx)?;
-            a.mov(r13, qword_ptr(0x28).fs())?;
-            a.mov(qword_ptr(rsp + 8), r13)?;
-            a.mov(r13d, r9d)?;
-            a.je(out)?;
-            a.test(ebp, ebp)?;
-            a.je(out)?;
-            a.mov(dword_ptr(rbx + displacement(fields.conn_id)), r15d)?;
-            a.mov(qword_ptr(rbx + displacement(fields.data)), r12)?;
-            a.mov(dword_ptr(rbx + displacement(fields.size)), ebp)?;
-            a.mov(qword_ptr(rbx + displacement(fields.owned_data)), r14)?;
-            a.mov(qword_ptr(rbx + displacement(layout.object_size - 8)), 0)?;
-            a.movzx(eax, byte_ptr(r12))?;
-            a.mov(dword_ptr(rbx + displacement(fields.conn_id + 4)), eax)?;
-            a.set_label(&mut out)?;
-            a.add(rsp, 0x18)?;
-            a.pop(rbx)?;
-            a.pop(rbp)?;
-            a.pop(r12)?;
-            a.pop(r13)?;
-            a.pop(r14)?;
-            a.pop(r15)?;
-            a.ret()
-        })
-    }
-
-    /// i686 `Release` behind a full prologue, so `this` is read off the stack.
-    fn x86_release(layout: &PacketApi) -> Vec<u8> {
-        assemble(32, |a| {
-            let mut free = a.create_label();
-            a.push(ebp)?;
-            a.push(edi)?;
-            a.push(esi)?;
-            a.push(ebx)?;
-            a.call(EXTERNAL)?;
-            a.add(ebx, PIC_ADD)?;
-            a.sub(esp, 0x2c)?;
-            a.mov(edi, dword_ptr(esp + 0x40))?;
-            a.sub(dword_ptr(edi + displacement(layout.refcount)), 1)?;
-            a.je(free)?;
-            a.add(esp, 0x2c)?;
-            a.pop(ebx)?;
-            a.pop(esi)?;
-            a.pop(edi)?;
-            a.pop(ebp)?;
-            a.ret()?;
-            a.set_label(&mut free)?;
-            a.ud2()
-        })
-    }
-
-    /// The compiler shapes seen across client builds, each with the layout it
-    /// was observed with.
-    fn shapes() -> [(&'static str, u32, Vec<u8>, PacketApi); 5] {
-        let x86 = |init: fn(&PacketApi) -> Vec<u8>, layout: PacketApi| {
-            region(&x86_alloc(&layout), &init(&layout), &x86_release(&layout))
-        };
-        let x64 = |layout: PacketApi| {
-            region(
-                &x64_alloc(&layout),
-                &x64_init(&layout),
-                &synthetic_release(displacement(layout.refcount)),
-            )
-        };
-        [
-            (
-                "i686 with a frame pointer",
-                32,
-                x86(|layout| x86_frame_init(layout, false), X86_LAYOUT),
-                X86_LAYOUT,
-            ),
-            (
-                "i686 steamrt, data argument spilled",
-                32,
-                x86(|layout| x86_frame_init(layout, true), X86_LAYOUT),
-                X86_LAYOUT,
-            ),
-            (
-                "i686 without a frame pointer",
-                32,
-                x86(x86_frameless_init, X86_GROWN_LAYOUT),
-                X86_GROWN_LAYOUT,
-            ),
-            ("x86_64", 64, x64(X64_LAYOUT), X64_LAYOUT),
-            ("x86_64 grown", 64, x64(X64_GROWN_LAYOUT), X64_GROWN_LAYOUT),
-        ]
-    }
-
-    #[test]
-    fn decodes_every_compiler_shape() {
-        for (shape, bitness, code, expected) in shapes() {
-            assert_eq!(
-                decode_api(bitness, &code, ALLOC, INIT, RELEASE),
-                Ok(expected),
-                "{shape}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_each_function_in_another_role() {
-        for (shape, bitness, code, _) in shapes() {
-            for offset in [ALLOC, RELEASE] {
-                assert!(decode_init(bitness, &code, offset).is_err(), "{shape}");
-            }
-            for offset in [ALLOC, INIT] {
-                assert!(decode_release(bitness, &code, offset).is_err(), "{shape}");
-            }
-            for offset in [INIT, RELEASE] {
-                assert!(decode_alloc(bitness, &code, offset).is_err(), "{shape}");
-            }
-        }
-    }
-
-    fn assemble(
-        bitness: u32,
-        build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>,
-    ) -> Vec<u8> {
-        let mut assembler = CodeAssembler::new(bitness).unwrap();
-        build(&mut assembler).unwrap();
-        assembler.assemble(0).unwrap()
-    }
-
-    fn synthetic_alloc(size: u32) -> Vec<u8> {
-        assemble(64, |a| {
-            let mut constructor = a.create_label();
-            a.push(rbx)?;
-            a.mov(esi, size)?;
-            a.call(qword_ptr(rax + 0x28))?;
-            a.mov(rbx, rax)?;
-            a.mov(rdi, rax)?;
-            a.call(constructor)?;
-            a.mov(rax, rbx)?;
-            a.pop(rbx)?;
-            a.ret()?;
-            a.set_label(&mut constructor)?;
-            a.ret()
-        })
-    }
-
-    fn synthetic_init(extra: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
-        assemble(64, |a| {
-            a.mov(dword_ptr(rdi), esi)?;
-            a.mov(qword_ptr(rdi + 0x08), rdx)?;
-            a.mov(dword_ptr(rdi + 0x10), ecx)?;
-            a.mov(qword_ptr(rdi + 0x18), r8)?;
-            extra(a)?;
-            a.ret()
-        })
-    }
-
-    fn synthetic_release(refcount: i32) -> Vec<u8> {
-        assemble(64, |a| {
-            a.sub(dword_ptr(rdi + refcount), 1)?;
-            a.ret()
-        })
-    }
-
-    /// Lay the three functions out at the region offsets.
-    fn region(alloc: &[u8], init: &[u8], release: &[u8]) -> Vec<u8> {
-        let mut code = vec![0xcc; RELEASE + 0x40];
-        code[ALLOC..ALLOC + alloc.len()].copy_from_slice(alloc);
-        code[INIT..INIT + init.len()].copy_from_slice(init);
-        code[RELEASE..RELEASE + release.len()].copy_from_slice(release);
-        code
-    }
-
-    #[test]
-    fn decodes_a_consistent_synthetic_packet() {
-        let code = region(
-            &synthetic_alloc(0x30),
-            &synthetic_init(|_| Ok(())),
-            &synthetic_release(0x14),
-        );
-        assert_eq!(
-            decode_api(64, &code, ALLOC, INIT, RELEASE),
-            Ok(api([0x00, 0x08, 0x10, 0x18], 0x14, 0x30))
-        );
-    }
-
-    #[test]
-    fn rejects_an_argument_stored_at_two_offsets() {
-        let init = synthetic_init(|a| a.mov(qword_ptr(rdi + 0x20), rdx));
-        assert_eq!(decode_init(64, &init, 0), Err("data pointer store"));
-    }
-
-    #[test]
-    fn rejects_a_refcount_inside_a_field() {
-        let code = region(
-            &synthetic_alloc(0x30),
-            &synthetic_init(|_| Ok(())),
-            &synthetic_release(0x10),
-        );
-        assert_eq!(
-            decode_api(64, &code, ALLOC, INIT, RELEASE),
-            Err("refcount apart from the packet fields")
-        );
-    }
-
-    #[test]
-    fn rejects_fields_past_the_allocation() {
-        let code = region(
-            &synthetic_alloc(0x18),
-            &synthetic_init(|_| Ok(())),
-            &synthetic_release(0x14),
-        );
-        assert_eq!(
-            decode_api(64, &code, ALLOC, INIT, RELEASE),
-            Err("packet fields inside the allocation")
-        );
-    }
-}
+mod tests;
