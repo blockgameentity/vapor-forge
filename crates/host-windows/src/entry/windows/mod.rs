@@ -126,6 +126,21 @@ impl Default for WindowsEnv {
 }
 
 impl HostEnv for WindowsEnv {
+    /// `<steam>/config/lua`, resolved from the directory the host DLL sits in
+    /// (next to `steam.exe`). Absent or empty produces no dirs, which the worker
+    /// reports as "lua: 0 dir(s)".
+    fn lua_dirs(&self) -> Vec<String> {
+        let Some(host_dir) = self.host_dir.as_deref() else {
+            return Vec::new();
+        };
+        let dir = host_dir.join("config").join("lua");
+        if !dir.is_dir() {
+            info!(dir = %dir.display(), "no lua directory; the config alone decides");
+            return Vec::new();
+        }
+        vec![dir.display().to_string()]
+    }
+
     fn config_path(&self) -> Option<PathBuf> {
         self.config_dir.as_deref().map(paths::config_path_in)
     }

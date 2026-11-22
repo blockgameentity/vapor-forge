@@ -36,8 +36,7 @@ pub struct HostState {
     /// Apps the effective config controls, DLC ids included, computed once.
     controlled: Vec<AppId>,
     ticket_cache: TicketCache,
-    /// Lua-provided tickets. Empty today: the scripting crate is not a
-    /// dependency of this host, so nothing populates it yet.
+    /// Lua-provided tickets, from `<steam>/config/lua`.
     lua_tickets: HashMap<AppId, Vec<u8>>,
     /// The Denuvo authorisation lease, acquired once when the host starts.
     ///
@@ -69,6 +68,16 @@ impl HostState {
             authorisation,
             depot,
         }
+    }
+
+    /// Attach the tickets the Lua scripts declared.
+    ///
+    /// The worker resolves the script state once, before any hook can run, so
+    /// this is a constructor-companion rather than a mutable global.
+    #[must_use]
+    pub fn with_lua_tickets(mut self, tickets: HashMap<AppId, Vec<u8>>) -> Self {
+        self.lua_tickets = tickets;
+        self
     }
 
     /// Replace the authorisation lease. Tests use it to check an exact instant

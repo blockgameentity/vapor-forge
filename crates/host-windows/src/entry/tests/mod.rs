@@ -162,6 +162,7 @@ struct FakeEnv {
     corpus: Option<PathBuf>,
     depot: Option<PathBuf>,
     modules: Vec<LoadedModule>,
+    lua: Vec<String>,
 }
 
 impl FakeEnv {
@@ -170,6 +171,7 @@ impl FakeEnv {
             config,
             corpus,
             depot: None,
+            lua: Vec::new(),
             modules: vec![LoadedModule {
                 name: "steamclient64.dll".to_owned(),
                 base: 0,
@@ -194,6 +196,10 @@ impl HostEnv for FakeEnv {
 
     fn ticket_dir(&self) -> Option<PathBuf> {
         None
+    }
+
+    fn lua_dirs(&self) -> Vec<String> {
+        self.lua.clone()
     }
 
     fn steam_modules(&mut self) -> Vec<LoadedModule> {

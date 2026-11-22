@@ -1437,6 +1437,7 @@ dependencies = [
  "vapor-forge-hook-engine",
  "vapor-forge-patterns",
  "vapor-forge-pe",
+ "vapor-forge-scripting",
 ]
 
 [[package]]

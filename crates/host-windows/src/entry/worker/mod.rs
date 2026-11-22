@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 use vapor_forge_config::RuntimeConfig;
-use vapor_forge_core::ScriptState;
+use vapor_forge_config::AppId;
 use vapor_forge_features::config_apply;
 use vapor_forge_features::package::controlled_app_ids;
 
@@ -60,6 +60,12 @@ pub trait HostEnv {
     fn depotcache_dir(&self) -> Option<PathBuf>;
     /// Where ticket material may be cached.
     fn ticket_dir(&self) -> Option<PathBuf>;
+    /// `<steam>/config/lua`, when it exists: the scripts the host tool writes
+    /// (addappid/setmanifestid/setAppTicket and friends).
+    ///
+    /// A missing directory is `None`, not an error: a machine with no Lua is a
+    /// machine where the config alone decides.
+    fn lua_dirs(&self) -> Vec<String>;
     /// The Steam modules currently loaded, at most one per component.
     fn steam_modules(&mut self) -> Vec<LoadedModule>;
 }
@@ -122,17 +128,42 @@ pub fn run(
     // rebuild. The hook bodies read the applied value from the host state, never
     // from a second copy of the config.
     let applied = config_apply::apply(&config);
-    let mut settings = HostSettings::resolve(&config, &ScriptState::default());
+
+    // Lua is how the host tool expresses per-app intent (addappid, manifests,
+    // tickets, purchase times). Loading it before the state is published means a
+    // hook never observes an empty script state that later fills in.
+    let lua_dirs = env.lua_dirs();
+    let scripts = vapor_forge_scripting::execute_scripts_runtime(&lua_dirs);
+    let script = &scripts.state;
+    notes.push(format!(
+        "lua: {} dir(s), {} app(s), {} depot key(s), {} manifest(s), {} ticket(s)",
+        lua_dirs.len(),
+        script.apps.len(),
+        script.depot_keys.len(),
+        script.manifests.len(),
+        script.app_tickets.len()
+    ));
+
+    let mut settings = HostSettings::resolve(&config, script);
     settings.achievements.local_rebuild = applied.achievements_local_rebuild;
 
-    let controlled = controlled_app_ids(&config, &HashSet::new());
-    let state = Arc::new(HostState::new(
-        config,
-        applied.family,
-        controlled,
-        env.ticket_dir(),
-        DepotPlan::new(env.depotcache_dir(), Vec::new()),
-    ));
+    let script_apps: HashSet<AppId> = script.apps.iter().copied().collect();
+    let controlled = controlled_app_ids(&config, &script_apps);
+    let lua_tickets = script
+        .app_tickets
+        .iter()
+        .map(|(app, ticket)| (*app, ticket.clone()))
+        .collect();
+    let state = Arc::new(
+        HostState::new(
+            config,
+            applied.family,
+            controlled,
+            env.ticket_dir(),
+            DepotPlan::new(env.depotcache_dir(), Vec::new()),
+        )
+        .with_lua_tickets(lua_tickets),
+    );
     // Published before any entry is patched: a body reached during the batch
     // sees the real configuration, and the gate is tightened as soon as the
     // install result is known.
