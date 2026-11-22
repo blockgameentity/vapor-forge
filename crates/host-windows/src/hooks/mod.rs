@@ -127,6 +127,7 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (legacy_cdkey::SYMBOL, legacy_cdkey::address),
     (launch_env::SYMBOL, launch_env::address),
     (achievements::SYMBOL, achievements::address),
+    (conflict_ui::registration::SYMBOL, conflict_ui::registration::address),
     (ui::visibility::SYMBOL, ui::visibility::address),
     (ui::overview::SYMBOL, ui::overview::address),
     (ui::snapshot::SYMBOL, ui::snapshot::address),
@@ -156,11 +157,11 @@ mod tests {
 
     #[test]
     fn an_unimplemented_symbol_has_no_replacement() {
-        // The two decisions that stayed without an anchor: `CUser::GetSteamID` is a
-        // weak vtable candidate with no corpus entry, and `RegisterJsMethod` has no
-        // candidate in either SteamUI build.
+        // `CUser::GetSteamID` is still without an anchor: its Windows accessor
+        // takes an out-parameter (see `res/patterns/win64/VTABLE-REPORT.md`) and the
+        // candidate addresses are not `.pdata` entries.
         assert!(replacement_address("CUser::GetSteamID").is_none());
-        assert!(replacement_address("RegisterJsMethod").is_none());
+        assert!(replacement_address("IClientUser::GetSteamID").is_none());
         assert_eq!(
             replacement_address(ownership::SYMBOL),
             Some(ownership::address())
@@ -232,7 +233,6 @@ mod tests {
             "RegisterInternalCallback",
             "IClientUser::GetSteamID",
             "CUser::GetSteamID",
-            "RegisterJsMethod",
         ] {
             assert_eq!(
                 replacement_address(symbol),

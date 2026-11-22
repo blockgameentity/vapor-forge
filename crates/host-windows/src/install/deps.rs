@@ -48,6 +48,10 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     // replacement, its row comes back here with it.
     (achievements::MERGE_SYMBOL, &[Capability::Achievements]),
     (
+        "RegisterJsMethod",
+        &[Capability::ConflictUiBridge],
+    ),
+    (
         "CloseAppCloud",
         &[Capability::CloudControl, Capability::CloudHttp],
     ),

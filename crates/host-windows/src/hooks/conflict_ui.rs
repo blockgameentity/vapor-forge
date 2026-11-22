@@ -29,6 +29,8 @@
 //! [`decide`] is the portable half: the generation and readiness rules, with a
 //! refusal that always says which rule fired.
 
+pub mod registration;
+
 use vapor_forge_config::AppId;
 
 use crate::capability::Capability;
