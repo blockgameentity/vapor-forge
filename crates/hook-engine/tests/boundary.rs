@@ -19,8 +19,21 @@ const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("detour.rs", include_str!("../src/detour.rs")),
     ("original.rs", include_str!("../src/original.rs")),
+    ("patch.rs", include_str!("../src/patch.rs")),
+    ("pic_repair.rs", include_str!("../src/pic_repair.rs")),
     ("pic_thunk.rs", include_str!("../src/pic_thunk.rs")),
+    (
+        "pic_thunk/tests.rs",
+        include_str!("../src/pic_thunk/tests.rs"),
+    ),
     ("plan.rs", include_str!("../src/plan.rs")),
+    ("protect.rs", include_str!("../src/protect.rs")),
+    ("protect/tests.rs", include_str!("../src/protect/tests.rs")),
+    ("protect/unix.rs", include_str!("../src/protect/unix.rs")),
+    (
+        "protect/windows.rs",
+        include_str!("../src/protect/windows.rs"),
+    ),
     ("vmt.rs", include_str!("../src/vmt.rs")),
 ];
 

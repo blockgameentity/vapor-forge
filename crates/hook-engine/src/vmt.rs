@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, error, info};
 
 use crate::plan::ValidatedHookTarget;
+use crate::protect;
 
 const INSTALL_IDLE: u8 = 0;
 const INSTALLING: u8 = 1;
@@ -117,80 +118,38 @@ pub unsafe fn swap_vtable_slot(
         "vtable slot read"
     );
 
-    // SAFETY: write to vtable slot. Need mprotect since .data.rel.ro may be read-only.
-    unsafe {
-        let page_size_raw = libc::sysconf(libc::_SC_PAGESIZE);
-        if page_size_raw <= 0 {
-            error!(hook = name, "VMT swap failed: page size unavailable");
+    // A vtable usually lives in read-only data: `.data.rel.ro` in an ELF
+    // image, `.rdata` in an MSVC one. The guard restores the previous
+    // protection from `Drop`, so the slot write cannot leak a writable page,
+    // and `restore` below reports the failure when it can be undone.
+    let region = match protect::make_writable(slot_ptr as usize, std::mem::size_of::<usize>()) {
+        Ok(region) => region,
+        Err(error) => {
+            error!(
+                hook = name,
+                %error,
+                "VMT swap failed: the slot page could not be made writable"
+            );
             return None;
         }
-        let page_size = page_size_raw as usize;
-        let slot_addr = slot_ptr as usize;
-        let page_start = slot_addr & !(page_size - 1);
-        let page_end = slot_addr
-            .checked_add(std::mem::size_of::<usize>())
-            .and_then(|end| end.checked_add(page_size - 1))
-            .map(|end| end & !(page_size - 1));
-        let Some(page_end) = page_end else {
-            error!(hook = name, "VMT swap failed: slot range overflow");
-            return None;
-        };
-        let region_size = page_end - page_start;
-        let Some(original_protection) = mapping_protection(page_start, region_size) else {
-            error!(hook = name, "VMT swap failed: page protection unavailable");
-            return None;
-        };
+    };
 
-        if libc::mprotect(
-            page_start as *mut libc::c_void,
-            region_size,
-            original_protection | libc::PROT_WRITE,
-        ) != 0
-        {
-            error!(hook = name, "mprotect(RW) failed for VMT swap");
-            return None;
-        }
+    // SAFETY: `slot_ptr` came from the validated vtable. Its address is
+    // pointer-aligned because vtable entries are pointer-sized (8 bytes on
+    // MS-x64, 4 on x86), so a single `usize` store is the whole slot, and the
+    // range is writable for as long as `region` is alive.
+    unsafe { *(slot_ptr as *mut usize) = replacement };
 
-        *(slot_ptr as *mut usize) = replacement;
-
-        if libc::mprotect(
-            page_start as *mut libc::c_void,
-            region_size,
-            original_protection,
-        ) != 0
-        {
-            error!(hook = name, "mprotect restore failed after VMT swap");
-        }
+    if let Err(error) = region.restore() {
+        error!(
+            hook = name,
+            %error,
+            "VMT slot written, but restoring the page protection failed"
+        );
     }
 
     info!(hook = name, slot = slot, "VMT hook INSTALLED");
     Some(original)
-}
-
-fn mapping_protection(address: usize, len: usize) -> Option<i32> {
-    let end = address.checked_add(len)?;
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    maps.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let mut bounds = fields.next()?.splitn(2, '-');
-        let start = usize::from_str_radix(bounds.next()?, 16).ok()?;
-        let mapping_end = usize::from_str_radix(bounds.next()?, 16).ok()?;
-        let permissions = fields.next()?.as_bytes();
-        if address < start || end > mapping_end || permissions.len() < 3 {
-            return None;
-        }
-        let mut protection = libc::PROT_NONE;
-        if permissions[0] == b'r' {
-            protection |= libc::PROT_READ;
-        }
-        if permissions[1] == b'w' {
-            protection |= libc::PROT_WRITE;
-        }
-        if permissions[2] == b'x' {
-            protection |= libc::PROT_EXEC;
-        }
-        Some(protection)
-    })
 }
 
 #[cfg(test)]
@@ -245,14 +204,35 @@ mod tests {
         assert_eq!(vtable[0], 0x1200);
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn mapping_protection_preserves_current_page_flags() {
-        let value = Box::new(7usize);
-        let address = (&*value) as *const usize as usize;
-        let protection =
-            super::mapping_protection(address, std::mem::size_of::<usize>()).expect("heap mapping");
+    fn swap_uses_pointer_sized_slots_on_64_bit_targets() {
+        // MS-x64 (and 64-bit ELF) vtable entries are 8 bytes wide. Slot values
+        // above 4 GiB prove the read, the comparison and the write all treat
+        // the slot as a pointer-sized value rather than a 32-bit one.
+        let original: usize = 0x0000_7ff6_1234_1000;
+        let replacement: usize = 0x0000_7ff6_1234_2000;
+        let vtable = [0usize, 0, original, 0];
+        let object_vtable = vtable.as_ptr();
+        let this = std::ptr::addr_of!(object_vtable) as *mut std::ffi::c_void;
+        let target = validate_hook_target(HookTargetInput {
+            target_address: original,
+            replacement_address: replacement,
+            executable_range: AddressRange {
+                start: 0x0000_7ff6_1234_0000,
+                end: 0x0000_7ff6_1235_0000,
+            },
+        })
+        .unwrap();
 
-        assert_ne!(protection & libc::PROT_READ, 0);
-        assert_ne!(protection & libc::PROT_WRITE, 0);
+        // SAFETY: `this` points to a test-owned object whose vtable is a
+        // writable stack array with four slots; slot 2 holds `original`. The
+        // swap writes into that test-owned page and restores its protection.
+        let swapped = unsafe { super::swap_vtable_slot("test", this, 2, target) };
+
+        assert_eq!(swapped, Some(original));
+        assert_eq!(vtable[2], replacement);
+        assert_eq!(vtable[0], 0, "neighbouring slots stay untouched");
+        assert_eq!(vtable[3], 0, "neighbouring slots stay untouched");
     }
 }

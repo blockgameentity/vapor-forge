@@ -10,6 +10,9 @@
 
 pub mod detour;
 pub mod original;
+pub mod patch;
+pub(crate) mod pic_repair;
 pub(crate) mod pic_thunk;
 pub mod plan;
+pub mod protect;
 pub mod vmt;

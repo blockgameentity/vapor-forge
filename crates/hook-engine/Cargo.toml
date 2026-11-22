@@ -7,7 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 iced-x86.workspace = true
-libc.workspace = true
 retour.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Only the unix page-protection backend (`mprotect`/`sysconf`/`PROT_*`) needs
+# libc. The Windows backend declares its kernel32 entry points itself, so
+# nothing here pulls a Windows binding crate in.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
