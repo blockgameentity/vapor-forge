@@ -38,7 +38,7 @@ signature that resolves on the current public build.
 | ShaderCacheControl | `client/shader.rs` | ⚠️ decision only, no anchor | ❌ |
 | FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ body at `CUser::GetFamilySharedLockAccount` (the Windows family shared-lock query, not Linux's `CFamilySharing`) | ✅ public + beta |
 | DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
-| CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, **serves** a cached code with a swap guard | ✅ |
+| CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, **serves** a cached code with a swap guard, and a worker **fetches** misses through `features::request_code::PendingQueue` | ✅ |
 | NativeResponseDelivery | `client/network.rs` (queue + work item) | **retired on Windows**: serving is synchronous inside Steam's `RecvPkt` call, so there is no cross-thread hand-off to gate — mapped onto the serving symbol | n/a |
 | CloudControl | `client/cloud.rs` | ⚠️ host feature pass decides, no client body | n/a |
 | CloudHttp | `client/cloud_http.rs` | ✅ `CloseAppCloud` | ✅ public + beta |
@@ -89,14 +89,22 @@ The **stats path turned out to be a job chain, not a per-stat writer**:
 can install. Vtable anchoring is
 the only method that has produced *any* candidate so far.
 
-**C. Platform shape differences.** The family lock is the clearest example: Linux
+**C. The achievements rebuild has no independent source yet.** On *both* hosts the
+"local" definition set is derived from the same schema cache the rebuild stands in
+for (`hooks::achievement_local::definitions` and the Windows `reply::definitions`
+both parse the cached schema). So `[achievements] local_rebuild` is off by default
+and turning it on re-derives what it was given; a real parity feature needs an
+independent definition source (for instance cheesetool writing achievement
+definitions it owns), not a flag flip.
+
+**D. Platform shape differences.** The family lock is the clearest example: Linux
 queries `CFamilySharing::GetLockingAccount`, Windows has no such class and instead
 keeps a `m_mapFamilyRunningApps` map updated by `CUser::UpdateFamilyRunningApps`,
 queried through `CUser::GetFamilySharedLockAccount`. Same capability, different
 carrier — the port had to find the Windows function rather than translate the
 Linux one.
 
-**D. Unverified ABI.** Everything below the planner assumes MS-x64 argument
+**E. Unverified ABI.** Everything below the planner assumes MS-x64 argument
 shapes taken from the Linux host. See `docs/windows-live-test.md` §4 for the list
 and the observable that confirms or refutes each.
 

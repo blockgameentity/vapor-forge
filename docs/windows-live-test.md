@@ -113,11 +113,13 @@ These are known, not bugs to chase:
 - **`achievements` rewrites the reply** when `[achievements] local_rebuild` is on:
   the merge body decodes the response, substitutes the rebuilt set and restores
   Steam's bytes afterwards. If the flag is off, behaviour is exactly Steam's.
-- **Request codes are served only from cache.** The dispatch body parses the
+- **Request codes are fetched, then served.** The dispatch body parses the
   request payload, and if a code for that `(depot, gid)` is already cached it hands
-  Steam the encoded response for that call; otherwise the message is recorded with
-  `NoCachedCode` and Steam's own round trip happens. Nothing dials from the hook
-  path.
+  Steam the encoded response for that call; on a miss the hook only *enqueues* the
+  `(app, depot, gid)` and a worker runs the provider chain
+  (`features::request_code::PendingQueue`), so a later request for the same depot is
+  served. Nothing dials on Steam's networking thread, and with no provider
+  configured the worker stays idle and Steam's own round trip happens.
 - **Corpus coverage:** 30 symbols in `steamclient64.dll` public (29 beta) and 9 in
   `SteamUI.dll` (7 beta), including the `CNetPacket` layout family and the leaf
   `CUser::GetSteamID` accessor. Unresolved symbols disable only their own
