@@ -20,6 +20,7 @@ pub mod depot_key_loader;
 pub mod elf;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod engine_work_item_site;
+pub mod pe_image;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]

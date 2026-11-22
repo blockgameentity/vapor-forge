@@ -26,6 +26,11 @@ name = "vapor-forge-vtable-scan"
 path = "src/bin/vapor-forge-vtable-scan.rs"
 required-features = ["tools"]
 
+[[bin]]
+name = "vapor-forge-pattern-mine"
+path = "src/bin/vapor-forge-pattern-mine.rs"
+required-features = ["tools"]
+
 [dependencies]
 iced-x86 = { workspace = true, optional = true }
 keyvalues-parser = { workspace = true, optional = true }
