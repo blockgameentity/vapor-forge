@@ -114,10 +114,11 @@ These are known, not bugs to chase:
   (`CAPIJobRequestUserStats::{BInit,YieldingMergeStats}` are anchored) and has no
   read-side counterpart of the Linux hook, so the rebuild stays a decision until a
   merge-site hook shape exists.
-- **No request-code skip yet.** The dispatch site is now anchored
-  (`CCMInterface::RecvPkt`, a two-level jump table over EMsg `0x2f3..0x370`) but no
-  body consumes it, so Steam's own request-code round trip still happens; the
-  depotcache pre-seed is consulted at `GetDecryptionKey` instead.
+- **No request-code skip yet.** The dispatch body exists and the packet layout is
+  decoded at startup (log line: "packet layout decoded"), but the `(depot, gid)`
+  offsets inside the request body are still unmeasured, so each message is recorded
+  with the blocker `NoTarget` and Steam's own round trip happens. The depotcache
+  pre-seed is consulted at `GetDecryptionKey` instead.
 - **Corpus coverage:** 28 symbols in `steamclient64.dll` public (27 beta) and 7 in
   `SteamUI.dll` (5 beta), including the `CNetPacket` layout family, so the
   request-code body can decode packet fields. Unresolved symbols disable only their

@@ -38,7 +38,7 @@ signature that resolves on the current public build.
 | ShaderCacheControl | `client/shader.rs` | ⚠️ decision only, no anchor | ❌ |
 | FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ consults `family::concurrent` | n/a |
 | DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
-| CmInterception | `client/network.rs` | ⚠️ anchor exists (`CCMInterface::RecvPkt`), body not written | ✅ newly mined |
+| CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, records; serving blocked on target offsets | ✅ |
 | NativeResponseDelivery | `client/network.rs` | — | — |
 | CloudControl | `client/cloud.rs` | ⚠️ host feature pass decides, no client body | n/a |
 | CloudHttp | `client/cloud_http.rs` | ✅ `CloseAppCloud` | ✅ public + beta |
@@ -128,8 +128,12 @@ request codes and achievements are blocked on corpus class B.
    than the Linux hook assumes. Unblocks `Achievements` (and the BST rebuild) once
    solved.
 3. ~~`CUser::GetAppTicket` anchor~~ — done (both builds), tickets install.
-4. **Request-code body** at `CCMInterface::RecvPkt` — anchor mined, body not
-   written; this is the last piece of the HYJ install path.
+4. **Request-code serving** at `CCMInterface::RecvPkt`: the body is written and the
+   packet layout is now decoded at runtime from the re-anchored
+   `CNetPacket::{Init,Alloc,Release}` (`patterns::cnet_packet` speaks MS-x64), so the
+   blocker moved from `NoLayout` to `NoTarget` — the `(depot, gid)` offsets in the
+   request body are still unmeasured. That is the last piece of the HYJ install
+   path.
 5. **Body-per-capability sweep** (class A) against the Linux reference:
    shader control, DLC overrides, callbacks, legacy CD key, SteamID override,
    cloud HTTP, conflict UI.
