@@ -36,6 +36,18 @@ const DEPENDENCIES: &[(&str, &[Capability])] = &[
     ("BBuildAndAsyncSendFrame", &[Capability::CmInterception]),
     ("GetPipeClient", &[Capability::CmInterception]),
     ("CNetPacket::Dispatch", &[Capability::CmInterception]),
+    // SteamUI. Each body owns exactly one capability, so a missing library
+    // anchor costs one library feature rather than the whole batch.
+    ("ShouldShowAppInLibrary", &[Capability::LibraryUi]),
+    (
+        "CSteamUIAppController::FillInAppOverview",
+        &[Capability::OverviewMetadata],
+    ),
+    (
+        "CSteamUIAppController::BuildCompleteAppOverviewChange",
+        &[Capability::LibrarySnapshot],
+    ),
+    ("CUpdateManager::MarkAppChange", &[Capability::LibrarySnapshot]),
 ];
 
 /// Capabilities that depend on `symbol`; empty for an unknown symbol.
@@ -65,5 +77,49 @@ mod tests {
     #[test]
     fn unknown_symbols_have_no_dependency() {
         assert!(capabilities_for_symbol("SomeFutureSymbol").is_empty());
+    }
+
+    #[test]
+    fn each_steamui_symbol_names_its_own_library_capability() {
+        assert_eq!(
+            capabilities_for_symbol("ShouldShowAppInLibrary"),
+            &[Capability::LibraryUi]
+        );
+        assert_eq!(
+            capabilities_for_symbol("CSteamUIAppController::FillInAppOverview"),
+            &[Capability::OverviewMetadata]
+        );
+        assert_eq!(
+            capabilities_for_symbol("CSteamUIAppController::BuildCompleteAppOverviewChange"),
+            &[Capability::LibrarySnapshot]
+        );
+        assert_eq!(
+            capabilities_for_symbol("CUpdateManager::MarkAppChange"),
+            &[Capability::LibrarySnapshot]
+        );
+    }
+
+    #[test]
+    fn a_steamui_anchor_never_gates_a_steamclient_capability() {
+        // A library symbol that fails to resolve must cost a library feature, not
+        // ownership or package injection: the two batches are independent.
+        for symbol in [
+            "ShouldShowAppInLibrary",
+            "CSteamUIAppController::FillInAppOverview",
+            "CSteamUIAppController::BuildCompleteAppOverviewChange",
+            "CUpdateManager::MarkAppChange",
+        ] {
+            for capability in capabilities_for_symbol(symbol) {
+                assert!(
+                    matches!(
+                        capability,
+                        Capability::LibraryUi
+                            | Capability::OverviewMetadata
+                            | Capability::LibrarySnapshot
+                    ),
+                    "{symbol} must not gate {capability}"
+                );
+            }
+        }
     }
 }

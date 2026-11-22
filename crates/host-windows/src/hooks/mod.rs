@@ -15,10 +15,11 @@
 //! | [`package`] | `CPackageInfo::GetPackageInfo` | yes / yes |
 //! | [`depot`] | `GetDecryptionKey` | yes / yes |
 //! | [`ticket`] | `CUser::GetAppTicket` | **no / no** — body written, cannot install |
+//! | [`ui`] (4 bodies) | `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | yes / yes, **no / yes**, yes / yes, yes / **no** |
 //!
-//! The last one is listed rather than hidden: `install::deps` maps it to the
-//! `ticket-overrides` capability, so an absent anchor reports that capability as
-//! disabled with the resolver's reason instead of silently doing nothing.
+//! The last two rows are listed rather than hidden: `install::deps` maps each of
+//! them to the capability it serves, so an absent anchor reports that capability
+//! as disabled with the resolver's reason instead of silently doing nothing.
 
 pub mod depot;
 pub mod depot_store;
@@ -27,6 +28,7 @@ pub mod ownership;
 pub mod package;
 pub mod state;
 pub mod ticket;
+pub mod ui;
 
 #[cfg(windows)]
 pub mod installer;
@@ -59,6 +61,10 @@ pub const REPLACEMENTS: &[Replacement] = &[
     (package::SYMBOL, package::address),
     (depot::SYMBOL, depot::address),
     (ticket::SYMBOL, ticket::address),
+    (ui::visibility::SYMBOL, ui::visibility::address),
+    (ui::overview::SYMBOL, ui::overview::address),
+    (ui::snapshot::SYMBOL, ui::snapshot::address),
+    (ui::change::SYMBOL, ui::change::address),
 ];
 
 /// The resolved symbol → body table, as the installer and the plan filter need it.
@@ -89,5 +95,20 @@ mod tests {
             replacement_address(ownership::SYMBOL),
             Some(ownership::address())
         );
+    }
+
+    #[test]
+    fn every_steamui_body_is_registered_under_its_anchored_name() {
+        for symbol in [
+            "ShouldShowAppInLibrary",
+            "CSteamUIAppController::FillInAppOverview",
+            "CSteamUIAppController::BuildCompleteAppOverviewChange",
+            "CUpdateManager::MarkAppChange",
+        ] {
+            assert!(
+                replacement_address(symbol).is_some(),
+                "{symbol} has a body but is not in REPLACEMENTS"
+            );
+        }
     }
 }

@@ -31,6 +31,7 @@ pub mod depot;
 pub mod ownership;
 pub mod package;
 pub mod ticket;
+pub mod ui;
 
 /// The one value a replacement returns for a Steam function that returns `bool`.
 ///
