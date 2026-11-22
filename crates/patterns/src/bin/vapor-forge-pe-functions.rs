@@ -144,6 +144,12 @@ fn report_anchors(image: &PeImage<'_>, table: &Pdata, anchors: &BTreeMap<String,
             pdata::AnchorVerdict::Unmapped => {
                 println!("  {name:<44} {rva:#010x} NOT an entry (not in .pdata)")
             }
+            // Unreachable through the strict `verify`: a leaf is only returned
+            // to a caller that passes uniqueness evidence.
+            pdata::AnchorVerdict::Leaf { body } => println!(
+                "  {name:<44} {rva:#010x} leaf       body: {} (accepted)",
+                body.label()
+            ),
         }
     }
     println!(

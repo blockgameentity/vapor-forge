@@ -11,10 +11,14 @@
 //!
 //! Everything else — a mid-function hit, an extent with no terminator, an RVA
 //! the table does not cover, an extent that is not file-backed — is rejected.
+//!
+//! An address outside `.pdata` is answered by the leaf rule in [`super::leaf`],
+//! which needs the matcher's uniqueness evidence and is never a default.
 
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
 use thiserror::Error;
 
+use super::leaf::{leaf_body, AnchorEvidence};
 use super::{Function, Pdata};
 use crate::pe_image::PeImage;
 
@@ -115,46 +119,76 @@ pub enum AnchorVerdict {
     MidFunction { function: Function },
     /// On an entry, but the extent shows no `RET` and no tail jump.
     NoTerminator { function: Function, body: Body },
-    /// Not covered by the table, or not file-backed.
+    /// Outside `.pdata`, but padding before it and a `RET` inside it prove a
+    /// leaf function; accepted, and labelled differently from `Verified`.
+    Leaf { body: Body },
+    /// Not covered by the table (or not file-backed, or not a proven leaf).
     Unmapped,
 }
 
 impl AnchorVerdict {
+    /// Strict verdict: a `.pdata` function entry with a terminating body.
     pub fn is_verified(self) -> bool {
         matches!(self, Self::Verified { .. })
     }
 
+    /// What the gate accepts: a verified entry, or a leaf with evidence.
+    pub fn is_accepted(self) -> bool {
+        matches!(self, Self::Verified { .. } | Self::Leaf { .. })
+    }
+
+    /// One-word verdict for reports. `leaf` is deliberately its own word so a
+    /// weaker acceptance is never printed as `verified`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Verified { .. } => "verified",
             Self::MidFunction { .. } => "mid-function",
             Self::NoTerminator { .. } => "no-body",
+            Self::Leaf { .. } => "leaf",
             Self::Unmapped => "unmapped",
         }
     }
 
-    /// The function this verdict is about, if the table models it.
+    /// The function this verdict is about, if the table models it. A leaf is
+    /// not in the table, so it has no extent.
     pub fn function(self) -> Option<Function> {
         match self {
             Self::Verified { function, .. }
             | Self::MidFunction { function }
             | Self::NoTerminator { function, .. } => Some(function),
-            Self::Unmapped => None,
+            Self::Leaf { .. } | Self::Unmapped => None,
         }
     }
 }
 
-/// Apply the gate: is `rva` a hook target this corpus may claim?
+/// Apply the strict gate: is `rva` a `.pdata` hook target this corpus may
+/// claim? Leaf relaxation needs [`AnchorEvidence`], so this form never applies
+/// it.
 pub fn verify(image: &PeImage<'_>, table: &Pdata, rva: u32) -> AnchorVerdict {
-    let Some(function) = table.containing(rva) else {
-        return AnchorVerdict::Unmapped;
-    };
-    if function.begin != rva {
-        return AnchorVerdict::MidFunction { function };
+    verify_with(image, table, rva, AnchorEvidence::default())
+}
+
+/// Apply the gate with the facts the caller measured. The `.pdata` branch runs
+/// first and answers for every address the table covers, so the leaf rule can
+/// never turn a mid-function hit into an acceptance.
+pub fn verify_with(
+    image: &PeImage<'_>,
+    table: &Pdata,
+    rva: u32,
+    evidence: AnchorEvidence,
+) -> AnchorVerdict {
+    if let Some(function) = table.containing(rva) {
+        if function.begin != rva {
+            return AnchorVerdict::MidFunction { function };
+        }
+        return match analyze_in(image, function) {
+            Some(body) if body.terminates() => AnchorVerdict::Verified { function, body },
+            Some(body) => AnchorVerdict::NoTerminator { function, body },
+            None => AnchorVerdict::Unmapped,
+        };
     }
-    match analyze_in(image, function) {
-        Some(body) if body.terminates() => AnchorVerdict::Verified { function, body },
-        Some(body) => AnchorVerdict::NoTerminator { function, body },
+    match leaf_body(image, rva, evidence) {
+        Some(body) => AnchorVerdict::Leaf { body },
         None => AnchorVerdict::Unmapped,
     }
 }

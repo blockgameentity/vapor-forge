@@ -1850,3 +1850,93 @@ publicbeta CUser::GetSteamID OK  1  0x0000a31200  unmapped
 (neither address is covered by a `RUNTIME_FUNCTION`). The same two runs report a
 pre-existing failure in the shipped corpus, unrelated to this pass:
 `GetPipeClient` at `0x8c50b0` public / `0x8e6f70` beta is also `unmapped`.
+
+## 10. The leaf gate and `CUser::GetSteamID`
+
+The anchor gate used to require a `.pdata` `RUNTIME_FUNCTION` entry whose body
+contains a `RET` or ends in a tail jump. A leaf function calls nothing, needs no
+unwinding and therefore has no `RUNTIME_FUNCTION` at all, so the gate refused
+patchable code purely for being leaf: `CUser::GetSteamID` resolved **uniquely**
+in both builds and was then rejected as `unmapped`. The gate now accepts a
+non-`.pdata` address on positive evidence (uniqueness from the matcher, `0x0c`
+bytes of `0xCC`/`0x90` padding before it, a `RET` within the first `0x40`
+bytes), reports the result as `leaf` rather than `ok`, and still answers from the
+`.pdata` branch first so a mid-function hit keeps failing. See
+[`README.md`](./README.md#leaf-functions-the-gates-one-relaxation) for the rule
+and the unit tests (`crates/patterns/src/pdata/body/tests.rs`).
+
+### The walk
+
+`vapor-forge-vtable-pe --class CUser --all-slots` enumerates four `CUser` tables
+per build; the primary one is 41 slots and its slot 4 is the out-parameter
+accessor the interface map calls `GetSteamID` (slot 10 of the 260-slot
+`IClientUser` table is the same body behind the secondary base, which is why its
+displacement differs):
+
+| channel | 41-slot table | slot 4 | body | `.pdata` | gate |
+| --- | --- | --- | --- | --- | --- |
+| public | `0x139e6e0` | `0xcfec0` | `48 8B 81 0A 02 00 00 48 89 02 48 8B C2 C3` | none | `leaf` |
+| publicbeta | `0x13d39b8` | `0xd0460` | same 14 bytes | none | `leaf` |
+
+Both entries are preceded by exactly `0x0c` bytes of `int3` — the patch length the
+gate asks for — and the body is `mov 0x20a(%rcx),%rax; mov %rax,(%rdx); mov
+%rdx,%rax; ret`: a leaf with an out-parameter, as §6 established.
+
+### The signature
+
+Derived by decoding that body, not by copying a literal: the decoder yields four
+instructions; wildcarding their operand fields (`48 8B 81 ?? ?? ?? ?? 48 89 02 48
+8B C2 C3`) matches **3** sites in public and **5** in publicbeta, so the member
+displacement is identity-bearing here and the shipped pattern keeps it. The two
+builds encode the slot-4 body **identically**, so no variants are needed; the
+slot-10 body is the build-dependent one (`-0x1c6e` public, `-0x1d3e` beta) and
+fails the gate anyway. Both corpus files now carry, under the symbol name
+`CUser::GetSteamID`, the 14-byte pattern above; `--verify` on both images:
+
+```
+public     CUser::GetSteamID  OK  1  0x00000cfec0  leaf
+publicbeta CUser::GetSteamID  OK  1  0x00000d0460  leaf
+```
+
+`GetPipeClient` is still rejected on both builds (`0x8c50b0` / `0x8e6f70`,
+`unmapped`): only 7 `0xCC` separate it from the `lea`/`ret` before it, short of
+the patch length, and the matched bytes are a mid-body `test edx,edx`. The
+relaxation did not open that hole.
+
+## 11. The family lock — no Windows carrier
+
+Linux's `FamilyLockBypass` carrier is `CFamilySharing::GetLockingAccount(this,
+u32 appid) -> u32`. Neither `steamclient64.dll` build has that class:
+
+* **RTTI.** Enumerating every table whose `RTTICompleteObjectLocator` class name
+  contains `Family` finds the **same 68 classes in both builds**, and all 68 are
+  19-slot PBO messages (`CFamilyGroups_*` requests/responses/notifications) or
+  value types (`FamilyGroupMember`, `FamilyGroupPendingInvite`,
+  `FamilyGroupFormerMember`, `FamilyGroupPendingInviteForUser`,
+  `FamilyGroupMembership`). No `CFamilySharing`, no sharing/lock manager.
+* **Cross-build structure.** The 68 tables have an identical per-slot sharing
+  profile in both builds (distinct bodies per slot: 68, 1, 68, 68, 30, 1, 1, 1,
+  39, 5, 39, 39, 1, 68, 68, 1, 1, 5, 68) and the same 1292 slots — a message
+  class hierarchy, not logic that survives as a candidate.
+* **AppId slots.** The only slots in those tables that take a 32-bit second
+  argument are the five `mov [rcx+disp], edx; ret` field setters at slot 17;
+  17 distinct bodies in the 68 tables read `edx`/`rdx` at all, and every one is
+  either such a setter or a message clear/merge helper that reads its own field
+  at `[rcx+0x10]`. **No slot takes an AppId and returns an account id** — the
+  ranked candidate list is empty.
+* **Strings.** `FamilySharing`, `GetLockingAccount` and `locking account` occur
+  **0** times in both modules; no export (41 in each) names family, sharing or
+  licences. The family tags name `CUser` state instead of a missed class:
+  `CUser::UpdateFamilyRunningApps`, `m_mapFamilyRunningApps`, `m_mapFamilyDLC`,
+  `m_ulFamilyGroupID`, `m_strFamilyGroupName`, `m_strFamilyGroupCountry`,
+  `m_vecFamilyGroupMembers`, plus server-sent borrowed-licence fields
+  (`borrower_id`, `is_borrowed`, `k_ESharedLibrary_LicenseExcluded_FlagBorrowed`,
+  `CClientJobUpdateAuthorizedBorrowers`).
+
+**Verdict: no corpus entry — the lock has no anchorable Windows carrier.** The
+Windows client holds family-group state in `CUser` and borrowed-licence flags
+from the server; it has no `CFamilySharing` equivalent, no class or slot shaped
+like an AppId-to-account-id lookup, and nothing whose structure survives into a
+candidate. Not "unanchored yet": absent. A `FamilyLockBypass` on Windows would
+have to be written against whatever consumes those borrowed-licence flags, which
+this measurement did not find as a method.

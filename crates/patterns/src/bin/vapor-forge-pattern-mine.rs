@@ -17,7 +17,7 @@ use std::process::exit;
 
 use memchr::memchr;
 use sha2::{Digest, Sha256};
-use vapor_forge_patterns::pdata::{self, verify, Pdata};
+use vapor_forge_patterns::pdata::{self, verify_with, AnchorEvidence, Pdata};
 use vapor_forge_patterns::pe_image::PeImage;
 use vapor_forge_patterns::registry::parse_toml_patterns;
 use vapor_forge_patterns::scan::{
@@ -89,7 +89,8 @@ fn run() -> Result<(), String> {
     );
     out.push_str("# re-mine per Steam build and record variants when a build stops resolving.\n");
     out.push_str(
-        "# Each pattern resolves to a .pdata function entry whose body returns or tail-jumps\n\
+        "# Each pattern resolves to a .pdata function entry whose body returns or tail-jumps,\n\
+         # or to a unique leaf with a patch-length padding run before it and a RET inside it\n\
          # (the anchor gate, see res/patterns/win64/README.md); anything else is not written.\n",
     );
     out.push_str("[hotfix]\nformat = 1\n");
@@ -100,6 +101,7 @@ fn run() -> Result<(), String> {
     let mut missing = 0usize;
     let mut collided = 0usize;
     let mut rejected = 0usize;
+    let mut leaves = 0usize;
     let mut rejected_names = Vec::new();
     let mined = targets
         .into_iter()
@@ -131,8 +133,10 @@ fn run() -> Result<(), String> {
             MineOutcome::Resolved { pattern, rva } => {
                 let rva = u32::try_from(rva)
                     .map_err(|_| format!("{target}: resolved rva exceeds u32"))?;
-                let verdict = verify(&image, &table, rva);
-                if !verdict.is_verified() && !args.allow_unverified {
+                // This site matched exactly once and the extended pattern is
+                // unique too, which is the evidence the leaf rule requires.
+                let verdict = verify_with(&image, &table, rva, AnchorEvidence::unique());
+                if !verdict.is_accepted() && !args.allow_unverified {
                     rejected += 1;
                     rejected_names.push(format!("{target} @ {rva:#x}: {}", verdict.label()));
                     println!(
@@ -147,10 +151,15 @@ fn run() -> Result<(), String> {
                     continue;
                 }
                 resolved += 1;
-                let status = if verdict.is_verified() {
-                    "OK"
-                } else {
-                    "UNVERIFIED"
+                if !verdict.is_verified() {
+                    leaves += usize::from(verdict.is_accepted());
+                }
+                // A leaf is accepted on weaker evidence, so the status column
+                // says `LEAF` instead of folding it into `OK`.
+                let status = match verdict {
+                    pdata::AnchorVerdict::Verified { .. } => "OK",
+                    pdata::AnchorVerdict::Leaf { .. } => "LEAF",
+                    _ => "UNVERIFIED",
                 };
                 println!(
                     "{:<44} {:<9} {:>8}  {:#012x} {:<6} {}",
@@ -195,7 +204,7 @@ fn run() -> Result<(), String> {
     let total = resolved + ambiguous + missing + collided + rejected;
     println!(
         "\nmined {resolved}/{total} symbols (ambiguous {ambiguous}, collided {collided}, \
-         missing {missing}, rejected by the anchor gate {rejected})"
+         missing {missing}, leaves {leaves}, rejected by the anchor gate {rejected})"
     );
     if !rejected_names.is_empty() {
         eprintln!(
@@ -363,6 +372,7 @@ fn verify_file(
         "symbol", "status", "matches", "rva"
     );
     let mut gated = 0usize;
+    let mut leaves = 0usize;
     let mut bad_gate = Vec::new();
     for entry in &report.entries {
         let rva = entry
@@ -370,9 +380,15 @@ fn verify_file(
             .and_then(|offset| u32::try_from(report.text_vaddr + offset as u64).ok());
         let (verdict, shown) = match rva {
             Some(rva) if entry.status == PatternScanStatus::Ok => {
-                let verdict = verify(image, table, rva);
-                if verdict.is_verified() {
+                // A pattern that matched once is the uniqueness evidence the
+                // relaxed gate asks for; an ambiguous one is already a failure.
+                let evidence = AnchorEvidence {
+                    unique_site: entry.match_count == 1,
+                };
+                let verdict = verify_with(image, table, rva, evidence);
+                if verdict.is_accepted() {
                     gated += 1;
+                    leaves += usize::from(!verdict.is_verified());
                 } else {
                     bad_gate.push(format!("{} @ {rva:#x}: {}", entry.name, verdict.label()));
                 }
@@ -399,7 +415,7 @@ fn verify_file(
             bad_gate.join(", ")
         ));
     }
-    println!("all {} patterns resolve and pass the body gate", gated);
+    println!("all {gated} patterns resolve and pass the body gate ({leaves} of them as leaves)");
     Ok(())
 }
 
