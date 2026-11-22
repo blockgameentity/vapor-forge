@@ -5,11 +5,18 @@ use std::sync::Mutex;
 use tracing::{debug, info};
 use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
+use crate::family::provenance::{OwnershipSignals, Provenance};
+use crate::family::FamilySettings;
+
 struct AccountState {
     actual_ownership: Option<HashMap<AppId, bool>>,
     // Controlled apps whose entitlement comes only from another family
     // member's license.
     family_shared: Option<HashSet<AppId>>,
+    // The account that license belongs to. Without it a family claim cannot be
+    // checked, so a license we fabricated ourselves would read back as borrowed
+    // and the library would say "from family library".
+    family_owner: Option<HashMap<AppId, u32>>,
     license_sync_complete: bool,
 }
 
@@ -18,6 +25,7 @@ impl AccountState {
         Self {
             actual_ownership: None,
             family_shared: None,
+            family_owner: None,
             license_sync_complete: false,
         }
     }
@@ -25,6 +33,7 @@ impl AccountState {
     fn reset(&mut self) {
         self.actual_ownership = None;
         self.family_shared = None;
+        self.family_owner = None;
         self.license_sync_complete = false;
     }
 }
@@ -159,14 +168,91 @@ pub fn actual_ownership(app_id: AppId) -> OwnershipState {
 
 /// Record whether the app's entitlement comes only from a family member.
 /// Returns whether the recorded value changed.
+///
+/// Clearing the flag also forgets the lender: a stale owner id would let a
+/// later pass mistake our own injection for a lender.
 pub fn record_family_shared(app_id: AppId, shared: bool) -> bool {
     let mut state = ACCOUNT_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let set = state.family_shared.get_or_insert_with(HashSet::new);
-    if shared {
-        set.insert(app_id)
+    let changed = if shared {
+        state
+            .family_shared
+            .get_or_insert_with(HashSet::new)
+            .insert(app_id)
     } else {
-        set.remove(&app_id)
+        state
+            .family_shared
+            .as_mut()
+            .is_some_and(|set| set.remove(&app_id))
+    };
+    if !shared {
+        if let Some(owners) = state.family_owner.as_mut() {
+            owners.remove(&app_id);
+        }
     }
+    changed
+}
+
+/// Record which account the covering license belongs to.
+///
+/// Wired by the host later: only the hooks layer can read the license owner, so
+/// no call site exists in this crate yet.
+pub fn record_family_owner(app_id: AppId, owner: u32) {
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .family_owner
+        .get_or_insert_with(HashMap::new)
+        .insert(app_id, owner);
+}
+
+/// The account the app's covering license belongs to, when the hooks reported
+/// one.
+pub fn family_owner(app_id: AppId) -> Option<u32> {
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .family_owner
+        .as_ref()
+        .and_then(|owners| owners.get(&app_id).copied())
+}
+
+/// Ownership signals for one app, taken from the recorded account state.
+///
+/// A snapshot, not a transaction: each read takes the lock on its own, so a
+/// concurrent license refresh can tear the three apart. Callers treat the result
+/// as evidence, never as a consistency check.
+pub fn ownership_signals(app_id: AppId, injected_by_us: bool) -> OwnershipSignals {
+    let owned = actual_ownership(app_id);
+    let borrowed = is_family_shared(app_id);
+    OwnershipSignals {
+        self_owned: matches!(owned, OwnershipState::Owned) && !borrowed,
+        borrowed,
+        license_owner: family_owner(app_id),
+        injected_by_us,
+    }
+}
+
+/// Where this app's ownership came from.
+///
+/// `injected_by_us` is the package layer's view, because only that layer knows
+/// what we actually wrote into pkg0. `self_account_id` is the current account's
+/// id, or 0 when it is not known yet.
+pub fn provenance(
+    app_id: AppId,
+    injected_by_us: bool,
+    self_account_id: u32,
+    settings: FamilySettings,
+) -> Provenance {
+    if actual_ownership(app_id) == OwnershipState::Unknown && !injected_by_us {
+        // No license-walk sample and nothing of ours in pkg0: the honest answer
+        // is that nothing is known yet.
+        return Provenance::Unknown;
+    }
+    crate::family::provenance::classify(
+        ownership_signals(app_id, injected_by_us),
+        self_account_id,
+        settings,
+    )
 }
 
 /// Whether the app is available to this account only through a family
@@ -633,5 +719,130 @@ mod tests {
         let config = config_with_inject(&[480, 730]);
         assert_eq!(get_subscribed_count_adjustment(&config, false), 2);
         assert_eq!(get_subscribed_count_adjustment(&config, true), 0);
+    }
+
+    // ---- family provenance -------------------------------------------------
+
+    const SELF_ACCOUNT: u32 = 7_777_777;
+    const LENDER_ACCOUNT: u32 = 9_999_999;
+
+    /// The account state is process-global, so every test that reads or writes
+    /// it serializes here. Otherwise a pass that resets the state (an account
+    /// switch) wipes the ids another test is still asserting on.
+    fn lock_account_state() -> std::sync::MutexGuard<'static, ()> {
+        ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Record the state a poisoned family signal leaves behind: the app reads as
+    /// borrowed, but the license it points at is the id we fabricate ourselves.
+    fn record_poisoned_family_signal(app_id: AppId) {
+        record_actual_ownership(app_id, false);
+        record_family_shared(app_id, true);
+        record_family_owner(app_id, crate::family::provenance::NO_ACCOUNT);
+    }
+
+    // Invariant 1: an app whose only title is our own injection is never reported
+    // as family-shared, whatever the recorded family flag says.
+    #[test]
+    fn our_own_injection_is_never_reported_as_family_shared() {
+        let _guard = lock_account_state();
+        let app_id = AppId(246_813_600);
+        record_poisoned_family_signal(app_id);
+
+        assert_eq!(
+            provenance(app_id, true, SELF_ACCOUNT, FamilySettings::default()),
+            Provenance::IngestedByUs
+        );
+        // With the fix off the recorded flag is trusted, which is the defect the
+        // Windows fork had to fix -- so the assertion above is not vacuous.
+        assert_eq!(
+            provenance(app_id, true, SELF_ACCOUNT, FamilySettings::legacy()),
+            Provenance::FamilyShared
+        );
+    }
+
+    // Invariant 2: a real lender keeps the family label, in both flag states.
+    #[test]
+    fn a_genuine_lender_stays_family_shared_even_when_we_inject() {
+        let _guard = lock_account_state();
+        let app_id = AppId(246_813_601);
+        record_actual_ownership(app_id, true);
+        record_family_shared(app_id, true);
+        record_family_owner(app_id, LENDER_ACCOUNT);
+
+        for settings in [FamilySettings::legacy(), FamilySettings::default()] {
+            assert_eq!(
+                provenance(app_id, true, SELF_ACCOUNT, settings),
+                Provenance::FamilyShared
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_family_flag_forgets_the_lender() {
+        let _guard = lock_account_state();
+        let app_id = AppId(246_813_602);
+        record_poisoned_family_signal(app_id);
+        assert!(family_owner(app_id).is_some());
+
+        assert!(record_family_shared(app_id, false));
+        assert_eq!(family_owner(app_id), None);
+    }
+
+    // An account switch drops the recorded lender. Asserted on a local state
+    // rather than the global one: the global reset would wipe every other test's
+    // app ids.
+    #[test]
+    fn an_account_switch_forgets_the_lender() {
+        let app_id = AppId(246_813_603);
+        let mut state = AccountState::new();
+        state
+            .family_owner
+            .get_or_insert_with(HashMap::new)
+            .insert(app_id, LENDER_ACCOUNT);
+        assert!(state.family_owner.is_some());
+
+        state.reset();
+
+        assert!(state.family_owner.is_none());
+        assert!(state.family_shared.is_none());
+    }
+
+    #[test]
+    fn no_sample_and_no_injection_is_unknown_not_unowned() {
+        let _guard = lock_account_state();
+        let app_id = AppId(246_813_604);
+        assert_eq!(
+            provenance(app_id, false, SELF_ACCOUNT, FamilySettings::default()),
+            Provenance::Unknown
+        );
+        // Our own injection is something we do know about.
+        assert_eq!(
+            provenance(app_id, true, SELF_ACCOUNT, FamilySettings::default()),
+            Provenance::IngestedByUs
+        );
+        record_actual_ownership(app_id, false);
+        assert_eq!(
+            provenance(app_id, false, SELF_ACCOUNT, FamilySettings::default()),
+            Provenance::Unowned
+        );
+    }
+
+    #[test]
+    fn a_self_owned_app_is_owned_and_not_borrowed() {
+        let _guard = lock_account_state();
+        let app_id = AppId(246_813_605);
+        record_actual_ownership(app_id, true);
+        record_family_shared(app_id, false);
+
+        let signals = ownership_signals(app_id, false);
+        assert!(signals.self_owned);
+        assert!(!signals.borrowed);
+        assert_eq!(
+            provenance(app_id, false, SELF_ACCOUNT, FamilySettings::default()),
+            Provenance::Owned
+        );
     }
 }
