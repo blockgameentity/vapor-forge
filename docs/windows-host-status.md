@@ -14,6 +14,7 @@ Branch: `integration/windows-host` (merges `phase1/hook-install` and
 | family share: provenance, idempotent marker removal, concurrent-play decision | done, flag-gated | `crates/features/src/family/*` |
 | host features parity (cloud, identity, depotcache, achievements flag) | done | `crates/host-windows/src/features/*`, `lifecycle` |
 | UI split (render vs decide) documented | done | `[CT] docs/ui-split.md` |
+| manifest providers owned by the host, not the backend | done — zero provider hostnames in this tree | `crates/config/src/model.rs`, `crates/features/src/request_code.rs` |
 | trampoline patch writer (instruction-boundary, relocatable-only) | done | `crates/host-windows/src/install/patch.rs` + `installer.rs` |
 | provider failover opt-in, dependency-aware depot closure | done | `crates/features/src/{request_code,manifest}*`, `crates/config` |
 | achievement rebuild from local definitions | done | `crates/features/src/achievements*` |
