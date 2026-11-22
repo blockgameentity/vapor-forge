@@ -53,6 +53,29 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
+# Ticket sources asked in order: "local_cache", "credential_store", "registry".
+# The first source that has the ticket wins; every attempt is logged and the
+# winner is reported back to the caller. Leaving the list at its default keeps
+# the single source this build has always used, so nothing changes until a
+# second entry is added. Repeating a source, or emptying the list, is a load
+# error rather than something discovered when a game asks for a ticket.
+source_order = ["local_cache"]
+
+# Denuvo authorisation: "off" (default) hands the app one ticket, exactly as
+# before. "lease" gives the authorisation an acquisition time and an explicit
+# expiry; the caller renews it before it lapses, and a lapsed lease is reported
+# as expired so it can never be mistaken for a valid one. lease_secs is only
+# read in lease mode.
+denuvo_mode = "off"
+denuvo_lease_secs = 300
+
+# Structural Denuvo detection from PE section names, DLL names and flags. Off by
+# default. denuvo_override is a manual verdict that wins over detection (true
+# forces Denuvo, false forces not-Denuvo, absent lets detection decide); with
+# detection off and no override, no app is treated as Denuvo-protected.
+denuvo_detection = false
+# denuvo_override = true
+
 # Manifest request-code providers for controlled apps, in preference order.
 # An entry is either a built-in name ("20770407", "manifestdex", "opensteamtool",
 # "wudrm", "steamrun") or a table describing your own endpoint, so a new source
