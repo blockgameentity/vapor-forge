@@ -28,6 +28,7 @@ fn shared(enabled: bool, include: &[u32], exclude: &[u32]) -> SharedSection {
         enabled,
         include: include.iter().copied().map(AppId).collect(),
         exclude: exclude.iter().copied().map(AppId).collect(),
+        ..Default::default()
     }
 }
 

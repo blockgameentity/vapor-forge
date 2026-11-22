@@ -180,6 +180,10 @@ pub(crate) fn script_state() -> Arc<ScriptState> {
 }
 
 pub(crate) fn ensure_runtime_services_for_config(config: &RuntimeConfig) {
+    // Push the user-facing flags into the feature modules that keep settings:
+    // family-share correctness and the local achievement rebuild. Doing it here
+    // means a hot-reloaded config takes effect without a restart.
+    vapor_forge_features::config_apply::apply(config);
     crate::cloud_backend::refresh(config);
     if config.local_cloud_configured() || config.cumulus_configured() {
         crate::achievement_worker::ensure_started();

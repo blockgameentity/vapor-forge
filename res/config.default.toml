@@ -24,6 +24,13 @@ init = true                 # show a startup toast after SteamUI bridge is ready
 # Family sharing concurrent-play unlock.
 [apps.shared]
 enabled = true
+# Family-share correctness, both on by default because both fix a wrong label:
+# validate_lender re-checks a claimed lender before trusting a family label (an
+# app we ingested must never read back as "from family library"), and
+# clean_borrower_markers removes a borrower marker once an app is no longer
+# borrowed. Set either to false to restore the pre-fix behaviour.
+validate_lender = true
+clean_borrower_markers = true
 # include = [480, 730]      # only unlock these family-shared apps
 # exclude = [730]           # unlock all family-shared apps except these
 
@@ -123,6 +130,10 @@ min_interval_ms = 1000
 
 # Offline achievement schema support.
 [achievements]
+# Rebuild achievement replies from local definitions when the schema cache is
+# missing or unreadable. Off by default: with it off the stats path behaves as
+# it always has.
+local_rebuild = false
 offline_schema = false
 
 # Native library injection into launched games.

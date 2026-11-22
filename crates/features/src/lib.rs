@@ -4,6 +4,7 @@ pub mod achievements;
 pub mod app_avatar;
 pub mod apps;
 pub mod cloud;
+pub mod config_apply;
 pub mod depot_key;
 pub mod depotcache;
 pub mod dlc;

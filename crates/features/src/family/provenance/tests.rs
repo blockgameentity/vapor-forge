@@ -33,6 +33,7 @@ fn shared_off() -> SharedSection {
         enabled: false,
         include: Vec::new(),
         exclude: Vec::new(),
+        ..Default::default()
     }
 }
 

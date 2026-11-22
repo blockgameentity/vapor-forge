@@ -125,6 +125,19 @@ pub struct SharedSection {
     pub include: Vec<AppId>,
     #[serde(default)]
     pub exclude: Vec<AppId>,
+    /// Re-validate a claimed lender before trusting a family label.
+    ///
+    /// Without this, a licence we fabricated ourselves reads back as borrowed
+    /// and the library says "from family library". On by default: it is the
+    /// correct behaviour, and turning it off restores the pre-fix label.
+    #[serde(default = "default_true")]
+    pub validate_lender: bool,
+    /// Remove a borrower marker once an app is no longer borrowed.
+    ///
+    /// On by default; off leaves the marker in place, which is the pre-fix
+    /// behaviour and can mislabel an ingested app.
+    #[serde(default = "default_true")]
+    pub clean_borrower_markers: bool,
 }
 
 impl SharedSection {
@@ -148,6 +161,8 @@ impl Default for SharedSection {
             enabled: true,
             include: Vec::new(),
             exclude: Vec::new(),
+            validate_lender: true,
+            clean_borrower_markers: true,
         }
     }
 }
@@ -282,6 +297,13 @@ pub struct ScriptingSection {
 pub struct AchievementsSection {
     #[serde(default)]
     pub offline_schema: bool,
+    /// Rebuild achievement replies from the local definition set when the schema
+    /// cache is absent or unreadable.
+    ///
+    /// Off by default: with the flag off the stats path behaves exactly as it
+    /// did before the rebuild existed (no stealth behaviour change).
+    #[serde(default)]
+    pub local_rebuild: bool,
 }
 
 /// AppAvatar: map a real AppId to another for networking.
