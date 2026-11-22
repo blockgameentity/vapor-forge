@@ -118,10 +118,10 @@ These are known, not bugs to chase:
   Steam the encoded response for that call; otherwise the message is recorded with
   `NoCachedCode` and Steam's own round trip happens. Nothing dials from the hook
   path.
-- **Corpus coverage:** 28 symbols in `steamclient64.dll` public (27 beta) and 7 in
-  `SteamUI.dll` (5 beta), including the `CNetPacket` layout family, so the
-  request-code body can decode packet fields. Unresolved symbols disable only their
-  own capability.
+- **Corpus coverage:** 30 symbols in `steamclient64.dll` public (29 beta) and 9 in
+  `SteamUI.dll` (7 beta), including the `CNetPacket` layout family and the leaf
+  `CUser::GetSteamID` accessor. Unresolved symbols disable only their own
+  capability.
 - `CUser::GetSubscribedApps` is anchored at CUser slot 183 (confirmed by the x64
   licence stride) but has **no body**, so it stays uninstalled.
 

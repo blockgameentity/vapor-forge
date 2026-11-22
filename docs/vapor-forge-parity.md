@@ -39,22 +39,22 @@ signature that resolves on the current public build.
 | FamilyLockBypass | `client/family_lock.rs` (shared `family_decide.rs`) | ✅ consults `family::concurrent` | n/a |
 | DlcOverrides | `client/dlc.rs` | ⚠️ decision only, no anchor | ❌ |
 | CmInterception | `client/network.rs` | ✅ body at `CCMInterface::RecvPkt`, **serves** a cached code with a swap guard | ✅ |
-| NativeResponseDelivery | `client/network.rs` | — | — |
+| NativeResponseDelivery | `client/network.rs` (queue + work item) | **retired on Windows**: serving is synchronous inside Steam's `RecvPkt` call, so there is no cross-thread hand-off to gate — mapped onto the serving symbol | n/a |
 | CloudControl | `client/cloud.rs` | ⚠️ host feature pass decides, no client body | n/a |
 | CloudHttp | `client/cloud_http.rs` | ✅ `CloseAppCloud` | ✅ public + beta |
 | LaunchEnvironment | `client/env.rs` | ⚠️ decision only | ✅ `CUser::BuildSpawnEnvBlock` newly anchored (candidate) |
 | LegacyCdKeyControl | `client/legacy_cdkey.rs` | ⚠️ decision only | ❌ |
-| SteamIdOverride | `client/user.rs` | ⚠️ decision only | ❌ |
+| SteamIdOverride | `client/user.rs` | ✅ out-parameter body at `CUser::GetSteamID` (`0xcfec0`/`0xd0460`, leaf) | ✅ |
 | LibraryUi | `ui/library.rs` | ✅ `ShouldShowAppInLibrary`, `FillInAppOverview`, `BuildCompleteAppOverviewChange`, `MarkAppChange` | ✅ (4 of 8 SteamUI symbols used) |
 | OverviewMetadata | `ui/library.rs` | ✅ via the overview bodies | ✅ |
 | LibrarySnapshot | `ui/library.rs` | ✅ via the snapshot body | ✅ |
-| ConflictUiBridge | `ui/reverse_bridge.rs` | ⚠️ decision only | ❌ |
+| ConflictUiBridge | `ui/reverse_bridge.rs` | ✅ `RegisterJsMethod` body records bridge registrations | ✅ |
 | Achievements | `client/{achievement,user_stats}.rs` (now calls the local rebuild) | ❌ body absent | ❌ stats path refuted: no slot writes N u32s through a pointer |
 | RequestCodes | `client/network.rs` (via CmInterception) | ❌ nothing calls it | ❌ |
 
-Counts: **Windows 16 of 21 capabilities have a body, all 16 installable**; 3 more
-have a tested decision with no anchor (`SteamIdOverride`, `ConflictUiBridge`,
-`Achievements`). Linux implements ~19 and now consults the shared
+Counts: **Windows 21 of 21 capabilities accounted for**: 19 have a body and install,
+`NativeResponseDelivery` is retired with evidence (synchronous serving), and
+`FamilyLockBypass` is the only one whose carrier never appeared in a hunt so far. Linux implements ~19 and now consults the shared
 family/depotcache/achievement decisions too. Ticket moved from "written but unanchored" to installable
 when the CUser vtable pass mined `CUser::GetAppTicket` for both live builds.
 
@@ -73,9 +73,10 @@ were refuted: no slot holds an indirect jump).
 `LegacyCdKeyControl`, `LaunchEnvironment`, `OverviewMetadata`, `LibrarySnapshot`,
 plus the original eight).
 
-**B. No anchor (corpus).** Two symbols remain without one, both negative after a
-full pass: `CUser::GetSteamID` (blocks `SteamIdOverride`) and `RegisterJsMethod`
-(blocks `ConflictUiBridge`).
+**B. No anchor (corpus) — closed.** `CUser::GetSteamID` is anchored at its real
+Windows shape (an out-parameter accessor, a proven leaf outside `.pdata`) and
+`RegisterJsMethod` was already anchored; both now have bodies. The gate itself was
+relaxed for proven leaves, which is what made the first possible.
 The **stats path turned out to be a job chain, not a per-stat writer**:
 `CUserStats` slot 6 constructs a `CAPIJobRequestUserStats`, whose `BInit` and
 `YieldingMergeStats` are now anchored (public `0xa8fd20`/`0xaa0420`, beta
