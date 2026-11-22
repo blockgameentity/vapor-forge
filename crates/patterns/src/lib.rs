@@ -38,6 +38,8 @@ pub mod probe_rank;
 pub mod semantic;
 pub mod vtable_scan;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod vtable_pe;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod work_item_site;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
